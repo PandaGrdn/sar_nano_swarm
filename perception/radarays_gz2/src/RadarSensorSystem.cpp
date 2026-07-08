@@ -4,8 +4,32 @@
 #include <gz/sim/Util.hh>
 #include <gz/sim/components/Pose.hh>
 
+#include <cstdlib>
+#include <string>
+
 using namespace radarays_gz2;
 namespace rm = rmagine;
+
+namespace
+{
+std::string ResolveMeshPath(const std::string &path)
+{
+  if (path.empty() || path.front() == '/') {
+    return path;
+  }
+
+  const char *root = std::getenv("SAR_NANO_SWARM_ROOT");
+  if (root == nullptr || root[0] == '\0') {
+    return path;
+  }
+
+  std::string resolved = root;
+  if (resolved.back() != '/') {
+    resolved += '/';
+  }
+  return resolved + path;
+}
+}  // namespace
 
 RadarSensorSystem::RadarSensorSystem() {}
 RadarSensorSystem::~RadarSensorSystem() {}
@@ -18,10 +42,13 @@ void RadarSensorSystem::Configure(
 {
   sensorEntity_ = entity;
 
-  std::string meshPath = "/home/ethan/crazyflie_ws/src/darpa_subt_worlds/meshes/tunnel.dae";
-  if (sdf->HasElement("mesh_path")) {
-    meshPath = sdf->Get<std::string>("mesh_path");
+  if (!sdf->HasElement("mesh_path")) {
+    gzerr << "radarays_gz2: <mesh_path> is required in the plugin SDF block."
+          << std::endl;
+    return;
   }
+
+  const std::string meshPath = ResolveMeshPath(sdf->Get<std::string>("mesh_path"));
   map_ = rm::import_embree_map(meshPath);
 
   radarModel_.theta.min = -M_PI;

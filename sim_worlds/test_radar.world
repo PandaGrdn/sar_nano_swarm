@@ -75,7 +75,7 @@
         <visual name="v"><geometry><sphere><radius>0.05</radius></sphere></geometry></visual>
       </link>
       <plugin filename="libradar_sensor_system.so" name="radarays_gz2::RadarSensorSystem">
-        <mesh_path>/home/ethan/crazyflie_ws/src/darpa_subt_worlds/worlds/models/jersey_barrier/meshes/jersey_barrier.dae</mesh_path>
+        <mesh_path>sim_worlds/darpa_subt_worlds/worlds/models/jersey_barrier/meshes/jersey_barrier.dae</mesh_path>
       </plugin>
     </model>
 
