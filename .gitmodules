@@ -1,0 +1,9 @@
+[submodule "firmware_mods/CrazySim"]
+	path = firmware_mods/CrazySim
+	url = https://github.com/gtfactslab/CrazySim.git
+[submodule "perception/rmagine"]
+	path = perception/rmagine
+	url = https://github.com/uos/rmagine.git
+[submodule "sim_worlds/darpa_subt_worlds"]
+	path = sim_worlds/darpa_subt_worlds
+	url = https://github.com/LTU-RAI/darpa_subt_worlds.git

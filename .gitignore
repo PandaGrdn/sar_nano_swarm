@@ -6,3 +6,9 @@ __pycache__/
 .vscode/
 mlruns/
 mlflow.db
+
+# Submodule build artifacts (sources live in submodules)
+perception/rmagine/build/
+firmware_mods/CrazySim/**/build/
+firmware_mods/CrazySim/**/install/
+firmware_mods/CrazySim/**/log/
