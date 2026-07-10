@@ -12,7 +12,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 fi
 
 export SAR_NANO_SWARM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
+set +u
 # ROS 2 Humble
 if [[ -f /opt/ros/humble/setup.bash ]]; then
   # shellcheck disable=SC1091
@@ -20,10 +20,11 @@ if [[ -f /opt/ros/humble/setup.bash ]]; then
 else
   echo "warning: /opt/ros/humble/setup.bash not found" >&2
 fi
+set -u
 
 # Gazebo Harmonic
 export GZ_VERSION=harmonic
-
+set +u
 # ros_gz bridge workspace (built separately; see README)
 if [[ -f "${ROS_GZ_WS:-$HOME/ros2_ws}/install/setup.bash" ]]; then
   # shellcheck disable=SC1091
@@ -31,17 +32,18 @@ if [[ -f "${ROS_GZ_WS:-$HOME/ros2_ws}/install/setup.bash" ]]; then
 else
   echo "warning: ros_gz workspace not found at \${ROS_GZ_WS:-$HOME/ros2_ws}" >&2
 fi
-
+set -u
 # rmagine (Embree backend)
 export CMAKE_PREFIX_PATH="${SAR_NANO_SWARM_ROOT}/perception/rmagine/build:${CMAKE_PREFIX_PATH:-}"
 export LD_LIBRARY_PATH="${SAR_NANO_SWARM_ROOT}/perception/rmagine/build/src:${LD_LIBRARY_PATH:-}"
 
+set +u
 # Project colcon overlay (radarays_gz2)
 if [[ -f "${SAR_NANO_SWARM_ROOT}/install/setup.bash" ]]; then
   # shellcheck disable=SC1091
   source "${SAR_NANO_SWARM_ROOT}/install/setup.bash"
 fi
-
+set -u
 # CrazySim / Crazyswarm2 overlay
 if [[ -f "${SAR_NANO_SWARM_ROOT}/firmware_mods/CrazySim/crazyswarm2_ws/install/setup.bash" ]]; then
   # shellcheck disable=SC1091
@@ -49,7 +51,8 @@ if [[ -f "${SAR_NANO_SWARM_ROOT}/firmware_mods/CrazySim/crazyswarm2_ws/install/s
 fi
 
 # Gazebo model/world search path for DARPA SubT assets
-export GZ_SIM_RESOURCE_PATH="${SAR_NANO_SWARM_ROOT}/sim_worlds/darpa_subt_worlds:${GZ_SIM_RESOURCE_PATH:-}"
+# Models live under worlds/ and worlds/models/ (model://jersey_barrier, model://cave_world, …)
+export GZ_SIM_RESOURCE_PATH="${SAR_NANO_SWARM_ROOT}/sim_worlds:${SAR_NANO_SWARM_ROOT}/sim_worlds/darpa_subt_worlds:${SAR_NANO_SWARM_ROOT}/sim_worlds/darpa_subt_worlds/worlds:${SAR_NANO_SWARM_ROOT}/sim_worlds/darpa_subt_worlds/worlds/models:${GZ_SIM_RESOURCE_PATH:-}"
 
 # gz-sim System plugin path for radarays_gz2
 export GZ_SIM_SYSTEM_PLUGIN_PATH="${SAR_NANO_SWARM_ROOT}/install/radarays_gz2/lib:${GZ_SIM_SYSTEM_PLUGIN_PATH:-}"

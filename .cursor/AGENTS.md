@@ -51,8 +51,8 @@ Build order & pinned submodule commits: see README. Path portability rule: world
 
 ## 3. Current status (update as phases close)
 
-- **Phase 0: steps 1–10 done except the exit gate.** Remaining: Crazyflie SITL flying in a SubT Tunnel world with the radar plugin attached to the *drone* (currently on a static test model), point cloud visible in RViz.
-- Verified working: SITL build (`sitl_make/build`, native cmake — **not** `make defconfig`/ARM kbuild), Crazyswarm2 build, radar plugin publishing real data in `test_radar.world`, MLflow (sqlite backend: `sqlite:///mlflow.db`, filesystem `./mlruns` backend is deprecated and errors).
+- **Phase 0: COMPLETE (exit gate passed 2026-07-09).** Crazyflie SITL in SubT tunnel world (`sim_worlds/phase0_tunnel_gate.sdf`) with `radarays_gz2` on the drone; `/radar/points` publishing ~10 Hz. Re-run: `./eval_scripts/phase0_gate.sh` (uses repo builds, or set `CRAZYSIM_FW` / `RADAR_PLUGIN_DIR` to `~/crazyflie_ws` artifacts).
+- Verified working: SITL build (`sitl_make/build`, native cmake — **not** `make defconfig`/ARM kbuild), Crazyswarm2 build, radar plugin on flying model in tunnel gate world, MLflow (sqlite backend: `sqlite:///mlflow.db`, filesystem `./mlruns` backend is deprecated and errors).
 - cfclient connects to SITL at `udp://127.0.0.1:19850`.
 - Next major work: Phase 1 (mass/inertia SDF, PID retune, sensor noise, **non-linear battery model — never the default linear drain**, radar degradation model from real bench data).
 
