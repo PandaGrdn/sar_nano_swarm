@@ -283,6 +283,30 @@ gz service \
          name: \"${MODEL}_${CF_ID}\",
          allow_renaming: 1"
 
+# ── wait for drone sensors to come online before starting firmware ───────────
+# In heavy worlds (e.g. cave), the drone's gz sensor plugins take time to init.
+# Starting cf2 too early drops the first IMU packets and the estimator never
+# recovers (canfly stays 0, drone won't arm). Wait until /cf_0/odom publishes.
+info "Waiting for drone sensors (/cf_${CF_ID}/odom) to come online …"
+_drone_ready=false
+for _i in $(seq 1 30); do
+  if timeout 2 gz topic -e -t "/cf_${CF_ID}/odom" -n 1 >/dev/null 2>&1; then
+    _drone_ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ "$_drone_ready" == true ]]; then
+  info "Drone sensors publishing. Giving them 2s to stabilise …"
+  sleep 2
+else
+  warn "Drone odom not detected after 30s — starting firmware anyway."
+fi
+
+# ── CRITICAL: cf2 needs CF2_SIM_MODEL to bind its SITL sensor interface to the
+# gz drone. Without it, IMU never reaches the firmware and the estimator locks.
+export CF2_SIM_MODEL="gz_${MODEL}"
+
 # ── start SITL firmware ───────────────────────────────────────────────────────
 info "Starting SITL firmware (instance ${CF_ID}) …"
 pushd "$BUILD_DIR/$CF_ID" > /dev/null
