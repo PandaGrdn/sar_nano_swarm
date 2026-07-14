@@ -4,32 +4,8 @@
 #include <gz/sim/Util.hh>
 #include <gz/sim/components/Pose.hh>
 
-#include <cstdlib>
-#include <string>
-
 using namespace radarays_gz2;
 namespace rm = rmagine;
-
-namespace
-{
-std::string ResolveMeshPath(const std::string &path)
-{
-  if (path.empty() || path.front() == '/') {
-    return path;
-  }
-
-  const char *root = std::getenv("SAR_NANO_SWARM_ROOT");
-  if (root == nullptr || root[0] == '\0') {
-    return path;
-  }
-
-  std::string resolved = root;
-  if (resolved.back() != '/') {
-    resolved += '/';
-  }
-  return resolved + path;
-}
-}  // namespace
 
 RadarSensorSystem::RadarSensorSystem() {}
 RadarSensorSystem::~RadarSensorSystem() {}
@@ -42,21 +18,24 @@ void RadarSensorSystem::Configure(
 {
   sensorEntity_ = entity;
 
-  if (!sdf->HasElement("mesh_path")) {
-    gzerr << "radarays_gz2: <mesh_path> is required in the plugin SDF block."
-          << std::endl;
-    return;
+  std::string meshPath = "/home/ethan/crazyflie_ws/src/darpa_subt_worlds/meshes/tunnel.dae";
+  if (sdf->HasElement("mesh_path")) {
+    meshPath = sdf->Get<std::string>("mesh_path");
   }
-
-  const std::string meshPath = ResolveMeshPath(sdf->Get<std::string>("mesh_path"));
   map_ = rm::import_embree_map(meshPath);
 
   radarModel_.theta.min = -M_PI;
   radarModel_.theta.inc = (2.0 * M_PI) / 360.0;
   radarModel_.theta.size = 360;
-  radarModel_.phi.min = 0.0;
-  radarModel_.phi.inc = 1.0;
-  radarModel_.phi.size = 1;
+
+  // Vertical FOV: +/-20 deg across 32 rows (placeholder mmWave-like geometry,
+  // still not a real sensor spec -- see CLAUDE.md Tier C).
+  const double vfov_deg = 40.0;
+  const int vfov_rows = 32;
+  radarModel_.phi.min = -(vfov_deg / 2.0) * M_PI / 180.0;
+  radarModel_.phi.inc = (vfov_deg * M_PI / 180.0) / (vfov_rows - 1);
+  radarModel_.phi.size = vfov_rows;
+
   radarModel_.range.min = 0.1;
   radarModel_.range.max = 30.0;
 
