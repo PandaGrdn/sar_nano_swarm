@@ -23,6 +23,9 @@
 #                        Defaults are auto-detected for built-in worlds; for custom
 #                        worlds you must provide this or pass --no-radar.
 #       --no-radar       Skip radar plugin injection entirely.
+#       --no-payload      Skip mass/inertia payload rewrite (apply_payload.py).
+#       --payload-config PATH
+#                         Path to payload.yaml [default: configs/airframe/payload.yaml]
 #       --no-rviz        Skip RViz launch.
 #       --headless       Skip Gazebo GUI (server + SITL only, useful for CI).
 #       --check          Gate-check mode: start headless, wait 15 s, verify
@@ -58,6 +61,8 @@ Usage: ./eval_scripts/phase0_gate.sh [OPTIONS]
   -y Y                 Spawn Y  [default: 0]
       --mesh PATH      Mesh for radar raycasting (rel to SAR_NANO_SWARM_ROOT)
       --no-radar       Skip radar plugin
+      --no-payload     Skip mass/inertia payload rewrite
+      --payload-config PATH  payload.yaml to use [default: configs/airframe/payload.yaml]
       --no-rviz        Skip RViz
       --headless       Skip Gazebo GUI
       --check          Headless gate-check (prints PASS/FAIL)
@@ -72,6 +77,8 @@ SPAWN_X=0
 SPAWN_Y=0
 MESH_ARG=""
 USE_RADAR=true
+USE_PAYLOAD=true
+PAYLOAD_CONFIG=""
 USE_RVIZ=true
 USE_GUI=true
 GATE_CHECK=false
@@ -84,6 +91,8 @@ while [[ $# -gt 0 ]]; do
     -y)           SPAWN_Y="$2";     shift 2 ;;
     --mesh)       MESH_ARG="$2";    shift 2 ;;
     --no-radar)   USE_RADAR=false;  shift   ;;
+    --no-payload) USE_PAYLOAD=false; shift  ;;
+    --payload-config) PAYLOAD_CONFIG="$2"; shift 2 ;;
     --no-rviz)    USE_RVIZ=false;   shift   ;;
     --headless)   USE_GUI=false;    shift   ;;
     --check)      GATE_CHECK=true; USE_RVIZ=false; USE_GUI=false; shift ;;
@@ -168,6 +177,7 @@ info "World name: $WORLD_NAME"
 # Default meshes keyed by world name (relative to SAR_NANO_SWARM_ROOT).
 declare -A _DEFAULT_MESHES=(
   ["phase0_tunnel_gate"]="sim_worlds/darpa_subt_worlds/worlds/models/cave_world/meshes/cave_world.obj"
+  ["phase1_pid_tune"]=""    # flat/open world, no geometry to raycast against — use --no-radar
   ["crazysim_default"]=""
 )
 
@@ -271,6 +281,28 @@ print(f"[radar-inject] Plugin injected into {sys.argv[1]}")
 PYEOF
 fi
 
+# ── rewrite mass/CoM/inertia for the loaded payload (Phase 1 step 1) ─────────
+# Recomputes base_link's <inertial> from configs/airframe/payload.yaml (base
+# airframe + every enabled sensor/compute deck) so downstream flight dynamics,
+# PID tuning, and the thrust-margin check reflect the real loaded drone, not
+# the stock 27 g default. See
+# .cursor/docs/Phase1_Physical_Fidelity_and_Sensor_Implementation_Plan.md
+if [[ "$USE_PAYLOAD" == true ]]; then
+  _payload_cfg="${PAYLOAD_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/airframe/payload.yaml}"
+  [[ "$_payload_cfg" != /* ]] && _payload_cfg="$SAR_NANO_SWARM_ROOT/$_payload_cfg"
+  if [[ ! -f "$_payload_cfg" ]]; then
+    warn "Payload config not found: $_payload_cfg — skipping mass/inertia rewrite."
+  else
+    info "Applying payload mass/inertia model ($_payload_cfg) …"
+    python3 "$SAR_NANO_SWARM_ROOT/eval_scripts/apply_payload.py" "$SDF_TMP" --payload "$_payload_cfg"
+
+    info "Checking thrust margin …"
+    python3 "$SAR_NANO_SWARM_ROOT/eval_scripts/thrust_margin_check.py" "$SDF_TMP" \
+      --config "$SAR_NANO_SWARM_ROOT/configs/airframe/thrust_margin.yaml" \
+      || warn "Thrust-margin check failed — drone may be under-thrusted for this payload."
+  fi
+fi
+
 # ── spawn Crazyflie in Gazebo ─────────────────────────────────────────────────
 info "Spawning ${MODEL}_${CF_ID} at (${SPAWN_X}, ${SPAWN_Y}) …"
 gz service \
@@ -356,6 +388,7 @@ echo "  ║  cfclient URI : udp://127.0.0.1:${CFLIB_PORT}      ║"
 echo "  ║  World        : ${WORLD_NAME}"
 echo "  ║  Model        : ${MODEL}_${CF_ID}"
 echo "  ║  Radar        : ${USE_RADAR}"
+echo "  ║  Payload model: ${USE_PAYLOAD}"
 echo "  ║  Radar topic  : /radar/points  (~10 Hz)"
 echo "  ╚═══════════════════════════════════════════════╝"
 echo ""

@@ -1,0 +1,52 @@
+pid_rate:
+  roll_kp: 462.2880519548251
+  roll_ki: 500.0
+  roll_kd: 3.1290129819645136
+  roll_kff: 0.0
+  pitch_kp: 341.86592978690487
+  pitch_ki: 500.0
+  pitch_kd: 1.5835357880292937
+  pitch_kff: 0.0
+  yaw_kp: 120.0
+  yaw_ki: 16.7
+  yaw_kd: 0.0
+  yaw_kff: 0.0
+pid_attitude:
+  roll_kp: 11.960175876164975
+  roll_ki: 3.0
+  roll_kd: 1.9270861684184857
+  roll_kff: 0.0
+  pitch_kp: 8.605142917187381
+  pitch_ki: 3.0
+  pitch_kd: 0.9106640476466843
+  pitch_kff: 0.0
+  yaw_kp: 6.0
+  yaw_ki: 1.0
+  yaw_kd: 0.35
+  yaw_kff: 0.0
+velCtlPid:
+  vxKp: 26.545254456776092
+  vxKi: 1.0
+  vxKd: 0.0
+  vxKFF: 0.0
+  vyKp: 39.949772817927695
+  vyKi: 1.0
+  vyKd: 0.0
+  vyKFF: 0.0
+  vzKp: 18.35069901659137
+  vzKi: 15.0
+  vzKd: 0.0
+  vzKFF: 0.0
+posCtlPid:
+  xKp: 1.4679835610086078
+  xKi: 0.0
+  xKd: 0.0
+  xKff: 0.0
+  yKp: 1.1742508365045983
+  yKi: 0.0
+  yKd: 0.0
+  yKff: 0.0
+  zKp: 3.5985284373248057
+  zKi: 0.5
+  zKd: 0.0
+  zKff: 0.0

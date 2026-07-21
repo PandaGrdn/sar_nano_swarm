@@ -13,6 +13,15 @@ fi
 
 export SAR_NANO_SWARM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ROS 2 / colcon / ament generated setup.bash files are known to reference
+# variables (e.g. AMENT_TRACE_SETUP_FILES) without a default, which blows up
+# with "unbound variable" if the calling script runs under `set -u`
+# (phase0_gate.sh does). Relax nounset only around these external sources,
+# then restore whatever the caller had.
+_snsw_had_nounset=0
+case "$-" in *u*) _snsw_had_nounset=1 ;; esac
+set +u
+
 # ROS 2 Humble
 if [[ -f /opt/ros/humble/setup.bash ]]; then
   # shellcheck disable=SC1091
@@ -46,6 +55,9 @@ if [[ -f "${SAR_NANO_SWARM_ROOT}/firmware_mods/CrazySim/crazyswarm2_ws/install/s
   # shellcheck disable=SC1091
   source "${SAR_NANO_SWARM_ROOT}/firmware_mods/CrazySim/crazyswarm2_ws/install/setup.bash"
 fi
+
+if [[ "${_snsw_had_nounset}" == 1 ]]; then set -u; fi
+unset _snsw_had_nounset
 
 # Gazebo model/world search path for DARPA SubT assets
 # Models live under worlds/ and worlds/models/ (model://jersey_barrier, model://cave_world, …)

@@ -1,0 +1,77 @@
+# Composite mass / CoM / inertia model for the loaded Crazyflie airframe.
+#positions in meteres with origin at center of mass before payload is added
+#
+
+
+base:
+  # Stock Crazyflie 2.1 airframe + battery, 4 props (0.0008 kg each) are added as their own components
+  mass_g: 25.0
+  com_xyz_m: [0.0, 0.0, 0.0]
+  inertia:
+    ixx: 1.6572e-5
+    iyy: 1.6656e-5
+    izz: 2.9262e-5
+    ixy: 0.0
+    ixz: 0.0
+    iyz: 0.0
+
+# Point-mass components. Each is treated as a point mass at pose_xyz_m
+# (no self-inertia) and folded into the composite CoM/inertia via the
+# parallel-axis theorem in apply_payload.py. Set enabled: false to exclude
+# a line item from the mass budget without deleting the record of it.
+#
+# Weights are real datasheet values unless flagged PLACEHOLDER 
+components:
+  # 4x rotor/prop assemblies, from the stock SDF (m1..m4_prop links).
+  # Kept explicit here (rather than folded into `base`) so removing/adding
+  # airframe variants (e.g. Brushless motors) is a one-line edit.
+  - name: prop_m1
+    mass_g: 0.8
+    pose_xyz_m: [0.031, -0.031, 0.021]
+    enabled: true
+    source: "stock model.sdf.jinja m1_prop"
+  - name: prop_m2
+    mass_g: 0.8
+    pose_xyz_m: [-0.031, -0.031, 0.021]
+    enabled: true
+    source: "stock model.sdf.jinja m2_prop"
+  - name: prop_m3
+    mass_g: 0.8
+    pose_xyz_m: [-0.031, 0.031, 0.021]
+    enabled: true
+    source: "stock model.sdf.jinja m3_prop"
+  - name: prop_m4
+    mass_g: 0.8
+    pose_xyz_m: [0.031, 0.031, 0.021]
+    enabled: true
+    source: "stock model.sdf.jinja m4_prop"
+
+  # --- Sensor payload (Phase 1 IR ToF + UWB workstreams) ---
+  - name: uwb_loco_deck
+    mass_g: 3.3
+    pose_xyz_m: [0.0, 0.0, 0.010]
+    enabled: true
+    source: "Bitcraze Loco Positioning deck datasheet (DWM1000)"
+  - name: flow_deck_v2
+    mass_g: 1.6
+    pose_xyz_m: [0.0, 0.0, -0.010]
+    enabled: true
+    source: "Bitcraze Flow deck v2 datasheet (VL53L1x down ToF + PMW3901 flow)"
+
+  # --- Not yet on the mass budget: measure real hardware before enabling ---
+  - name: gap9_compute_shield
+    mass_g: 6.0
+    pose_xyz_m: [0.0, 0.0, 0.008]
+    enabled: false
+    source: "PLACEHOLDER — no public datasheet for the custom shield; weigh it"
+  - name: mmwave_radar_module
+    mass_g: 4.5
+    pose_xyz_m: [0.02, 0.0, 0.0]
+    enabled: false
+    source: "PLACEHOLDER — depends on chosen 24/60/70-80GHz dev kit; weigh it"
+  - name: anchor_pucks
+    mass_g: 15.0
+    count: 0
+    pose_xyz_m: [0.0, 0.0, -0.015]
+    enabled: false
+    source: "PLACEHOLDER — per-puck mass x carried count; weigh a puck, set count"

@@ -1,0 +1,9 @@
+# Force LF on shell/python/config scripts so they run under WSL bash/ROS/gz
+# even when edited from Windows. Windows editors (and some tools) otherwise
+# rewrite these with CRLF, which breaks `source setup_env.sh` and every
+# eval_scripts/*.sh / *.py at runtime ("$'\r': command not found").
+*.sh    text eol=lf
+*.bash  text eol=lf
+*.py    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf

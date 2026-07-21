@@ -1,10 +1,12 @@
 # Python tooling for evaluation and experiment tracking
 mlflow>=3.0,<4.0
+optuna>=3.0,<5.0
 
 # CrazySim / Crazyswarm2 dependencies (see firmware_mods/CrazySim/README.md)
 Jinja2
 numpy
 tomli
+PyYAML
 
 # Optional: MuJoCo backend for CrazySim
 # mujoco

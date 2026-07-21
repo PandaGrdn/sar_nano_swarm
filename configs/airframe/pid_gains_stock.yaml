@@ -1,0 +1,68 @@
+# Stock cf2/SITL default PID gains, transcribed from
+# firmware_mods/CrazySim/crazyflie-firmware/src/platform/interface/platform_defaults_sitl.h
+# (verify against that file if CrazySim's submodule commit is ever bumped).
+#
+# This is the UNLOADED-mass baseline and the search starting point for
+# eval_scripts/tune_pid.py (Phase 1 M2). Every key below is a runtime CFLib
+# parameter name, verified against the firmware's PARAM_ADD() calls in:
+#   - src/modules/src/controller/attitude_pid_controller.c  (pid_rate, pid_attitude)
+#   - src/modules/src/controller/position_controller_pid.c  (velCtlPid, posCtlPid)
+#
+# Do NOT hand-edit this file's values — it's a fixed reference point.
+# Tuning output goes to pid_gains_loaded.yaml instead.
+
+pid_rate:
+  roll_kp: 250.0
+  roll_ki: 500.0
+  roll_kd: 2.5
+  roll_kff: 0.0
+  pitch_kp: 250.0
+  pitch_ki: 500.0
+  pitch_kd: 2.5
+  pitch_kff: 0.0
+  yaw_kp: 120.0
+  yaw_ki: 16.7
+  yaw_kd: 0.0
+  yaw_kff: 0.0
+
+pid_attitude:
+  roll_kp: 6.0
+  roll_ki: 3.0
+  roll_kd: 0.0
+  roll_kff: 0.0
+  pitch_kp: 6.0
+  pitch_ki: 3.0
+  pitch_kd: 0.0
+  pitch_kff: 0.0
+  yaw_kp: 6.0
+  yaw_ki: 1.0
+  yaw_kd: 0.35
+  yaw_kff: 0.0
+
+velCtlPid:
+  vxKp: 25.0
+  vxKi: 1.0
+  vxKd: 0.0
+  vxKFF: 0.0
+  vyKp: 25.0
+  vyKi: 1.0
+  vyKd: 0.0
+  vyKFF: 0.0
+  vzKp: 25.0
+  vzKi: 15.0
+  vzKd: 0.0
+  vzKFF: 0.0
+
+posCtlPid:
+  xKp: 2.0
+  xKi: 0.0
+  xKd: 0.0
+  xKff: 0.0
+  yKp: 2.0
+  yKi: 0.0
+  yKd: 0.0
+  yKff: 0.0
+  zKp: 2.0
+  zKi: 0.5
+  zKd: 0.0
+  zKff: 0.0

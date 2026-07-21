@@ -1,0 +1,99 @@
+# Phase 1 M2 — PID retune search config for eval_scripts/tune_pid.py.
+# See .cursor/docs/Phase1_Physical_Fidelity_and_Sensor_Implementation_Plan.md §3.4.
+#
+# Two-stage cascade (classical control practice: tune the inner/fast loop
+# before the outer/slow loop that depends on it):
+#   Stage 1 (inner) : pid_rate + pid_attitude  -> attitude step-disturbance test
+#   Stage 2 (outer) : velCtlPid + posCtlPid    -> position step-response test
+# ki/kff and all yaw gains are held at stock values in both stages to keep
+# the per-stage search space small (~8-9 dims) and because payload changes
+# from configs/airframe/payload.yaml mostly perturb roll/pitch inertia, not
+# yaw. Reopen this scope if yaw hunting shows up during hover testing.
+
+connection:
+  uri: "udp://127.0.0.1:19850"
+  # gz world name (must match the <world name="..."> the SITL instance was
+  # launched against, e.g. via:
+  #   ./eval_scripts/phase0_gate.sh -w phase1_pid_tune --no-radar --headless
+  world_name: "phase1_pid_tune"
+  model_name: "crazyflie_0"     # entity name as spawned by phase0_gate.sh
+  # Which estimator's runtime reset param to fire between trials.
+  # "kalman" -> kalman.resetEstimation (estimator_kalman.c, SITL default).
+  # "ukf"    -> ukf.resetEstimation (estimator_ukf.c), if you switch estimators.
+  estimator_reset_group: "kalman"
+
+optuna:
+  n_trials_stage1: 40
+  n_trials_stage2: 40
+  sampler: "TPE"          # Optuna default; classical/optimizer-based per AGENTS.md Tier A
+  seed: 42
+  mlflow_experiment: "phase1_pid_tune"
+  # If this many trials in a row hit the per-trial watchdog timeout, the study
+  # aborts cleanly instead of grinding through the rest against a dead firmware.
+  # CrazySim's cf2 SITL is known to segfault on long/aggressive sweeps; when it
+  # does, cflib's blocking SyncLogger would otherwise hang tune_pid forever.
+  max_consecutive_timeouts: 3
+
+# Search bounds as [low, high] MULTIPLIERS on the stock gain in
+# pid_gains_stock.yaml (e.g. 0.5 - 2.0 means search 50%-200% of stock).
+# Multiplier bounds keep the search physically sane across whatever payload
+# mass is currently in configs/airframe/payload.yaml, rather than hard-coding
+# absolute gain values that only make sense for one mass.
+search_bounds:
+  stage1:
+    pid_rate.roll_kp:  [0.5, 2.0]
+    pid_rate.roll_kd:  [0.2, 3.0]
+    pid_rate.pitch_kp: [0.5, 2.0]
+    pid_rate.pitch_kd: [0.2, 3.0]
+    pid_attitude.roll_kp:  [0.5, 2.0]
+    pid_attitude.roll_kd:  [0.0, 3.0]   # stock kd is 0.0 -> search an additive range instead
+    pid_attitude.pitch_kp: [0.5, 2.0]
+    pid_attitude.pitch_kd: [0.0, 3.0]
+  stage2:
+    velCtlPid.vxKp: [0.5, 2.0]
+    velCtlPid.vxKd: [0.0, 3.0]
+    velCtlPid.vyKp: [0.5, 2.0]
+    velCtlPid.vyKd: [0.0, 3.0]
+    velCtlPid.vzKp: [0.5, 2.0]
+    posCtlPid.xKp:  [0.5, 2.0]
+    posCtlPid.yKp:  [0.5, 2.0]
+    posCtlPid.zKp:  [0.5, 2.0]
+
+# Additive (not multiplicative) params: for gains whose stock value is 0.0,
+# a multiplier range is meaningless. Listed keys above with stock 0.0
+# (pid_attitude.roll_kd, pid_attitude.pitch_kd) are instead searched as an
+# ABSOLUTE value in the given [low, high] range by tune_pid.py.
+additive_params: ["pid_attitude.roll_kd", "pid_attitude.pitch_kd"]
+
+maneuver:
+  hover_height_m: 0.5
+  settle_time_s: 2.0          # time to hover before applying the test disturbance
+  stage1_kick_vx_mps: 0.5     # brief body-x velocity kick to excite roll/pitch
+  stage1_kick_duration_s: 0.3
+  stage1_measure_window_s: 2.0   # measurement window after the kick starts
+  stage2_step_dx_m: 0.5       # position step for the outer-loop test
+  stage2_measure_window_s: 4.0
+  log_period_ms: 20           # ~50 Hz logging during measurement windows
+  inter_trial_idle_s: 1.5     # idle hold before resetting pose/estimator for next trial
+  # Hard per-trial wall-clock budget (SIGALRM watchdog in tune_pid.py). Normal
+  # trials are ~15-20 s; exceeding this marks the trial diverged rather than
+  # letting a dead-firmware SyncLogger block forever. Raise it if your sim runs
+  # well below real-time and legitimately slow trials get flagged.
+  trial_timeout_s: 45.0
+
+cost:
+  # cost = w_itae * ITAE + w_overshoot * max_overshoot + w_ss_err * |final_error|
+  # ITAE = integral of t * |error(t)| dt (classical, penalizes slow AND
+  # oscillatory responses without needing a hand-tuned settling-time band).
+  w_itae: 1.0
+  w_overshoot: 2.0
+  w_steady_state_error: 5.0
+  # Trials that never stabilize (estimator diverges, NaN, or crosses this
+  # safety bound) are assigned this large finite penalty rather than being
+  # dropped, so Optuna still learns to avoid that region of gain space.
+  divergence_penalty: 1000.0
+  divergence_bound_m: 3.0
+
+output:
+  gains_path: "configs/airframe/pid_gains_loaded.yaml"
+  report_path: "eval_scripts/_pid_tune_report.json"
