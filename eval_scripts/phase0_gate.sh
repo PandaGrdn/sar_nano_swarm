@@ -26,6 +26,9 @@
 #       --no-payload      Skip mass/inertia payload rewrite (apply_payload.py).
 #       --payload-config PATH
 #                         Path to payload.yaml [default: configs/airframe/payload.yaml]
+#       --no-tof         Skip IR ToF rangefinder sensor injection (apply_tof_sensor.py).
+#       --tof-config PATH
+#                         Path to tof.yaml [default: configs/sensors/tof.yaml]
 #       --no-rviz        Skip RViz launch.
 #       --headless       Skip Gazebo GUI (server + SITL only, useful for CI).
 #       --check          Gate-check mode: start headless, wait 15 s, verify
@@ -63,6 +66,8 @@ Usage: ./eval_scripts/phase0_gate.sh [OPTIONS]
       --no-radar       Skip radar plugin
       --no-payload     Skip mass/inertia payload rewrite
       --payload-config PATH  payload.yaml to use [default: configs/airframe/payload.yaml]
+      --no-tof         Skip IR ToF rangefinder sensor injection
+      --tof-config PATH  tof.yaml to use [default: configs/sensors/tof.yaml]
       --no-rviz        Skip RViz
       --headless       Skip Gazebo GUI
       --check          Headless gate-check (prints PASS/FAIL)
@@ -79,6 +84,8 @@ MESH_ARG=""
 USE_RADAR=true
 USE_PAYLOAD=true
 PAYLOAD_CONFIG=""
+USE_TOF=true
+TOF_CONFIG=""
 USE_RVIZ=true
 USE_GUI=true
 GATE_CHECK=false
@@ -93,6 +100,8 @@ while [[ $# -gt 0 ]]; do
     --no-radar)   USE_RADAR=false;  shift   ;;
     --no-payload) USE_PAYLOAD=false; shift  ;;
     --payload-config) PAYLOAD_CONFIG="$2"; shift 2 ;;
+    --no-tof)     USE_TOF=false;   shift   ;;
+    --tof-config) TOF_CONFIG="$2"; shift 2 ;;
     --no-rviz)    USE_RVIZ=false;   shift   ;;
     --headless)   USE_GUI=false;    shift   ;;
     --check)      GATE_CHECK=true; USE_RVIZ=false; USE_GUI=false; shift ;;
@@ -303,6 +312,21 @@ if [[ "$USE_PAYLOAD" == true ]]; then
   fi
 fi
 
+# ── inject IR ToF rangefinder sensor(s) (Phase 1 M3, §4.1) ───────────────────
+# Pure-geometry gpu_lidar beam(s) into base_link. Mass already accounted for
+# in payload.yaml (flow_deck_v2 component) — this only adds the sensor element.
+if [[ "$USE_TOF" == true ]]; then
+  _tof_cfg="${TOF_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/sensors/tof.yaml}"
+  [[ "$_tof_cfg" != /* ]] && _tof_cfg="$SAR_NANO_SWARM_ROOT/$_tof_cfg"
+  if [[ ! -f "$_tof_cfg" ]]; then
+    warn "ToF config not found: $_tof_cfg — skipping sensor injection."
+  else
+    info "Injecting IR ToF sensor(s) ($_tof_cfg) …"
+    python3 "$SAR_NANO_SWARM_ROOT/eval_scripts/apply_tof_sensor.py" "$SDF_TMP" \
+      --config "$_tof_cfg" --cf-id "$CF_ID"
+  fi
+fi
+
 # ── spawn Crazyflie in Gazebo ─────────────────────────────────────────────────
 info "Spawning ${MODEL}_${CF_ID} at (${SPAWN_X}, ${SPAWN_Y}) …"
 gz service \
@@ -345,6 +369,24 @@ pushd "$BUILD_DIR/$CF_ID" > /dev/null
 "$CF2_BIN" "$CFFIRM_PORT" > out.log 2> error.log &
 _PIDS+=($!)
 popd > /dev/null
+
+# ── optional: bridge ToF gz topic(s) to ROS 2 for Phase-2 EKF consumption ────
+# ros_gz_bridge lives in the separate source-built workspace sourced by
+# setup_env.sh (${ROS_GZ_WS:-$HOME/ros2_ws}/install) — NOT the apt package, so
+# `apt-cache policy ros-humble-ros-gz-bridge` alone will look like it's
+# missing even when it's actually available here. Verified live (2026-07-21):
+# bridges /cf_${CF_ID}/tof_down (gz.msgs.LaserScan) -> ROS
+# sensor_msgs/msg/LaserScan, confirmed publishing at ~27-28 Hz via
+# `ros2 topic hz`.
+if [[ "$USE_TOF" == true ]] && command -v ros2 &>/dev/null && ros2 pkg prefix ros_gz_bridge &>/dev/null; then
+  info "Bridging /cf_${CF_ID}/tof_down to ROS 2 (sensor_msgs/msg/LaserScan) …"
+  ros2 run ros_gz_bridge parameter_bridge \
+    "/cf_${CF_ID}/tof_down@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan" &
+  _PIDS+=($!)
+elif [[ "$USE_TOF" == true ]]; then
+  warn "ros_gz_bridge not installed — /cf_${CF_ID}/tof_down is gz-native only (no ROS topic)."
+  warn "Install with: sudo apt install ros-humble-ros-gz-bridge"
+fi
 
 # ── launch RViz ───────────────────────────────────────────────────────────────
 RVIZ_CFG="$SAR_NANO_SWARM_ROOT/configs/rviz/radar.rviz"
@@ -389,7 +431,9 @@ echo "  ║  World        : ${WORLD_NAME}"
 echo "  ║  Model        : ${MODEL}_${CF_ID}"
 echo "  ║  Radar        : ${USE_RADAR}"
 echo "  ║  Payload model: ${USE_PAYLOAD}"
+echo "  ║  ToF sensor   : ${USE_TOF}"
 echo "  ║  Radar topic  : /radar/points  (~10 Hz)"
+echo "  ║  ToF topic    : /cf_${CF_ID}/tof_down  (gz-native, ~30 Hz)"
 echo "  ╚═══════════════════════════════════════════════╝"
 echo ""
 
