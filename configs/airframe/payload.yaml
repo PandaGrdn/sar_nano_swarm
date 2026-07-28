@@ -47,11 +47,17 @@ components:
     source: "stock model.sdf.jinja m4_prop"
 
   # --- Sensor payload (Phase 1 IR ToF + UWB workstreams) ---
-  - name: uwb_loco_deck
-    mass_g: 3.3
+  # v3 roadmap (Simulation_Training_Optimization_Roadmap_v3_MOONSHOT.md) replaces
+  # drone<->anchor UWB ranging with an inter-drone PDoA (range+bearing) mesh, which
+  # needs a 2nd antenna for phase-difference angle sensing — a single-antenna Loco
+  # deck (DWM1000, range-only) can no longer do the job. Renamed + mass bumped
+  # slightly above the Loco deck's 3.3 g to budget for the 2nd antenna/RF switch
+  # until a real part is chosen (v3 defers hardware purchase to Phase 11).
+  - name: uwb_pdoa_module
+    mass_g: 4.0
     pose_xyz_m: [0.0, 0.0, 0.010]
     enabled: true
-    source: "Bitcraze Loco Positioning deck datasheet (DWM1000)"
+    source: "PLACEHOLDER — dual-antenna UWB PDoA module (inter-drone range+bearing, v3 roadmap); no committed part yet, budgeted ~0.7 g above the single-antenna Bitcraze Loco deck (3.3 g datasheet) for the 2nd antenna/RF switch. Candidates are DW3xxx-class dual-antenna boards (see v3 roadmap Phase 1 item 1 / ETH-PBL reference design). Weigh the real part once chosen."
   - name: flow_deck_v2
     mass_g: 1.6
     pose_xyz_m: [0.0, 0.0, -0.010]
@@ -69,9 +75,9 @@ components:
     pose_xyz_m: [0.02, 0.0, 0.0]
     enabled: false
     source: "PLACEHOLDER — depends on chosen 24/60/70-80GHz dev kit; weigh it"
-  - name: anchor_pucks
-    mass_g: 15.0
-    count: 0
-    pose_xyz_m: [0.0, 0.0, -0.015]
-    enabled: false
-    source: "PLACEHOLDER — per-puck mass x carried count; weigh a puck, set count"
+
+  # anchor_pucks component RETIRED (v3 roadmap, Phase 6: "Remove: puck payload
+  # handling and drop-mechanism behaviors" — no infrastructure is dropped inside
+  # the structure anymore, UWB localization is entirely inter-drone PDoA + a fixed
+  # entrance node instead). Was already enabled: false / count: 0 (contributed
+  # zero mass), so this removal doesn't change any prior gate numbers.
