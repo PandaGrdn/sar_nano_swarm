@@ -23,6 +23,15 @@
 #                        Defaults are auto-detected for built-in worlds; for custom
 #                        worlds you must provide this or pass --no-radar.
 #       --no-radar       Skip radar plugin injection entirely.
+#       --no-payload      Skip mass/inertia payload rewrite (apply_payload.py).
+#       --payload-config PATH
+#                         Path to payload.yaml [default: configs/airframe/payload.yaml]
+#       --no-tof         Skip IR ToF rangefinder sensor injection (apply_tof_sensor.py).
+#       --tof-config PATH
+#                         Path to tof.yaml [default: configs/sensors/tof.yaml]
+#       --no-flow        Skip PMW3901 optical-flow node (perception/flow_sim/flow_node.py).
+#       --flow-config PATH
+#                         Path to optical_flow.yaml [default: configs/sensors/optical_flow.yaml]
 #       --no-rviz        Skip RViz launch.
 #       --headless       Skip Gazebo GUI (server + SITL only, useful for CI).
 #       --check          Gate-check mode: start headless, wait 15 s, verify
@@ -58,6 +67,12 @@ Usage: ./eval_scripts/phase0_gate.sh [OPTIONS]
   -y Y                 Spawn Y  [default: 0]
       --mesh PATH      Mesh for radar raycasting (rel to SAR_NANO_SWARM_ROOT)
       --no-radar       Skip radar plugin
+      --no-payload     Skip mass/inertia payload rewrite
+      --payload-config PATH  payload.yaml to use [default: configs/airframe/payload.yaml]
+      --no-tof         Skip IR ToF rangefinder sensor injection
+      --tof-config PATH  tof.yaml to use [default: configs/sensors/tof.yaml]
+      --no-flow        Skip PMW3901 optical-flow node
+      --flow-config PATH  optical_flow.yaml [default: configs/sensors/optical_flow.yaml]
       --no-rviz        Skip RViz
       --headless       Skip Gazebo GUI
       --check          Headless gate-check (prints PASS/FAIL)
@@ -72,6 +87,12 @@ SPAWN_X=0
 SPAWN_Y=0
 MESH_ARG=""
 USE_RADAR=true
+USE_PAYLOAD=true
+PAYLOAD_CONFIG=""
+USE_TOF=true
+TOF_CONFIG=""
+USE_FLOW=true
+FLOW_CONFIG=""
 USE_RVIZ=true
 USE_GUI=true
 GATE_CHECK=false
@@ -84,6 +105,12 @@ while [[ $# -gt 0 ]]; do
     -y)           SPAWN_Y="$2";     shift 2 ;;
     --mesh)       MESH_ARG="$2";    shift 2 ;;
     --no-radar)   USE_RADAR=false;  shift   ;;
+    --no-payload) USE_PAYLOAD=false; shift  ;;
+    --payload-config) PAYLOAD_CONFIG="$2"; shift 2 ;;
+    --no-tof)     USE_TOF=false;   shift   ;;
+    --tof-config) TOF_CONFIG="$2"; shift 2 ;;
+    --no-flow)    USE_FLOW=false;  shift   ;;
+    --flow-config) FLOW_CONFIG="$2"; shift 2 ;;
     --no-rviz)    USE_RVIZ=false;   shift   ;;
     --headless)   USE_GUI=false;    shift   ;;
     --check)      GATE_CHECK=true; USE_RVIZ=false; USE_GUI=false; shift ;;
@@ -168,6 +195,7 @@ info "World name: $WORLD_NAME"
 # Default meshes keyed by world name (relative to SAR_NANO_SWARM_ROOT).
 declare -A _DEFAULT_MESHES=(
   ["phase0_tunnel_gate"]="sim_worlds/darpa_subt_worlds/worlds/models/cave_world/meshes/cave_world.obj"
+  ["phase1_pid_tune"]=""    # flat/open world, no geometry to raycast against — use --no-radar
   ["crazysim_default"]=""
 )
 
@@ -271,6 +299,43 @@ print(f"[radar-inject] Plugin injected into {sys.argv[1]}")
 PYEOF
 fi
 
+# ── rewrite mass/CoM/inertia for the loaded payload (Phase 1 step 1) ─────────
+# Recomputes base_link's <inertial> from configs/airframe/payload.yaml (base
+# airframe + every enabled sensor/compute deck) so downstream flight dynamics,
+# PID tuning, and the thrust-margin check reflect the real loaded drone, not
+# the stock 27 g default. See
+# .cursor/docs/Phase1_Physical_Fidelity_and_Sensor_Implementation_Plan.md
+if [[ "$USE_PAYLOAD" == true ]]; then
+  _payload_cfg="${PAYLOAD_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/airframe/payload.yaml}"
+  [[ "$_payload_cfg" != /* ]] && _payload_cfg="$SAR_NANO_SWARM_ROOT/$_payload_cfg"
+  if [[ ! -f "$_payload_cfg" ]]; then
+    warn "Payload config not found: $_payload_cfg — skipping mass/inertia rewrite."
+  else
+    info "Applying payload mass/inertia model ($_payload_cfg) …"
+    python3 "$SAR_NANO_SWARM_ROOT/eval_scripts/apply_payload.py" "$SDF_TMP" --payload "$_payload_cfg"
+
+    info "Checking thrust margin …"
+    python3 "$SAR_NANO_SWARM_ROOT/eval_scripts/thrust_margin_check.py" "$SDF_TMP" \
+      --config "$SAR_NANO_SWARM_ROOT/configs/airframe/thrust_margin.yaml" \
+      || warn "Thrust-margin check failed — drone may be under-thrusted for this payload."
+  fi
+fi
+
+# ── inject IR ToF rangefinder sensor(s) (Phase 1 M3, §4.1) ───────────────────
+# Pure-geometry gpu_lidar beam(s) into base_link. Mass already accounted for
+# in payload.yaml (flow_deck_v2 component) — this only adds the sensor element.
+if [[ "$USE_TOF" == true ]]; then
+  _tof_cfg="${TOF_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/sensors/tof.yaml}"
+  [[ "$_tof_cfg" != /* ]] && _tof_cfg="$SAR_NANO_SWARM_ROOT/$_tof_cfg"
+  if [[ ! -f "$_tof_cfg" ]]; then
+    warn "ToF config not found: $_tof_cfg — skipping sensor injection."
+  else
+    info "Injecting IR ToF sensor(s) ($_tof_cfg) …"
+    python3 "$SAR_NANO_SWARM_ROOT/eval_scripts/apply_tof_sensor.py" "$SDF_TMP" \
+      --config "$_tof_cfg" --cf-id "$CF_ID"
+  fi
+fi
+
 # ── spawn Crazyflie in Gazebo ─────────────────────────────────────────────────
 info "Spawning ${MODEL}_${CF_ID} at (${SPAWN_X}, ${SPAWN_Y}) …"
 gz service \
@@ -314,6 +379,46 @@ pushd "$BUILD_DIR/$CF_ID" > /dev/null
 _PIDS+=($!)
 popd > /dev/null
 
+# ── optional: bridge ToF gz topic(s) to ROS 2 for Phase-2 EKF consumption ────
+# ros_gz_bridge lives in the separate source-built workspace sourced by
+# setup_env.sh (${ROS_GZ_WS:-$HOME/ros2_ws}/install) — NOT the apt package, so
+# `apt-cache policy ros-humble-ros-gz-bridge` alone will look like it's
+# missing even when it's actually available here. Verified live (2026-07-21):
+# bridges /cf_${CF_ID}/tof_down (gz.msgs.LaserScan) -> ROS
+# sensor_msgs/msg/LaserScan, confirmed publishing at ~27-28 Hz via
+# `ros2 topic hz`.
+if [[ "$USE_TOF" == true || "$USE_FLOW" == true ]] && command -v ros2 &>/dev/null && ros2 pkg prefix ros_gz_bridge &>/dev/null; then
+  _bridge_topics=()
+  if [[ "$USE_TOF" == true ]]; then
+    _bridge_topics+=("/cf_${CF_ID}/tof_down@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan")
+  fi
+  if [[ "$USE_FLOW" == true ]]; then
+    _bridge_topics+=("/cf_${CF_ID}/odom@nav_msgs/msg/Odometry[gz.msgs.Odometry")
+  fi
+  info "Bridging gz topics to ROS 2: ${_bridge_topics[*]} …"
+  ros2 run ros_gz_bridge parameter_bridge "${_bridge_topics[@]}" &
+  _PIDS+=($!)
+elif [[ "$USE_TOF" == true || "$USE_FLOW" == true ]]; then
+  warn "ros_gz_bridge not installed — gz-native topics not bridged to ROS."
+  warn "Install with: sudo apt install ros-humble-ros-gz-bridge (or source setup_env.sh)."
+fi
+
+# ── launch PMW3901 optical-flow node (Phase 1 M3b, §4.2) ───────────────────────
+if [[ "$USE_FLOW" == true ]]; then
+  _flow_cfg="${FLOW_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/sensors/optical_flow.yaml}"
+  [[ "$_flow_cfg" != /* ]] && _flow_cfg="$SAR_NANO_SWARM_ROOT/$_flow_cfg"
+  if [[ ! -f "$_flow_cfg" ]]; then
+    warn "Optical-flow config not found: $_flow_cfg — skipping flow node."
+  elif ! command -v ros2 &>/dev/null; then
+    warn "ros2 not on PATH — skipping optical-flow node (source setup_env.sh)."
+  else
+    info "Starting PMW3901 optical-flow node ($_flow_cfg) …"
+    python3 -u "$SAR_NANO_SWARM_ROOT/perception/flow_sim/flow_node.py" \
+      --config "$_flow_cfg" --cf-id "$CF_ID" &
+    _PIDS+=($!)
+  fi
+fi
+
 # ── launch RViz ───────────────────────────────────────────────────────────────
 RVIZ_CFG="$SAR_NANO_SWARM_ROOT/configs/rviz/radar.rviz"
 
@@ -356,7 +461,12 @@ echo "  ║  cfclient URI : udp://127.0.0.1:${CFLIB_PORT}      ║"
 echo "  ║  World        : ${WORLD_NAME}"
 echo "  ║  Model        : ${MODEL}_${CF_ID}"
 echo "  ║  Radar        : ${USE_RADAR}"
+echo "  ║  Payload model: ${USE_PAYLOAD}"
+echo "  ║  ToF sensor   : ${USE_TOF}"
+echo "  ║  Optical flow : ${USE_FLOW}"
 echo "  ║  Radar topic  : /radar/points  (~10 Hz)"
+echo "  ║  ToF topic    : /cf_${CF_ID}/tof_down  (gz-native, ~30 Hz)"
+echo "  ║  Flow topic   : /cf_${CF_ID}/flow  (ROS, ~100 Hz)"
 echo "  ╚═══════════════════════════════════════════════╝"
 echo ""
 

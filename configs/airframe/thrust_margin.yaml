@@ -1,0 +1,9 @@
+gravity_mps2: 9.80665
+
+# Minimum acceptable thrust-to-weight ratio at full throttle. 1.5 is a
+# common quadrotor floor for adequate control authority (attitude control
+# needs headroom above pure hover thrust); tune if you have a better
+# number for the nano-drone regime.
+min_thrust_to_weight: 1.5
+
+mlflow_experiment: "phase1_airframe"

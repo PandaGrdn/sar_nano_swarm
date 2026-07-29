@@ -1,0 +1,64 @@
+# PMW3901 downward optical flow — Phase 1 M3b.
+# See .cursor/docs/M3b_Optical_Flow_Implementation_Plan.md
+#
+# The PMW3901 is the SECOND chip on the Bitcraze Flow deck v2. The first is the
+# VL53L1x IR ToF rangefinder (M3a, configs/sensors/tof.yaml) — a different chip
+# measuring a different quantity. Flow is NOT computed from ToF; ToF only
+# supplies the height this model divides by.
+#
+# Simulated analytically by perception/flow_sim/flow_node.py using the exact
+# measurement equation the Crazyflie firmware's EKF uses
+# (firmware_mods/CrazySim/crazyflie-firmware/src/modules/src/kalman_core/mm_flow.c).
+# Active only when configs/sensors/tof.yaml has `deck: flow_v2`.
+#
+# FIDELITY (AGENTS.md §5): geometry + noise are high-fidelity. The surface map
+# below is a HAND-AUTHORED Tier B input, not a measurement — we may claim
+# "dropout on low-texture floors is modelled", NOT "the sim validates where the
+# real texture threshold is".
+
+# --- chip constants (verified against mm_flow.c / flowdeck_v1v2.c — see the
+# --- plan doc §2.1 for file:line. Do not change without re-reading them.)
+npix: 35.0                  # mm_flow.c:43
+thetapix_rad: 0.71674       # mm_flow.c:45  (~41.1 deg aperture)
+flow_resolution: 0.1        # mm_flow.c:29  driver reports 10x motion pixels
+outlier_limit_px: 100       # flowdeck_v1v2.c:45  (driver units)
+
+# --- rates & noise (Tier B)
+update_rate_hz: 100         # flowdeck_v1v2.c:88 vTaskDelay(10) == 10 ms
+flow_std_px: 2.0            # flowdeck_v1v2.c:77 flowStdFixed, driver units
+quality_eps: 0.05           # floor on the quality divisor in sigma_px
+max_flow_rad_s: 7.4         # angular flow-rate saturation (v/h), NOT m/s
+z_floor_m: 0.1              # mm_flow.c:67-72 singularity clamp
+r22_min: 0.5                # guard on the 1/cos(tilt) inversion in the derived vx/vy
+invalid_variance: 1.0e6     # sentinel in twist.covariance when valid == false
+
+# --- height input
+height_source: tof          # tof | truth   (truth = debug/ablation only)
+tof_stale_s: 0.2            # older than this -> height unknown -> invalid
+tof_min_valid_m: 0.04       # mirrors tof.yaml range_min_m
+tof_max_valid_m: 4.0        # mirrors tof.yaml range_max_m
+
+# --- validity / quality model (plan §4.2)
+min_quality: 0.15
+min_height_m: 0.08
+good_height_min_m: 0.15
+good_height_max_m: 2.5
+max_height_m: 4.0
+tilt_full_deg: 15.0
+tilt_zero_deg: 45.0
+omega_lowpass_alpha: 0.3    # single-pole on body angular rate from quaternion diff
+
+# --- surface texture map (world frame, axis-aligned rects; last match wins)
+# quality 1.0 = richly textured rubble/concrete; 0.0 = polished glass.
+default_texture_quality: 1.0
+surface_patches:
+  # Low-texture patch used by flow_gate.py's dropout test. Keep it clear of the
+  # (0,0) spawn so takeoff and the hover leg happen over good texture.
+  - {name: smooth_tile, x_min: 1.0, x_max: 3.0, y_min: -1.0, y_max: 1.0, texture_quality: 0.0}
+
+# --- debug
+publish_ground_truth: true  # /cf_<id>/flow/debug_truth — SIM ORACLE, AGENTS.md §1
+                            # Tier A: the estimator must NEVER subscribe to it.
+seed: 0
+
+mlflow_experiment: "phase1_optical_flow"
