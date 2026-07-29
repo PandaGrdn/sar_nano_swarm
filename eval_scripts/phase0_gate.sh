@@ -29,6 +29,9 @@
 #       --no-tof         Skip IR ToF rangefinder sensor injection (apply_tof_sensor.py).
 #       --tof-config PATH
 #                         Path to tof.yaml [default: configs/sensors/tof.yaml]
+#       --no-flow        Skip PMW3901 optical-flow node (perception/flow_sim/flow_node.py).
+#       --flow-config PATH
+#                         Path to optical_flow.yaml [default: configs/sensors/optical_flow.yaml]
 #       --no-rviz        Skip RViz launch.
 #       --headless       Skip Gazebo GUI (server + SITL only, useful for CI).
 #       --check          Gate-check mode: start headless, wait 15 s, verify
@@ -68,6 +71,8 @@ Usage: ./eval_scripts/phase0_gate.sh [OPTIONS]
       --payload-config PATH  payload.yaml to use [default: configs/airframe/payload.yaml]
       --no-tof         Skip IR ToF rangefinder sensor injection
       --tof-config PATH  tof.yaml to use [default: configs/sensors/tof.yaml]
+      --no-flow        Skip PMW3901 optical-flow node
+      --flow-config PATH  optical_flow.yaml [default: configs/sensors/optical_flow.yaml]
       --no-rviz        Skip RViz
       --headless       Skip Gazebo GUI
       --check          Headless gate-check (prints PASS/FAIL)
@@ -86,6 +91,8 @@ USE_PAYLOAD=true
 PAYLOAD_CONFIG=""
 USE_TOF=true
 TOF_CONFIG=""
+USE_FLOW=true
+FLOW_CONFIG=""
 USE_RVIZ=true
 USE_GUI=true
 GATE_CHECK=false
@@ -102,6 +109,8 @@ while [[ $# -gt 0 ]]; do
     --payload-config) PAYLOAD_CONFIG="$2"; shift 2 ;;
     --no-tof)     USE_TOF=false;   shift   ;;
     --tof-config) TOF_CONFIG="$2"; shift 2 ;;
+    --no-flow)    USE_FLOW=false;  shift   ;;
+    --flow-config) FLOW_CONFIG="$2"; shift 2 ;;
     --no-rviz)    USE_RVIZ=false;   shift   ;;
     --headless)   USE_GUI=false;    shift   ;;
     --check)      GATE_CHECK=true; USE_RVIZ=false; USE_GUI=false; shift ;;
@@ -378,14 +387,36 @@ popd > /dev/null
 # bridges /cf_${CF_ID}/tof_down (gz.msgs.LaserScan) -> ROS
 # sensor_msgs/msg/LaserScan, confirmed publishing at ~27-28 Hz via
 # `ros2 topic hz`.
-if [[ "$USE_TOF" == true ]] && command -v ros2 &>/dev/null && ros2 pkg prefix ros_gz_bridge &>/dev/null; then
-  info "Bridging /cf_${CF_ID}/tof_down to ROS 2 (sensor_msgs/msg/LaserScan) …"
-  ros2 run ros_gz_bridge parameter_bridge \
-    "/cf_${CF_ID}/tof_down@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan" &
+if [[ "$USE_TOF" == true || "$USE_FLOW" == true ]] && command -v ros2 &>/dev/null && ros2 pkg prefix ros_gz_bridge &>/dev/null; then
+  _bridge_topics=()
+  if [[ "$USE_TOF" == true ]]; then
+    _bridge_topics+=("/cf_${CF_ID}/tof_down@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan")
+  fi
+  if [[ "$USE_FLOW" == true ]]; then
+    _bridge_topics+=("/cf_${CF_ID}/odom@nav_msgs/msg/Odometry[gz.msgs.Odometry")
+  fi
+  info "Bridging gz topics to ROS 2: ${_bridge_topics[*]} …"
+  ros2 run ros_gz_bridge parameter_bridge "${_bridge_topics[@]}" &
   _PIDS+=($!)
-elif [[ "$USE_TOF" == true ]]; then
-  warn "ros_gz_bridge not installed — /cf_${CF_ID}/tof_down is gz-native only (no ROS topic)."
-  warn "Install with: sudo apt install ros-humble-ros-gz-bridge"
+elif [[ "$USE_TOF" == true || "$USE_FLOW" == true ]]; then
+  warn "ros_gz_bridge not installed — gz-native topics not bridged to ROS."
+  warn "Install with: sudo apt install ros-humble-ros-gz-bridge (or source setup_env.sh)."
+fi
+
+# ── launch PMW3901 optical-flow node (Phase 1 M3b, §4.2) ───────────────────────
+if [[ "$USE_FLOW" == true ]]; then
+  _flow_cfg="${FLOW_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/sensors/optical_flow.yaml}"
+  [[ "$_flow_cfg" != /* ]] && _flow_cfg="$SAR_NANO_SWARM_ROOT/$_flow_cfg"
+  if [[ ! -f "$_flow_cfg" ]]; then
+    warn "Optical-flow config not found: $_flow_cfg — skipping flow node."
+  elif ! command -v ros2 &>/dev/null; then
+    warn "ros2 not on PATH — skipping optical-flow node (source setup_env.sh)."
+  else
+    info "Starting PMW3901 optical-flow node ($_flow_cfg) …"
+    python3 -u "$SAR_NANO_SWARM_ROOT/perception/flow_sim/flow_node.py" \
+      --config "$_flow_cfg" --cf-id "$CF_ID" &
+    _PIDS+=($!)
+  fi
 fi
 
 # ── launch RViz ───────────────────────────────────────────────────────────────
@@ -432,8 +463,10 @@ echo "  ║  Model        : ${MODEL}_${CF_ID}"
 echo "  ║  Radar        : ${USE_RADAR}"
 echo "  ║  Payload model: ${USE_PAYLOAD}"
 echo "  ║  ToF sensor   : ${USE_TOF}"
+echo "  ║  Optical flow : ${USE_FLOW}"
 echo "  ║  Radar topic  : /radar/points  (~10 Hz)"
 echo "  ║  ToF topic    : /cf_${CF_ID}/tof_down  (gz-native, ~30 Hz)"
+echo "  ║  Flow topic   : /cf_${CF_ID}/flow  (ROS, ~100 Hz)"
 echo "  ╚═══════════════════════════════════════════════╝"
 echo ""
 

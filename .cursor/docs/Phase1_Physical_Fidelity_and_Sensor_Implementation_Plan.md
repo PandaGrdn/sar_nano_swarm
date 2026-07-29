@@ -8,6 +8,25 @@
 
 ---
 
+## Status at a glance (updated 2026-07-28)
+
+| Milestone | Scope | Status | Gate / notes |
+|---|---|---|---|
+| **M1** | Mass / CoM / inertia model + thrust margin | ✅ **DONE** (v3-revised) | 33.8 g, T/W = 2.019 (floor 1.5) |
+| **M2** | PID retune + hover hold on loaded mass | ✅ **DONE** | `hover_gate.py` PASS; mean \|Z err\| = 1.18 cm, RMS drift = 8.03 cm |
+| **M2b** | Disturbance flags (`--sensor-noise`, wind, turbulence) | ❌ **NOT STARTED** | §3.5 — no sweep run yet |
+| **M3a** | VL53L1x down-ToF (`gpu_lidar`) | ✅ **DONE** | `tof_gate.py` PASS; ~29.9 Hz, altitude error 0.8–1.8 cm |
+| **M3b** | PMW3901 optical flow (Flow deck v2 only) | ✅ **DONE** | `flow_gate.py` PASS; ~100 Hz, dropout on smooth patch works |
+| **M4a** | UWB drone↔anchor analytic node (control arm) | ❌ **NOT STARTED** | Run once, freeze — v3 baseline only |
+| **M4b** | Inter-drone UWB PDoA gz-sim plugin (v3 primary) | ❌ **NOT STARTED** | Next major implementation task |
+| **M5** | Phase-1 exit gate (±10 cm hold under noise + turbulence) | ❌ **NOT STARTED** | Roadmap Ph1 exit; stricter than M2 |
+| **§4.3** | Thermal / LWIR camera | ⏸ **DEFERRED** | Out of scope Phase 1 |
+| **Multi-ranger** | 5-direction ToF beams | ⏸ **DISABLED** | Config stub only; optional for Phase 3 |
+
+**Phase 1 progress:** airframe physics (M1–M2) and Flow-deck sensors (M3a + M3b) are complete and gated. UWB (M4) and the final noise/turbulence exit gate (M5) remain.
+
+---
+
 ## 0. Read this first — simulation fidelity boundaries
 
 These are hard constraints from `AGENTS.md §5`. The plan is designed *around* them; do not let the implementation quietly cross them.
@@ -17,21 +36,24 @@ These are hard constraints from `AGENTS.md §5`. The plan is designed *around* t
 | **UWB ranging** (drone↔anchor, v2 control arm — §5.1–5.4) | High (geometry + analytic noise) | Range accuracy, NLOS/multipath dropout, DOP behaviour | — (this one is genuinely good in sim) |
 | **UWB PDoA ranging+bearing** (inter-drone mesh, v3 primary — §5.5) | High for range; angle fidelity only as good as the off-boresight/AoA-cone model, which is placeholder until Phase 1's external-validation gate (v3 roadmap Phase 1 item 1) | Range accuracy, angle accuracy within a validated envelope, AoA-cone range-only fallback, NLOS/multipath dropout | Angle accuracy outside the externally-validated range; anything about a *specific* unbuilt PDoA module's real aperture until Phase 11 bench data exists |
 | **IR ToF rangefinder** (downward/obstacle) | High (raycast geometry + noise) | Altitude/obstacle ranging under geometry | Material-specific reflectivity dropout (approximate only) |
-| **Thermal / LWIR camera** (victim IR) | **Low — mocked** | *Out of scope this phase (see §4.2)* | ❌ That the sim validates thermal victim detection or **thermal-inertial odometry** (real-hardware-only per `AGENTS.md §5`) |
+| **Thermal / LWIR camera** (victim IR) | **Low — mocked** | *Out of scope this phase (see §4.3)* | ❌ That the sim validates thermal victim detection or **thermal-inertial odometry** (real-hardware-only per `AGENTS.md §5`) |
+| **PMW3901 optical flow** (Flow deck) | High when analytic sim uses true velocity + noise; texture dropout must be modeled | Body-frame `(vx, vy)` ground-relative velocity on textured floor | ❌ That flow works on untextured/smooth floors without invalid flag; ❌ that PMW3901 measures range/altitude |
 
-**Consequence for this plan:** "IR sensor" = **IR ToF rangefinder** (decided). Both the **IR ToF** and **UWB** streams are built as *real, EKF-grade measurement sources*. A thermal/LWIR camera is **deferred** (§4.2) — not part of this phase.
+**Consequence for this plan:** default **Flow deck v2** = two sensors — **VL53L1x ToF** (M3a, ranging) and **PMW3901 optical flow** (M3b, horizontal velocity). These are separate chips; optical flow is not computed from ToF. **Both are built and gated (M3 complete).** UWB PDoA (M4) is the inter-drone mesh source — not started. Thermal/LWIR is **deferred** (§4.3).
 
 ---
 
 ## 1. Objectives (definition of done)
 
-1. **Physically accurate drone**: SDF mass, centre-of-mass (CoM), and inertia tensor reflect the *real loaded airframe* (base + battery + every payload deck), not the default 27 g. PID gains re-tuned for that mass. Thrust margin sanity-checked.
-2. **IR sensor in sim (= IR ToF rangefinder, decided)**: a downward + (optional) 5-direction **IR ToF** ranging stream published as ROS 2 topics with datasheet-matched noise. (Thermal/LWIR camera is deferred — §4.2.)
-3. **UWB sensor in sim (revised for v3):** two deliverables, not one —
-   - **(retained, control-arm only)** the original analytic drone↔anchor + anchor↔anchor range generator with ±10 cm Gaussian noise + NLOS/multipath outliers, run **once** as v3's frozen baseline comparison (v3 Phase 2 item 1). Anchors here are still **configurable entities, positions treated as state downstream — never ground truth** (`AGENTS.md §1 Tier A`).
-   - **(new, primary — v3 W1)** an **inter-drone UWB PDoA plugin**: per drone-pair range + azimuth + elevation in the observer's body frame, with an AoA field-of-view cone (~90–120°, range-only fallback outside it), off-boresight angle-error growth, NLOS/multipath outliers, and a fixed entrance/base-station node as the localization gauge. No anchor pucks are dropped; nothing is deployed inside the structure. See §5.5.
-4. **Sensor weights folded into the mass model**: every added sensor's real mass increases total mass, shifts CoM, and updates inertia — automatically, from one config file.
-5. Everything **config-driven** (`configs/`), **portable** (paths relative to `SAR_NANO_SWARM_ROOT`), submodule left unedited, and every eval logged to **MLflow** (`sqlite:///mlflow.db`).
+| # | Objective | Status |
+|---|---|---|
+| 1 | Physically accurate drone (mass, CoM, inertia, PID, T/W) | ✅ M1 + M2 done |
+| 2 | IR sensors in sim (Flow deck: ToF + optical flow) | ✅ M3a + M3b done |
+| 3 | UWB sensor in sim (M4a control arm + M4b PDoA mesh) | ❌ Not started |
+| 4 | Sensor weights in mass model (config-driven) | ✅ Done |
+| 5 | Config-driven, portable, MLflow-logged evals | ✅ Done for M1–M3 gates |
+
+**Still open:** UWB (obj 3), disturbance flags (§3.5), Phase-1 exit gate M5 (±10 cm under noise+turbulence). Thermal LWIR deferred (§4.3).
 
 ---
 
@@ -94,25 +116,47 @@ Keep the base tensor from the stock SDF as the `base` entry in the YAML so nothi
 ### 3.3 Thrust-margin check (cheap, high-value)
 Add `eval_scripts/thrust_margin_check.py`: from the motor model in the SDF (`maxRotVelocity`, `motorConstant`; 4 rotors) compute max static thrust `T_max = 4 · motorConstant · maxRotVel²`, compare to `M·g`. Emit **thrust-to-weight ratio** and fail loudly if T/W < a configurable floor (e.g. 1.5). Log to MLflow. This is the quantitative form of the Brushless argument.
 
+**Status: DONE (M1).** Live PASS at T/W = 2.019 on v3-revised 33.8 g payload.
+
 ### 3.4 PID retune for the loaded mass (roadmap Ph1.2)
 - After the mass model is in, hover will be sluggish/unstable on the old gains. Re-tune via the CrazySim PID-tuning workflow; **save the gain set** to `configs/airframe/pid_gains_loaded.yaml` (this is what eventually flashes to hardware).
 - Gains belong in `configs/`, not firmware C. Prefer parameter/config over editing firmware (`AGENTS.md §2`).
 
+**Status: DONE (M2).** Two-stage Optuna cascade; `pid_gains_loaded.yaml` committed; `hover_gate.py` PASS on loaded mass.
+
 ### 3.5 Enable realistic disturbances (roadmap Ph1.6)
 Run hover + waypoint sweeps with CrazySim's `--sensor-noise --ground-effect --wind-speed --turbulence`. These are launch flags; expose them through `phase0_gate.sh` pass-through args so evals can sweep them.
 
+**Status: NOT STARTED.** Flags not yet wired through `phase0_gate.sh`; no disturbance sweep logged to MLflow.
+
 ---
 
-## 4. Workstream C — IR sensor (IR ToF rangefinder)
+## 4. Workstream C — Flow deck sensors (IR ToF + optical flow)
 
-**Decision: "IR sensor" = IR ToF laser rangefinder** (VL53L1x-class, 940 nm) — *ranging*. High sim fidelity, directly needed by the Phase-2 EKF ("downward ToF for altitude"). This is the sole IR deliverable for this phase; the thermal/LWIR camera is **deferred** (§4.2).
+**Decision:** the default payload deck is **Bitcraze Flow deck v2** (`deck: flow_v2` in `configs/sensors/tof.yaml`). It carries **two separate downward sensors** on one PCB — do not conflate them:
 
-### 4.1 IR ToF rangefinder — real, EKF-grade
-- **Sim mechanism:** Gazebo `gpu_lidar` sensor (single ray = `samples: 1` in H & V), one per beam direction. This is pure geometry (raycast), which is exactly what a ToF laser measures.
-  - **Downward** beam (required by EKF for altitude) → models Flow deck v2 / Z-ranger.
-  - Optional **5-direction** set (front/back/left/right/up) → models Multi-ranger; useful early for Phase-3 obstacle avoidance.
-- **Requires** the `gz-sim-sensors-system` (already present with `ogre2` in `phase0_tunnel_gate.sdf`).
-- **SDF (injected by `apply_payload.py`)**, per beam:
+| Chip | Type | What it measures | Sim in M3 | ROS topic (planned/built) |
+|---|---|---|---|---|
+| **STMicro VL53L1x** | IR time-of-flight laser rangefinder (940 nm) | Single-point range down (altitude over floor) | **M3a — DONE** (`apply_tof_sensor.py`, `gpu_lidar` single ray) | `/cf_<id>/tof_down` → `sensor_msgs/LaserScan` (1 range) |
+| **PixArt PMW3901** | Optical-flow motion sensor (downward low-res camera + DSP) | Ground-relative horizontal velocity `(vx, vy)` in body frame by tracking floor texture | **M3b — DONE** (analytic node) | `/cf_<id>/flow` → `TwistWithCovarianceStamped`; `/cf_<id>/flow/pixels` |
+
+The VL53L1x is **not** an optical-flow sensor — it fires a laser pulse and times the return. The PMW3901 is **not** a rangefinder — it watches how the floor pattern moves between frames. On real hardware both point down from the same deck; in sim they are separate injectors/nodes with separate noise models.
+
+**Alternate decks (no PMW3901):**
+- `zranger_v2` — VL53L1x down ToF only (1.3 g); skip M3b entirely.
+- `multi_ranger` — 5× VL53L1x (F/B/L/R/up, 2.3 g); optional Phase-3 obstacle ranging; no optical flow.
+
+Mass for Flow deck v2 (**1.6 g**, both chips) is already in `payload.yaml`. Both chips are simmed when `deck: flow_v2` (M3 complete).
+
+### 4.1 M3a — VL53L1x IR ToF rangefinder (altitude)
+
+- **Hardware:** STMicro **VL53L1x** on the Flow/Z-ranger/Multi-ranger deck — 940 nm IR laser time-of-flight, **one range value per frame**, 4 cm–4 m, ~30 Hz in our config (up to ~50 Hz on chip).
+- **Sim mechanism:** Gazebo `gpu_lidar` with `samples: 1` in H & V (single ray = pencil beam). Pure geometry raycast — high fidelity per `AGENTS.md §5`.
+  - **Downward** beam (required by Phase-2 EKF for altitude) → `/cf_<id>/tof_down`.
+  - Optional **5-direction** Multi-ranger beams (disabled by default) → Phase-3 near-field obstacle check.
+- **Injector:** `eval_scripts/apply_tof_sensor.py` (not `apply_payload.py`) — called from `phase0_gate.sh` after mass rewrite.
+- **Requires** `gz-sim-sensors-system` (ogre2) at world level — already in `phase0_tunnel_gate.sdf` / `phase1_pid_tune.sdf`.
+- **SDF sketch**, per beam:
 ```xml
 <sensor name="tof_down" type="gpu_lidar">
   <topic>/cf_0/tof_down</topic>
@@ -126,18 +170,39 @@ Run hover + waypoint sweeps with CrazySim's `--sensor-noise --ground-effect --wi
   </lidar>
 </sensor>
 ```
-- **Datasheet params → `configs/sensors/tof.yaml`** (Tier B): range 0.04–4.0 m, noise ~1 cm (surface/light dependent), rate. VL53L1x-based (Flow/Z-ranger/Multi-ranger).
-- **ROS 2 bridge:** map the gz topic to ROS via the CrazySim/`ros_gz_bridge` mechanism already used for other topics (verify the bridge line; add if missing). The EKF (Phase 2) subscribes to `/cf_0/tof_down`.
-- **Mass:** adds Flow deck v2 **1.6 g** (or Z-ranger **1.3 g**, or Multi-ranger **2.3 g**) — folded in via §3.2.
+- **Config:** `configs/sensors/tof.yaml` → `down`, `multi_ranger`, range/noise/rate params.
+- **ROS 2 bridge:** `/cf_<id>/tof_down` → `sensor_msgs/LaserScan` via `ros_gz_bridge` (auto-launched from `phase0_gate.sh` when available).
+- **Gate:** `eval_scripts/tof_gate.py` — publish rate + hover-plateau altitude tracking vs EKF `stateEstimate.z`.
 
-**Status: DONE, gated live.** `configs/sensors/tof.yaml` + `eval_scripts/apply_tof_sensor.py` (kept as a **separate** script from `apply_payload.py` rather than folded in as originally sketched in §3.1/§8 — single-responsibility: `apply_payload.py` stays mass/inertia-only, `apply_tof_sensor.py` injects the sensor element(s); both are called back-to-back from `phase0_gate.sh`). Wired into `phase0_gate.sh` via `--no-tof`/`--tof-config`. `eval_scripts/tof_gate.py` is the M3 exit gate. Live-run findings, all fixed:
-  - The exact `<noise type="gaussian">...</noise>` attribute form shown above (copied from the `<air_pressure>` sensor's noise syntax) is **invalid for `<lidar><noise>`** — sdformat logs "XML Attribute[type] ... not defined in SDF" and silently drops the noise model. `<lidar><noise>` wants `<type>gaussian</type>` as a **child element** (verified against `/usr/share/sdformat12/1.9/lidar.sdf`). Fixed in `apply_tof_sensor.py`.
-  - **ROS bridge — NOT actually missing**, contrary to how it looked at first: `ros_gz_bridge` isn't in the system apt tree, but setup_env.sh sources a separately source-built workspace (`${ROS_GZ_WS:-$HOME/ros2_ws}/install`) that has it. `phase0_gate.sh` now auto-launches `ros2 run ros_gz_bridge parameter_bridge "/cf_<id>/tof_down@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan"` when `ros_gz_bridge` resolves, and warns (non-fatal) otherwise. Verified live: bridged topic publishes at ~27–28 Hz measured via `ros2 topic hz`.
-  - `tof_gate.py`'s altitude-tracking check does **not** use `gz service .../set_pose` teleports — teleporting a gravity-on, unpowered body and then reading the sensor immediately still costs ~0.3–0.5 s per `gz service`/`gz topic` CLI round-trip, in which the drone free-falls past the target height (verified: a teleport to 2.0 m read back as 0.895 m by read time). Pausing the world and stepping via `WorldControl.multi_step` was also tried live and reliably returned "no valid return" (unclear why; not chased further). The gate instead reuses `hover_gate.py`'s (M2) proven cflib connect/arm/`MotionCommander` hover pattern and samples the down-beam range while the drone is genuinely PID-held at each plateau — no free-fall, so CLI latency doesn't matter. Live result: 0.3/0.6/1.0 m plateaus tracked within 0.8–1.8 cm of the EKF's `stateEstimate.z`.
-  - `gz topic -e --json-output` serializes non-finite doubles (`inf`/`nan`, e.g. "no return") as JSON **strings** (`"Infinity"`), not JSON numbers — `float()` handles this fine, but naive numeric summing does not.
-  - `gz topic -f --duration N` does **not** self-terminate after N seconds; it streams average-rate blocks forever until killed.
+**Status: DONE, gated live.** Gate result: ~29.9 Hz (floor 24 Hz); altitude error 0.8–1.8 cm at 0.3/0.6/1.0 m plateaus. Live-run gotchas (all fixed): invalid `<lidar><noise type=...>` attribute syntax (use child `<type>` element); `gz topic -f` never self-terminates; `gz topic -e --json-output` serializes `inf` as `"Infinity"` string; altitude gate uses cflib hover not `set_pose` teleport (free-fall during CLI latency).
 
-### 4.2 Thermal / LWIR camera — DEFERRED (out of scope this phase)
+### 4.2 M3b — PMW3901 downward optical flow (horizontal velocity)
+
+**Meeting decision (2026-07-28):** extend M3 to sim the **second chip on the Flow deck** — the PixArt **PMW3901** optical-flow sensor — alongside the VL53L1x (M3a). This is **M3b**, not a separate phase; M3a's gate already passed independently so M3b can land without re-gating altitude.
+
+**Hardware (real):** PMW3901 is a small **downward-facing optical-flow ASIC** (camera + motion DSP on one die). It compares consecutive floor-texture frames and outputs **integrated motion in pixels**, which the deck firmware converts to **ground-relative horizontal velocity** `(vx, vy)` in the drone body frame. It does **not** measure height — that is the VL53L1x's job. Typical specs (Tier B, tune from [PixArt PMW3901 datasheet](https://www.pixart.com/) / Bitcraze Flow deck docs):
+- Update rate: ~100–200 Hz (firmware-dependent)
+- Max measurable flow: ~7.4 m/s (saturates above)
+- Works over **textured** surfaces; reports invalid / near-zero quality on smooth glass, glossy tile, or featureless concrete
+- Height band: roughly **0.1–4 m** over floor (same band as down-ToF; too low = out of focus, too high = texture too small)
+
+**What it is NOT:**
+- **Not IR ToF** — no laser, no time-of-flight, no range output.
+- **Not derived from ToF data** — you cannot compute optical flow from `/cf_<id>/tof_down`'s single range sample.
+- **Not a point cloud** — two velocity scalars `(vx, vy)`, not a depth image.
+
+**Built sim mechanism (M3b — DONE, 2026-07-28):**
+- **Config:** `configs/sensors/optical_flow.yaml` (own file — not inside `tof.yaml`). Active only when `deck: flow_v2`; node refuses to start on `zranger_v2`.
+- **Implementation:** `perception/flow_sim/flow_node.py` — analytic rclpy node using the Crazyflie firmware flow measurement equation (`mm_flow.c`), PMW3901 pixel noise, hand-authored surface texture map, ToF height scale from bridged `/cf_<id>/tof_down`. No SDF injection (`apply_flow_sensor.py` not used).
+- **Launch wiring:** `phase0_gate.sh` `--no-flow` / `--flow-config`; bridges `/cf_<id>/odom` alongside ToF when flow enabled; launches node with `python3 -u`.
+- **ROS topics:** `/cf_<id>/flow` → `geometry_msgs/TwistWithCovarianceStamped` (derived vx/vy + covariance sentinel when invalid); `/cf_<id>/flow/pixels` → driver-unit dpixel + quality; `/cf_<id>/flow/meta` → dt, σ_px, h_meas; `/cf_<id>/flow/debug_truth` → sim oracle (Tier A — estimator must never subscribe).
+- **Downstream (Phase 2):** EKF velocity update; breadcrumb path integration `(v, Δψ)`; short-horizon hover hold when radar is sparse.
+
+**Gate (`eval_scripts/flow_gate.py`):** live PASS on `phase1_pid_tune --no-radar --headless` — `/cf_0/flow` ~100 Hz; hover valid fraction 100%, hover RMS ~0.31 m/s (single-frame noise floor at `flow_std_px=2.0`); forward RMSE vs debug_truth ~0.32 m/s, mean vx bias ~−0.02 m/s; smooth-patch dropout valid fraction ~8%. See `.cursor/docs/M3b_Optical_Flow_Implementation_Plan.md`.
+
+**Status: DONE, gated live.** Mass already counted in Flow deck v2 line item. Does not block M4.
+
+### 4.3 Thermal / LWIR camera — DEFERRED (out of scope Phase 1)
 Not implemented now (you selected IR ToF). Recorded here so the option is documented if revisited:
 - Gazebo Harmonic *can* render one (`<sensor type="thermal">` + `gz-sim-thermal-sensor-system` sensor plugin + `gz-sim-thermal-system` visual `<temperature>` on victim models like `rescue_randy`), but it is **mocked/non-validating** (no LWIR material physics, no thermal-inertial odometry validation — `AGENTS.md §5`).
 - If added later: implement its **mass only** (~2.1 g Lepton 3.5 deck) for physics accuracy behind a `configs` flag, and **never** feed the thermal image into Phase-2+ logic.
@@ -155,8 +220,7 @@ Not implemented now (you selected IR ToF). Recorded here so the option is docume
 - **M4a** (small, lower priority): keep/finish the v2 analytic range node below, run it once for the control-arm dataset, freeze results.
 - **M4b** (the real work, and gated earlier than "M4" implied — v3 wants a basic version working to *exit Phase 0*): the inter-drone PDoA plugin, §5.5.
 
-### 5.1 Architecture (v2 design — M4a, control-arm only)
-A ROS 2 node `perception/uwb_sim/uwb_range_node.py` (rclpy, per `AGENTS.md §6.3`):
+### 5.1 Architecture (v2 design — M4a, control-arm only) — **NOT STARTED**A ROS 2 node `perception/uwb_sim/uwb_range_node.py` (rclpy, per `AGENTS.md §6.3`):
 - **Inputs:** drone ground-truth pose (from gz `/cf_*/odom` or a gz→ROS pose bridge) and a set of **anchor world positions** from `configs/sensors/uwb_anchors.yaml`.
 - **Per range measurement** (drone↔anchor, and **anchor↔anchor** — cheap, stiffens the chain per roadmap Ph2.3):
   1. True Euclidean distance `d`.
@@ -196,13 +260,17 @@ Was: UWB Loco deck **3.3 g** + carried anchor pucks (⚠ placeholder). **Both re
 ```
 configs/
   airframe/
-    payload.yaml            # base inertial + component list {name, mass_g, pose xyz, optional box dims}
-    pid_gains_loaded.yaml   # re-tuned gains for the loaded mass (from §3.4)
+    payload.yaml            # base inertial + component list — DONE (v3-revised)
+    pid_gains_loaded.yaml   # re-tuned gains for loaded mass — DONE (M2)
+    pid_gains_stock.yaml    # stock baseline — DONE
+    pid_tune.yaml           # Optuna search space — DONE
+    thrust_margin.yaml      # T/W floor — DONE
   sensors/
-    tof.yaml                # IR ToF: range, noise, rate, which deck (flow/zranger/multiranger). DONE.
-    uwb.yaml                # M4a (control-arm only): UWB noise/NLOS/dropout/range/rate params
-    uwb_anchors.yaml        # M4a (control-arm only): SIM-ORACLE anchor world positions (floor-only); NEVER read by the estimator
-    uwb_pdoa.yaml           # M4b (v3 primary, NEW): inter-drone PDoA noise/AoA-cone/entrance-node params — NOT YET CREATED
+    tof.yaml                # IR ToF (M3a) — DONE
+    optical_flow.yaml       # PMW3901 flow (M3b) — DONE (separate file, not inside tof.yaml)
+    uwb.yaml                # M4a (control-arm only) — NOT STARTED
+    uwb_anchors.yaml        # M4a sim-oracle anchor positions — NOT STARTED
+    uwb_pdoa.yaml           # M4b inter-drone PDoA params — NOT STARTED
 ```
 
 `payload.yaml` sketch (reflects the v3-revised, **live** budget — actual file has real datasheet sources and per-component `enabled` flags, see §2):
@@ -214,7 +282,7 @@ base:
 components:
   - {name: uwb_pdoa_module, mass_g: 4.0, pose_xyz_m: [0.0,  0.0,  0.010]}   # v3: PLACEHOLDER dual-antenna PDoA module, replaces uwb_loco_deck
   - {name: flow_deck_v2,    mass_g: 1.6, pose_xyz_m: [0.0,  0.0, -0.010]}   # deck below (down ToF+flow)
-  # thermal deck deferred (§4.2) — add only if the real airframe carries one
+  # thermal deck deferred (§4.3) — add only if the real airframe carries one
   - {name: gap9_compute_shield, mass_g: 6.0, pose_xyz_m: [0.0, 0.0,  0.008], enabled: false}   # PLACEHOLDER — measure
   - {name: mmwave_radar_module, mass_g: 4.5, pose_xyz_m: [0.02, 0.0, 0.000], enabled: false}   # PLACEHOLDER — measure
   # anchor_pucks component RETIRED in v3 — no longer part of the mission architecture, removed from the file entirely
@@ -224,14 +292,15 @@ components:
 
 ## 7. Validation & gates (every run → MLflow: params, seed, metrics)
 
-| Check | Script | Pass criterion |
-|---|---|---|
-| Mass model applied | inspect generated SDF | `<mass>` = Σ config, CoM offset present, inertia recomputed |
-| Thrust margin | `thrust_margin_check.py` | T/W ≥ configurable floor; else flag "needs Brushless" |
-| IR ToF stream | `tof_gate.py` | `/cf_0/tof_down` publishes at configured rate; ranges track altitude — **DONE, PASSED** |
-| UWB stream (M4a, control-arm only) | `uwb_range_node` self-test | ranges = true + noise; NLOS drops when wall occludes; anchor↔anchor present |
-| UWB PDoA mesh edge (M4b, v3 primary) | new gate TBD when M4b is implemented | two drones exchange range+bearing on a ROS topic; range-only fallback fires correctly outside the AoA cone |
-| **Phase-1 gate** (roadmap) | hover/waypoint sweep | **position hold within tolerance (e.g. ±10 cm) under sensor noise + mild turbulence, in an empty world**, on the *loaded-mass* model with re-tuned PID |
+| Mass model applied | inspect generated SDF / `thrust_margin_check.py` | T/W ≥ floor — **DONE, PASS** |
+| Thrust margin | `thrust_margin_check.py` | T/W ≥ 1.5 — **DONE, PASS (2.019)** |
+| Loaded-mass hover (M2) | `hover_gate.py` | RMS drift + \|Z err\| within thresholds — **DONE, PASS** |
+| IR ToF stream (M3a) | `tof_gate.py` | rate + altitude tracking — **DONE, PASS** |
+| Optical flow stream (M3b) | `flow_gate.py` | ~100 Hz; texture valid; smooth-patch dropout — **DONE, PASS (2026-07-28)** |
+| Disturbance sweep (M2b) | hover/waypoint under `--sensor-noise` etc. | **NOT STARTED** |
+| UWB stream (M4a, control-arm only) | `uwb_range_node` self-test | **NOT STARTED** |
+| UWB PDoA mesh edge (M4b, v3 primary) | gate TBD | **NOT STARTED** |
+| **Phase-1 exit gate (M5)** | hover/waypoint sweep | **±10 cm hold under noise + turbulence — NOT STARTED** |
 
 The Phase-1 exit gate is the roadmap's: stable loaded-mass flight under realistic noise **before** any radar/UWB fusion (that's Phase 2).
 
@@ -239,26 +308,48 @@ The Phase-1 exit gate is the roadmap's: stable loaded-mass flight under realisti
 
 ## 8. File-by-file change list
 
-**New:**
-- `eval_scripts/apply_payload.py` — rewrite inertial + inject ToF/thermal sensors from configs. **(done)**
-- `eval_scripts/thrust_margin_check.py` — T/W check → MLflow. **(done)**
-- `eval_scripts/pid_gains.py`, `eval_scripts/tune_pid.py`, `eval_scripts/push_pid_gains.py` — cascade PID retune (§3.4). **(code complete, not yet run live)**
-- `sim_worlds/phase1_pid_tune.sdf` — empty/open world for hover/PID testing. **(done)**
-- `perception/uwb_sim/uwb_range_node.py` (+ `package.xml`/setup if a ROS pkg) — analytic UWB ranges. **(M4a, control-arm only — not started)**
-- `configs/airframe/payload.yaml` **(done, revised for v3 — see §2)**, `configs/airframe/thrust_margin.yaml` **(done)**, `configs/airframe/pid_gains_stock.yaml` **(done)**, `configs/airframe/pid_tune.yaml` **(done)**, `configs/airframe/pid_gains_loaded.yaml` **(done, produced by tune_pid.py, M2 ran live)**
-- `eval_scripts/apply_tof_sensor.py` — inject `gpu_lidar` ToF beam(s) into `base_link` from `configs/sensors/tof.yaml`. **(done)**
-- `eval_scripts/tof_gate.py` — M3 exit gate (rate + hover-plateau altitude tracking). **(done)**
-- `eval_scripts/hover_gate.py` — M2 exit gate (RMS horizontal drift + mean |Z error|). **(done)**
-- `configs/sensors/tof.yaml` **(done)**, `configs/sensors/{uwb,uwb_anchors}.yaml` (M4a, control-arm — not started; thermal deferred, §4.2)
-- **NEW for v3 M4b:** a gz-sim System plugin (C++, name TBD e.g. `uwb_pdoa_gz`, sibling to `perception/radarays_gz2/`) — inter-drone range+bearing. `configs/sensors/uwb_pdoa.yaml` (new). **Not started.**
+### Done ✅
 
-**Edited:**
-- `eval_scripts/phase0_gate.sh` — after the radar-inject block, call `apply_payload.py`; add pass-through flags for `--sensor-noise/--ground-effect/--wind-speed/--turbulence`; optionally launch `uwb_range_node`.
-- `configs/rviz/radar.rviz` — add ToF range + (optional) thermal image + UWB range displays.
-- README / `AGENTS.md §3` status — update when the Phase-1 gate passes.
+| File | Milestone |
+|---|---|
+| `eval_scripts/apply_payload.py` | M1 — mass/CoM/inertia rewrite |
+| `eval_scripts/thrust_margin_check.py` | M1 — T/W gate |
+| `configs/airframe/payload.yaml` | M1 — v3-revised (no pucks, `uwb_pdoa_module`) |
+| `configs/airframe/thrust_margin.yaml` | M1 |
+| `configs/airframe/pid_gains_stock.yaml`, `pid_tune.yaml` | M2 |
+| `configs/airframe/pid_gains_loaded.yaml` | M2 — Optuna output, live-validated |
+| `eval_scripts/pid_gains.py`, `tune_pid.py`, `push_pid_gains.py` | M2 |
+| `eval_scripts/hover_gate.py` | M2 exit gate |
+| `sim_worlds/phase1_pid_tune.sdf` | M2 test world |
+| `eval_scripts/apply_tof_sensor.py` | M3a — ToF injection |
+| `eval_scripts/tof_gate.py` | M3a exit gate |
+| `configs/sensors/tof.yaml` | M3a (+ deck selector for M3b) |
+| `perception/flow_sim/flow_node.py` | M3b — analytic PMW3901 sim |
+| `eval_scripts/flow_gate.py` | M3b exit gate |
+| `configs/sensors/optical_flow.yaml` | M3b config |
+| `eval_scripts/phase0_gate.sh` | M3a/M3b wiring (ToF inject, odom bridge, flow node, `--no-flow`) |
+
+### Not started ❌
+
+| File | Milestone |
+|---|---|
+| `perception/uwb_sim/uwb_range_node.py` | M4a — control-arm only |
+| `configs/sensors/uwb.yaml`, `uwb_anchors.yaml` | M4a |
+| gz-sim UWB PDoA System plugin (name TBD, e.g. `uwb_pdoa_gz`) | M4b — v3 primary |
+| `configs/sensors/uwb_pdoa.yaml` | M4b |
+| M5 exit gate script (noise + turbulence sweep) | M5 |
+| `phase0_gate.sh` pass-through for `--sensor-noise` / wind / turbulence | M2b / §3.5 |
+
+### Partial / deferred ⏸
+
+| Item | Notes |
+|---|---|
+| `configs/rviz/radar.rviz` | ToF/flow/UWB displays not fully wired |
+| `configs/sensors/tof.yaml` → `multi_ranger.enabled` | Disabled; optional Phase 3 |
+| Thermal deck mass + sim | Deferred §4.3 |
+| README / `AGENTS.md §3` | Updated incrementally; M3b added 2026-07-28 |
 
 **Untouched:** the CrazySim submodule (`model.sdf.jinja` etc.) — all changes via launch-time injection + configs.
-
 ---
 
 ## 9. Suggested sequencing (milestones)
@@ -267,21 +358,42 @@ The Phase-1 exit gate is the roadmap's: stable loaded-mass flight under realisti
    **Status: DONE, revised for v3.** Original gate: 33.1 g total, T/W=2.062, PASS. **v3 revision (this session):** retired the `anchor_pucks` placeholder component and relabeled `uwb_loco_deck` → `uwb_pdoa_module` (mass bumped 3.3→4.0 g placeholder, pending a real PDoA part choice — see §2). Re-ran `apply_payload.py` + `thrust_margin_check.py` live against a fresh jinja-generated SDF: **33.8 g total, T/W=2.019, PASS.**
 2. **M2 — PID retune + disturbance flags** (§3.4–3.5): stable hover on loaded mass. *Gate: hover holds.*
    **Status: DONE, run live.** Two-stage cascade Optuna search (Stage 1 = pid_rate+pid_attitude, Stage 2 = velCtlPid+posCtlPid), `configs/airframe/pid_gains_loaded.yaml` committed, `hover_gate.py` passing (RMS horizontal drift + mean |Z error| within thresholds). `tune_pid.py` needed a `SIGALRM` watchdog + consecutive-timeout abort added mid-run for `cf2` SITL crashes (see `AGENTS.md` §3/§4). **v3 revision (this session):** since M1's mass only moved 33.1→33.8 g (+0.7 g), re-ran `hover_gate.py` only (no re-tune) as a cheap sanity check against the updated mass model, against a freshly launched sim (existing gains still applicable at this small a mass delta — no need to burn another multi-hour Optuna run). **Result: PASS** — mean |Z error| = 1.18 cm (threshold 5 cm), RMS horizontal drift = 8.03 cm (threshold 10 cm), took off cleanly, no divergence. Existing `pid_gains_loaded.yaml` gains remain valid; no re-tune needed for the v3 mass revision. The `--sensor-noise/--ground-effect/--wind-speed/--turbulence` sweep from §3.5 is still open (not yet run).
-3. **M3 — IR ToF** (§4.1): downward ToF publishing, tracks altitude. (Optional multi-ranger for Phase 3.)
-   **Status: DONE, gated live, unaffected by v3.** `configs/sensors/tof.yaml`, `eval_scripts/apply_tof_sensor.py`, `eval_scripts/tof_gate.py`. Gate result: rate ~29.9 Hz (floor 24 Hz), altitude error 0.8–1.8 cm at 0.3/0.6/1.0 m hover plateaus (tolerance ±12 cm). See §4.1 for live-run findings/fixes.
-4. **M4 — UWB, REDEFINED by v3** (§5): split into **M4a** (v2 drone↔anchor range node, kept only as a frozen baseline control-arm run — not started) and **M4b** (v3 primary: inter-drone UWB PDoA gz-sim plugin, range+bearing+AoA-cone — not started, next real implementation task). *M4b gate: two drones exchange range+bearing on a ROS topic; correct range-only fallback outside the AoA cone.*
-5. **M5 — Phase-1 exit gate** (§7): ±10 cm hold under noise+turbulence on the full loaded airframe.
+3. **M3 — Flow deck sensors** (§4): **COMPLETE (2026-07-28).**
+   - **M3a — IR ToF: DONE, gated live.** Gate: rate ~29.9 Hz, altitude error 0.8–1.8 cm at hover plateaus. See §4.1.
+   - **M3b — PMW3901 optical flow: DONE, gated live.** Gate: ~100 Hz, smooth-patch dropout ~8% valid. See §4.2.
+4. **M4 — UWB, REDEFINED by v3** (§5): **NOT STARTED.** Split into **M4a** (control-arm analytic node) and **M4b** (inter-drone PDoA plugin — next major task).
+5. **M5 — Phase-1 exit gate** (§7): **NOT STARTED.** ±10 cm hold under noise+turbulence on the full loaded airframe.
 
-M3 and M4 are independent and can be parallelised; M1→M2 are the critical path. M4b is now gated earlier than "M4" implied — v3 wants a basic inter-drone PDoA exchange working to exit its own Phase 0, so don't treat it as low-priority just because of the M-number.
+**What's left for Phase 1:** M4 (UWB), M2b disturbance flags, M5 exit gate. M1→M2→M3 critical path is done.
 
 ---
 
 ## 10. Risks / open decisions
 
-- **"IR sensor" meaning** — RESOLVED: IR ToF rangefinder (§4). Thermal camera deferred (§4.2).
+- **"IR sensor" meaning** — RESOLVED: Flow deck = VL53L1x ToF (M3a, §4.1) + PMW3901 optical flow (M3b, §4.2) as separate chips. Thermal LWIR deferred (§4.3).
 - **Airframe choice** — brushed 2.1 likely fails T/W once radar+GAP9 are added (pucks retired, v3 — one less item pushing toward Brushless); the Brushless is Tier B but the mass model will force this decision with data (§3.3).
 - **⚠ Placeholder masses** (radar, GAP9 shield, UWB PDoA module) — the physics is only as accurate as these; get a scale on the real parts once chosen (v3 defers all hardware purchase to Phase 11 — see roadmap). Until then, clearly label sim results as provisional. (Anchor pucks removed from this list — retired entirely, v3.)
 - **UWB architecture superseded** — v2's drone↔anchor puck design is retained *only* as a frozen baseline control arm (§5.1–5.4, M4a); it is not the thing M4 is building toward anymore. Don't let new work quietly assume anchors are still the primary inter-drone sensing mechanism — see §5.5/M4b.
-- **ROS↔gz bridging** — RESOLVED for ToF: `phase0_gate.sh` auto-launches `ros_gz_bridge` for `/cf_0/tof_down` when the workspace that provides it (`${ROS_GZ_WS:-$HOME/ros2_ws}`, sourced by `setup_env.sh`) is present; verified live at ~27–28 Hz. If that workspace isn't set up on a given machine, the script warns and continues with the gz-native topic only (same situation `/cf_0/{imu,baro,odom}` are already in).
+- **ROS↔gz bridging** — RESOLVED for ToF + flow: `phase0_gate.sh` auto-launches `ros_gz_bridge` for `/cf_0/tof_down` and `/cf_0/odom` (flow node) when the workspace that provides it (`${ROS_GZ_WS:-$HOME/ros2_ws}`, sourced by `setup_env.sh`) is present; ToF verified ~27–28 Hz, flow ~100 Hz. If that workspace isn't set up on a given machine, the script warns and continues with gz-native topics only.
 - **Known repo nit (not this phase):** `RadarSensorSystem.cpp` has a hard-coded default `/home/ethan/...` mesh path (overridden by SDF `mesh_path`, so functional). Flagging per the path-portability rule; fix opportunistically.
 - **MuJoCo — new dependency flagged by v3, not yet installed.** v3 lists MuJoCo (for the Phase 6 perching gate) as a direct Phase 0 checklist item ("Install and validate MuJoCo, confirm it can simulate at minimum a basic gripping/perching mechanism"). Out of scope for *this* Phase 1 plan (perching is a later phase), but tracked here since it's an environment-setup item the same team will hit soon — not addressed by this revision.
+
+---
+
+## 11. Downstream mission architecture (meeting 2026-07-28)
+
+Phase 1 ends at sensor plumbing + stable loaded-mass flight. The meeting clarified what those sensors *feed* in later phases — captured in full in `Simulation_Training_Optimization_Roadmap_v3_MOONSHOT.md` (new "Meeting decisions" section). Summary for traceability:
+
+| Meeting topic | Phase 1 status | Where it lands |
+|---|---|---|
+| Obstacle avoidance (mmWave + hard-coded rules) | Radar exists (`/radar/points`); avoidance logic **not built** | Phase 3 |
+| Auction floor exploration (ToF grid) | Down-ToF **built** (M3); Multi-ranger **disabled**; auction logic **not built** | Phase 7 |
+| Local / global / swarm positioning | ToF + flow **built** (M3); UWB PDoA **not started** (M4b); estimator **not built** | Phase 2 |
+| Path tracing `(v, Δψ)` breadcrumbs | **Not built** | Phase 2 log + Phase 7 RTH |
+| Human detection — IR ToF | **Misnomer in meeting** — ToF = altitude/floor only | M3 done; no change |
+| Human detection — thermal IR | Deferred (§4.3) | Phase 5/6 |
+| Human detection — mmWave heartbeat | Radar plugin exists; vitals mode **not built** | Phase 5 |
+| Human detection — audio | **Not built** | Phase 5/6 |
+| Downward optical flow (PMW3901 on Flow deck) | M3a ToF **built**; M3b flow **built & gated** | Done (`§4.2`, `M3b_Optical_Flow_Implementation_Plan.md`) |
+
+**One actionable Phase 1 follow-on (optional, not gated):** flip `multi_ranger.enabled: true` in `configs/sensors/tof.yaml` when Phase 3 obstacle avoidance wants near-field beams — requires updating `payload.yaml` mass to Multi-ranger deck (2.3 g) if enabled.

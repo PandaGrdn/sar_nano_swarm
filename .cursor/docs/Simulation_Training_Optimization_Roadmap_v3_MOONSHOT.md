@@ -24,6 +24,29 @@ Each phase has a **gate**. Durations assume one engineer; hobbyist pace is 3–5
 
 ---
 
+## Meeting decisions (2026-07-28) — incorporated below
+
+Team meeting clarified mission priorities beyond sensor plumbing (Phase 1). These map to roadmap phases; **Phase 1 scope is unchanged** except where noted as a forward dependency.
+
+| Topic | Decision | Roadmap home | Notes |
+|---|---|---|---|
+| **Obstacle avoidance** | mmWave distance → **hard-coded** reactive avoidance (no learned policy) | Phase 3 | Sector min-range from `/radar/points`; if closer than threshold, apply fixed repulsive velocity override. Classical rules only — must run on Light Scouts without GAP9. |
+| **Auction-based floor exploration** | Auctions allocate **floor cells** to drones; down-ToF drives coverage map | Phase 7 (+ Phase 6 behavior) | ToF down-beam builds a 2D floor-geometry / clearance grid; unexplored cells are auction items. **Not** human detection — ToF only sees distance to surface. |
+| **Local positioning** | Per-drone pose in its own frame + short-horizon odometry | Phase 2 | RIO/EKF front-end: IMU + degraded radar + down-ToF + baro. |
+| **Global positioning** | Absolute pose in structure frame, gauged at entrance | Phase 2 | UWB PDoA mesh + entrance base-station node + loop closures (Phase 4). |
+| **Swarm / relative positioning** | **Constrained observables:** neighbor **bearing** (UWB PDoA az/el) + neighbor **velocity** (broadcast from each drone's state estimate) | Phase 2 + 7 | No ground-truth neighbor positions in the estimator. Bearing from PDoA; velocity from mesh state broadcast (with covariance). Relative pose derived from these + own odometry. |
+| **Path tracing (breadcrumbs)** | Log **velocity + heading change (Δψ) each timestep**; integrate into a flight-path trace for return navigation | Phase 2 (logging) + Phase 6/7 (RTH) | Enables "fly back along own path" when a victim is found, independent of map quality. Complements mesh-based RTH — dead-reckoning trail is the fallback when mesh/coords are uncertain. |
+| **Human detection — IR** | Thermal LWIR for victim cueing during exploration | Phase 5/6 | **Distinct from IR ToF** (Phase 1 M3). ToF = ranging; thermal = heat signature. Sim: mocked per `AGENTS.md §5`; real-hardware-only validation. |
+| **Human detection — mmWave** | Heartbeat / breathing via radar vitals mode | Phase 5 | Already in roadmap; primary confirmatory cue after IR/thermal flag. |
+| **Human detection — audio** | Acoustic victim cue (groans, tapping, etc.) | Phase 5/6 (new) | Sim: sampled from measured detection/FP distribution (same mock discipline as vitals). Real: mic on GAP9 mappers only; fuse as a soft cue, not sole trigger. |
+| **Downward optical flow (Flow deck)** | Use the **same Flow deck v2** for horizontal velocity aiding local odometry, alongside down-ToF for altitude | Phase 2 (sim sensor) | Real deck = VL53L1x (ToF) **+ PMW3901** (optical flow) on one board. **Not the same sensor** — ToF does not produce flow; the PMW3901 tracks ground texture motion. M3 sim models ToF only; optical flow is a **Phase 2 add-on** when `deck: flow_v2`. |
+
+**IR ToF scope clarification (already built in M3):** down-ToF is for **altitude + floor geometry** in exploration auctions. It does **not** detect humans — a person on the floor looks like "ground at expected range." Human cueing requires thermal IR, mmWave vitals, or audio.
+
+**Flow deck dual role (meeting 2026-07-28):** when `configs/sensors/tof.yaml` selects `deck: flow_v2` (current default), the airframe carries both sensors in hardware. Phase 1 M3 sim injects **only the VL53L1x down-ranging beam**. Phase 2 will add a simulated **PMW3901 downward optical-flow** stream (`/cf_<id>/flow` or `geometry_msgs/TwistStamped` body-frame `(vx, vy)`), publishing horizontal ground-relative velocity at ~100–200 Hz with datasheet noise, surface-quality dropout (smooth/glass floors → invalid), and min/max height gates tied to the ToF range. This feeds the local EKF between radar updates and when UWB mesh is sparse — especially useful for short-horizon path tracing (breadcrumb integration) and hover hold over textured rubble floors.
+
+---
+
 ## PHASE 0 — Environment Setup (LARGELY COMPLETE per sar_nano_swarm repo)
 
 Done (verified in repo): Ubuntu 22.04 + ROS 2 Humble + **Gazebo Harmonic (gz-sim 8)** — Garden EOL correctly avoided; CrazySim SITL + Crazyswarm2 pinned as submodules; **custom `radarays_gz2` plugin** replacing ROS1-era RadaRays, publishing PointCloud2 on `/radar/points`; SubT worlds submodule; MLflow; path-portable world files; radar smoke test.
@@ -60,6 +83,16 @@ Unchanged from v2 (mass/inertia model, PID retune, sensor noise from datasheets,
 
 This replaces v2's anchor-SLAM phase. **Committed modality: UWB PDoA for all inter-drone measurements** (identity-aware, omnidirectional range, ~90–120° AoA cone). The estimation problem: a distributed pose graph over all airborne (and landed) drones, gauged by a single fixed node at the entrance (Tier-0 base with its own UWB PDoA unit), with edges from (a) per-drone odometry — RIO with the Phase-1 degradation model applied; adapt the **Michalczyk et al. (ICRA 2023) multi-state EKF with persistent radar landmarks** as the front-end baseline rather than plain Doppler-only RIO, since tracked high-RCS landmarks measurably cut drift between mesh updates — (b) inter-drone UWB range+bearing factors, (c) **mutual-bearing factors** (A measures bearing to B and B to A in the same window → their relative yaw becomes observable), and (d) altitude factors (baro + downward ToF — Z still gets no help from a coplanar mesh strung along a corridor; the vertical channel remains sensor-carried).
 
+**Positioning stack (meeting 2026-07-28 — three layers, one estimator family):**
+
+| Layer | What it is | Sensors / inputs | Output |
+|---|---|---|---|
+| **Local** | Short-horizon self-motion + attitude | IMU, degraded radar (RIO), down-ToF, **downward optical flow (Flow deck PMW3901, Phase 2)**, baro | Body-frame velocity, local pose increment |
+| **Global** | Absolute pose in structure frame | Local odometry + UWB mesh + entrance gauge + loop closures (Ph 4) | World-frame pose with bounded error vs entrance |
+| **Swarm / relative** | Pose relative to neighbors | **Neighbor bearing** (UWB PDoA az/el in body frame) + **neighbor velocity** (each drone broadcasts its estimated `(vx, vy, vz)` + yaw rate from the front-end EKF, with covariance) | Relative pose/velocity constraints between drones — **no ground-truth neighbor positions ever enter the estimator** |
+
+8. **Path trace / breadcrumb log (new, meeting 2026-07-28).** Each drone logs at every control timestep: `(t, v, Δψ)` — speed scalar (or body-frame velocity), heading change since last step, and timestamp — appended to a ring buffer on-board and mirrored to the squad graph as Class-B bulk data. Integrating `(v, Δψ)` reconstructs the flown path in the drone's local frame; fusing with the mesh estimate places it globally. **Purpose:** when a victim is found, the drone (or a relay) can command **return along the recorded trace** even if global coords are stale — dead-reckoning RTH is the fallback when mesh quality degrades. Implement in `coordination/` as a lightweight logger; gate: integrated breadcrumb path vs ground-truth trajectory RMSE < 2× the front-end odometry error over a 30 s sortie. **Optical flow (meeting 2026-07-28):** when `deck: flow_v2`, add simulated PMW3901 downward optical flow — body-frame horizontal velocity with PMW3901-class noise and surface dropout — as an EKF update aiding short-horizon velocity integration for breadcrumbs and local hold. Not built in Phase 1 (M3 is ToF-only); gate with a `flow_gate.py`-style check: flow velocity vs ground-truth body `(vx, vy)` within tolerance at hover over textured floor.
+
 0. **AoA-cone coverage handling (replaces the retired modality trade study).** The UWB AoA cone (~90–120°) means not every link gets an angle — out-of-cone neighbors contribute range-only edges. Per the graph-rigidity literature (range+angle edges make a subgraph rigid; range-only edges leave rotational freedom), the estimator and the behaviors must together ensure enough angle edges exist: model antenna mounting orientation explicitly, evaluate whether corridor chains need alternating mounts or periodic yaw-glances to close mutual-bearing pairs, and have the graph track its own rigidity (flag floppy subgraphs) rather than silently absorbing them.
 
 1. **Baseline condition (retained control arm):** v2's anchor experiments — anchors at drifted drop poses, positions as state, floor-only geometry, 5/10/20 m spacing sweep. Run it once, properly, and freeze the results. Every W1 claim is reported against this.
@@ -74,9 +107,17 @@ This replaces v2's anchor-SLAM phase. **Committed modality: UWB PDoA for all int
 
 ---
 
-## PHASE 3 — Local Mapping & Obstacle Avoidance (1–2 weeks; unchanged from v2)
+## PHASE 3 — Local Mapping & Obstacle Avoidance (1–2 weeks)
 
-Rolling occupancy/ESDF-lite from `radarays_gz2` (with degradation model applied), reactive avoidance (velocity-space or CBF), cluttered SubT test suite. **Gate:** <5% collision rate across 20+ randomized cluttered approaches; log every collision as future regression cases. No moonshot changes — but note the avoidance stack must run on Light Scouts without GAP9, so keep it classical and cheap.
+Rolling occupancy/ESDF-lite from `radarays_gz2` (with degradation model applied), **hard-coded reactive avoidance**, cluttered SubT test suite.
+
+**Meeting decision (2026-07-28):** obstacle avoidance is **mmWave distance → fixed rules**, not learned. Architecture:
+
+1. **Sector min-range:** partition the horizontal radar scan (or a lightweight forward arc) into N sectors; each sector reports minimum range from `/radar/points` (with Phase-1 degradation model applied).
+2. **Hard-coded repulsion:** if any sector's min-range < `d_stop` (config, e.g. 0.5 m), override the velocity command with a fixed repulsive vector away from that sector — no neural net, no RL. Rules table in `configs/avoidance/radar_reactive.yaml`.
+3. **Optional:** velocity-space (DWA) or CBF wrapper on top of the same sector ranges if the fixed rules prove too conservative — still classical, still inspectable.
+
+**Gate:** <5% collision rate across 20+ randomized cluttered approaches; log every collision as future regression cases. Avoidance stack must run on Light Scouts without GAP9 — keep it classical and cheap. **Forward dependency:** enable Multi-ranger ToF beams (Phase 1 M3 config, currently disabled) as a secondary near-field check for floor-level obstacles the radar misses — not the primary avoidance sensor.
 
 ---
 
@@ -99,9 +140,19 @@ Dataset and validation edits from v2, all retained: procedural world generation 
 
 ---
 
-## PHASE 5 — Victim Vital-Signs Detection (parallel, 1–2 weeks; unchanged from v2)
+## PHASE 5 — Victim Detection: mmWave Vitals + Thermal IR + Audio (parallel, 2–3 weeks)
 
-Real datasets (breathing SAR + heart sounds), clutter suppression pipeline, detection rate / false-positive rate / minimum integration window quantified, GAP9 port. The mission is still SAR; the moonshot changes how drones know where they are, not why they're there. **Gate:** unchanged.
+**Expanded per meeting 2026-07-28.** Three complementary cue channels — any one can trigger a perch-and-confirm behavior tree branch; fusion is OR-with-confirm, not single-modality:
+
+| Modality | Sensor | Role | Sim fidelity |
+|---|---|---|---|
+| **Thermal IR (LWIR)** | FLIR Lepton / MLX90640 deck | Primary **exploration cue** — heat blob above floor background during floor sweeps | **Mocked** — sample detection/FP from public datasets; no thermal-inertial odometry claims |
+| **mmWave vitals** | IWR6843AOP vitals mode | **Confirmatory** — heartbeat/breathing after perch | Real datasets (breathing SAR + heart sounds); sim trigger sampled from measured detection/FP distribution |
+| **Audio** | Onboard mic (GAP9 mappers) | **Soft cue** — groans, tapping, voice-like energy in victim band | **Mocked** — same discipline as vitals; real validation on public SAR audio datasets |
+
+Pipeline: clutter suppression per modality → detection rate / false-positive rate / minimum integration window quantified → GAP9 port for mappers. Light Scouts carry audio only if mass budget allows; vitals confirm is mapper-only.
+
+**Gate:** each modality meets a stated detection rate / FP rate on held-out real data; fused trigger (thermal OR audio → perch → vitals confirm) beats any single channel on a scripted victim-in-tunnel eval. Sim runs use mocked statistics only — label results accordingly.
 
 ---
 
@@ -112,6 +163,7 @@ As v2 (behavior tree: explore → cue → perch → integrate vitals → alert/r
 1. **Remove:** puck payload handling and drop-mechanism behaviors. (Payload margin freed — note it, it partially relieves the 2–4 min sortie floor.)
 2. **Add: mesh-duty landing.** Landing-site selection gains a second objective besides vitals-stare: "become a static mesh node / relay here." Geometry-aware (prefer sites that de-collinearize the mesh; elevated debris preferred for Z diversity and RF line-of-sight), battery-aware. A landed drone keeps its ranging channel + low-rate radio alive for tens of minutes — and **if the Phase 2 trade study picked radar+reflector, a landed drone is a passive landmark even after its battery dies**, so mesh-duty sites should be scored partly as *permanent* landmark placements.
 3. **Add: radar blackout accounting during mode switches** — now with a fourth mode if the trade study picked radar-based inter-drone sensing (odometry / obstacle / vitals / neighbor-tracking chirp configs share one 6843AOP). Make explicit the time-multiplexing schedule, what the EKF coasts on during each mode's blackout, and the perched case: a drone in vital-signs mode stops *measuring* neighbors but its reflector keeps *being measured* (vs UWB, where a busy/asleep node answers ranging on a separate radio — log whichever assumption applies).
+4. **Add: victim-find → perch → alert branch (meeting 2026-07-28).** Behavior tree: `(thermal IR cue OR audio cue) → slow hover → perch → mmWave vitals confirm → Class-A alert + stamp victim pose + freeze breadcrumb index`. Resume exploration or hold perch depending on battery. Thermal/acoustic triggers use Phase-5 mocked statistics in sim.
 
 **Gate:** v2 gate + perching sub-gate + at least one mission variant where the drone ends its sortie as a functioning static mesh/relay node and neighboring sim drones measurably benefit (localization covariance drops when ranging to it).
 
@@ -122,10 +174,12 @@ As v2 (behavior tree: explore → cue → perch → integrate vitals → alert/r
 v2's backbone-deployment phase, rebuilt. Retained: 10-drone squad scale-up, Anchor/Shadow leader election with buffered pose graphs, auction-based frontier allocation + response-threshold fallback, latency/packet-loss stress, elastic-breadcrumb RTH (now over the mesh-estimated topological graph), **RF propagation model** (distance + wall/bend attenuation — still needed; the connected/disconnected coordination switch and relay decisions fire against it). Removed: anchor-drop policy and drop dynamics. Added — the W3 research content:
 
 1. **Mesh-configuration planning.** The swarm must decide, continuously, who flies the frontier and who holds (hovers or lands) as a mesh node. Implement as auction terms: a drone bids on "mesh-node duty at site X" with battery state, position value (de-collinearization, hop-count reduction, RF relay value), and expendability class. This replaces the drop-on-link-margin policy: **the trigger condition is analogous (don't let the last link's margin/geometry collapse), but the resource spent is a drone-minutes budget, not a puck.**
-2. **Active loop-closure planning.** Add an information-value term to frontier auctions: trajectories that revisit mapped regions, cross another drone's path at a junction, or return past known keyframes *purchase* loop closures with flight time. Start dead simple — a bonus for paths intersecting the existing keyframe graph within descriptor-match range — and let Phase 9's mission-level metrics judge whether sophistication pays.
-3. **Inter-drone loop closures:** when two drones' descriptors match across the mesh, that's a cross-agent factor. Wire it through the same vetting as Phase 4.
-4. **Radar-modality swarm mechanics (conditional on the Phase 2 trade study picking radar or hybrid):** (i) **chirp TDM/scheduling** — many 6843AOPs radiating the same band in one corridor will interfere; add a slot-scheduling scheme and model chirp-collision dropout in the plugin; (ii) **yaw-glance / mount-orientation coordination** — the FoV coverage plan from Phase 2 item 0 becomes a real squad behavior here (who glances back, when), budgeted as flight-time cost in the auctions.
-5. **Comms honesty (the accepted v3 trade):** Class-A alerts route over landed-drone relays where they exist, else store-and-forward to the nearest connected node, else data-mule on RTH. **Measure and report alert latency vs depth** — expect it to be worse than v2's dedicated backbone; the mission-level question is whether it's still operationally acceptable (seconds-to-minutes, not never).
+2. **Auction-based floor exploration (new, meeting 2026-07-28).** Partition the explored area into **floor cells** (2D grid, cell size configurable, e.g. 1 m). Each cell tracks: `(a)` down-ToF-derived floor height / clearance, `(b)` exploration status (unvisited / partial / complete), `(c)` human-cue flags from thermal IR or audio passes. **Auction item = "explore cell X"** — drones bid with battery, distance, and mesh-deconfliction cost; winner flies a lawn-mower or spiral pass over that cell while logging ToF floor geometry. When a human cue fires during the pass → branch to perch-and-confirm (Phase 6 behavior tree) and **stamp the cell with victim-candidate flag + breadcrumb path index** (Phase 2 path trace) so other drones and RTH know where to return. ToF alone does not detect humans — it only maps floor geometry for the auction grid.
+3. **Active loop-closure planning.** Add an information-value term to frontier auctions: trajectories that revisit mapped regions, cross another drone's path at a junction, or return past known keyframes *purchase* loop closures with flight time. Start dead simple — a bonus for paths intersecting the existing keyframe graph within descriptor-match range — and let Phase 9's mission-level metrics judge whether sophistication pays.
+4. **Inter-drone loop closures:** when two drones' descriptors match across the mesh, that's a cross-agent factor. Wire it through the same vetting as Phase 4.
+5. **Radar-modality swarm mechanics (conditional on the Phase 2 trade study picking radar or hybrid):** (i) **chirp TDM/scheduling** — many 6843AOPs radiating the same band in one corridor will interfere; add a slot-scheduling scheme and model chirp-collision dropout in the plugin; (ii) **yaw-glance / mount-orientation coordination** — the FoV coverage plan from Phase 2 item 0 becomes a real squad behavior here (who glances back, when), budgeted as flight-time cost in the auctions.
+6. **Comms honesty (the accepted v3 trade):** Class-A alerts route over landed-drone relays where they exist, else store-and-forward to the nearest connected node, else data-mule on RTH. **Measure and report alert latency vs depth** — expect it to be worse than v2's dedicated backbone; the mission-level question is whether it's still operationally acceptable (seconds-to-minutes, not never).
+7. **Return-to-victim / breadcrumb RTH (meeting 2026-07-28).** When a drone finds a victim, it stamps the location with the current mesh pose *and* the breadcrumb path index (Phase 2 item 8). RTH options, in priority order: (a) mesh-topology path if coords are healthy, (b) **reverse the logged `(v, Δψ)` breadcrumb trail** if mesh is partitioned or coords are stale. Gate: drone returns to entrance (or relay node) via breadcrumb reversal with ≤2× the forward-path length.
 
 **Gate:** squad explores with <15% redundant coverage; mesh stays connected-enough that frontier-drone error meets the Phase-2 budget *with* loop closures now active (show the error-vs-hops curve bends flat where closures occur — this plot is the moonshot's thesis in one figure); Anchor kill survived; RTH succeeds with comms at zero; alert-latency-vs-depth curve produced and stated. **Paper 3 checkpoint:** active loop closing as an auction mechanism, evaluated at squad scale.
 

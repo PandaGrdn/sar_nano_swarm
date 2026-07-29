@@ -13,6 +13,10 @@
 #   zranger_v2   -> VL53L1x down ToF only (Bitcraze Z-ranger deck v2, 1.3 g)
 # Multi-ranger (5-direction) is optional/deferred to Phase 3 obstacle avoidance
 # per the plan — present here but disabled by default.
+#
+# Optical flow (PMW3901, Flow deck only): simulated in M3b by
+# perception/flow_sim/flow_node.py — see configs/sensors/optical_flow.yaml and
+# .cursor/docs/M3b_Optical_Flow_Implementation_Plan.md
 deck: flow_v2
 
 # VL53L1x datasheet values (Bitcraze Flow deck v2 / Z-ranger v2).
