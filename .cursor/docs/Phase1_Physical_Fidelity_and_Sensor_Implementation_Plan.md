@@ -4,11 +4,11 @@
 
 **Prereq status:** Phase 0 is COMPLETE (SITL Crazyflie + `radarays_gz2` in `sim_worlds/phase0_tunnel_gate.sdf`, `/radar/points` @ ~10 Hz).
 
-> **⚠ SUPERSEDED BY v3 (read before touching §5/UWB or M4):** `Simulation_Training_Optimization_Roadmap_v3_MOONSHOT.md` (2026-07-27) retires the dropped-anchor-puck architecture entirely — no infrastructure gets deployed inside the structure anymore. UWB's role becomes an **inter-drone range+bearing (PDoA) mesh** gauged only at the entrance, not a drone↔anchor ranging system. This doc's mass model (§2/M1) and ToF sensor (§4/M3) are **unaffected** — they don't depend on the anchor architecture. §5/M4 (UWB) is **substantially rewritten below**: the original drone↔anchor analytic node is kept only as a one-time baseline control-arm run (v3 Phase 2 item 1), and the real M4 deliverable is now the inter-drone PDoA plugin described in §5.5. M1's mass budget also needs one correction: **anchor pucks are retired from the budget** (v3 Phase 6: "Remove: puck payload handling and drop-mechanism behaviors"), and the UWB deck entry needs relabeling from a single-antenna Loco deck to a dual-antenna PDoA module (§2).
+> **⚠ SUPERSEDED BY v3 (read before touching §5/UWB or M4):** `Simulation_Training_Optimization_Roadmap_v3_MOONSHOT.md` (2026-07-27) retires dropped **anchor pucks** entirely. UWB's role is an **inter-drone range+bearing (PDoA) mesh** gauged at a fixed entrance node. **M4a cancelled.** **Build authority for M4:** `.cursor/docs/M4_UWB_Relative_Positioning_Implementation_Plan.md` (Python analytic node, not the C++ plugin sketch in §5 below).
 
 ---
 
-## Status at a glance (updated 2026-07-28)
+## Status at a glance (updated 2026-07-30)
 
 | Milestone | Scope | Status | Gate / notes |
 |---|---|---|---|
@@ -17,13 +17,13 @@
 | **M2b** | Disturbance flags (`--sensor-noise`, wind, turbulence) | ❌ **NOT STARTED** | §3.5 — no sweep run yet |
 | **M3a** | VL53L1x down-ToF (`gpu_lidar`) | ✅ **DONE** | `tof_gate.py` PASS; ~29.9 Hz, altitude error 0.8–1.8 cm |
 | **M3b** | PMW3901 optical flow (Flow deck v2 only) | ✅ **DONE** | `flow_gate.py` PASS; ~100 Hz, dropout on smooth patch works |
-| **M4a** | UWB drone↔anchor analytic node (control arm) | ❌ **NOT STARTED** | Run once, freeze — v3 baseline only |
-| **M4b** | Inter-drone UWB PDoA gz-sim plugin (v3 primary) | ❌ **NOT STARTED** | Next major implementation task |
+| **M4** | Inter-drone UWB PDoA mesh (Python analytic node) | ✅ **DONE** | `uwb_gate.py` PASS 12/12; see §5. M4a **cancelled** |
+| **M4-4** | Landed peers + mesh LOS control arm | ⏸ **NOT RUN** | Config-only; low priority |
 | **M5** | Phase-1 exit gate (±10 cm hold under noise + turbulence) | ❌ **NOT STARTED** | Roadmap Ph1 exit; stricter than M2 |
 | **§4.3** | Thermal / LWIR camera | ⏸ **DEFERRED** | Out of scope Phase 1 |
 | **Multi-ranger** | 5-direction ToF beams | ⏸ **DISABLED** | Config stub only; optional for Phase 3 |
 
-**Phase 1 progress:** airframe physics (M1–M2) and Flow-deck sensors (M3a + M3b) are complete and gated. UWB (M4) and the final noise/turbulence exit gate (M5) remain.
+**Phase 1 progress:** airframe physics (M1–M2), Flow-deck sensors (M3a + M3b), and UWB PDoA mesh (M4) are complete and gated. **M5** exit gate and **M2b** disturbance flags remain.
 
 ---
 
@@ -33,13 +33,12 @@ These are hard constraints from `AGENTS.md §5`. The plan is designed *around* t
 
 | Sensor | Sim fidelity | What we may claim | What we must NOT claim |
 |---|---|---|---|
-| **UWB ranging** (drone↔anchor, v2 control arm — §5.1–5.4) | High (geometry + analytic noise) | Range accuracy, NLOS/multipath dropout, DOP behaviour | — (this one is genuinely good in sim) |
-| **UWB PDoA ranging+bearing** (inter-drone mesh, v3 primary — §5.5) | High for range; angle fidelity only as good as the off-boresight/AoA-cone model, which is placeholder until Phase 1's external-validation gate (v3 roadmap Phase 1 item 1) | Range accuracy, angle accuracy within a validated envelope, AoA-cone range-only fallback, NLOS/multipath dropout | Angle accuracy outside the externally-validated range; anything about a *specific* unbuilt PDoA module's real aperture until Phase 11 bench data exists |
+| **UWB PDoA ranging+bearing** (inter-drone mesh, v3 — §5.1) | High for range; angle fidelity only as good as the off-boresight/AoA model, which is placeholder until Phase 1's external-validation gate (v3 roadmap Phase 1 item 1) | Range accuracy, angle accuracy within a validated envelope, AoA-cone range-only fallback, NLOS/multipath dropout | Angle accuracy outside the externally-validated range; anything about a *specific* unbuilt PDoA module's real aperture until Phase 11 bench data exists |
 | **IR ToF rangefinder** (downward/obstacle) | High (raycast geometry + noise) | Altitude/obstacle ranging under geometry | Material-specific reflectivity dropout (approximate only) |
 | **Thermal / LWIR camera** (victim IR) | **Low — mocked** | *Out of scope this phase (see §4.3)* | ❌ That the sim validates thermal victim detection or **thermal-inertial odometry** (real-hardware-only per `AGENTS.md §5`) |
 | **PMW3901 optical flow** (Flow deck) | High when analytic sim uses true velocity + noise; texture dropout must be modeled | Body-frame `(vx, vy)` ground-relative velocity on textured floor | ❌ That flow works on untextured/smooth floors without invalid flag; ❌ that PMW3901 measures range/altitude |
 
-**Consequence for this plan:** default **Flow deck v2** = two sensors — **VL53L1x ToF** (M3a, ranging) and **PMW3901 optical flow** (M3b, horizontal velocity). These are separate chips; optical flow is not computed from ToF. **Both are built and gated (M3 complete).** UWB PDoA (M4) is the inter-drone mesh source — not started. Thermal/LWIR is **deferred** (§4.3).
+**Consequence for this plan:** default **Flow deck v2** = two sensors — **VL53L1x ToF** (M3a, ranging) and **PMW3901 optical flow** (M3b, horizontal velocity). **Both are built and gated (M3 complete).** UWB PDoA (M4) is **built and gated** — see §5. Thermal/LWIR is **deferred** (§4.3).
 
 ---
 
@@ -49,11 +48,11 @@ These are hard constraints from `AGENTS.md §5`. The plan is designed *around* t
 |---|---|---|
 | 1 | Physically accurate drone (mass, CoM, inertia, PID, T/W) | ✅ M1 + M2 done |
 | 2 | IR sensors in sim (Flow deck: ToF + optical flow) | ✅ M3a + M3b done |
-| 3 | UWB sensor in sim (M4a control arm + M4b PDoA mesh) | ❌ Not started |
+| 3 | UWB sensor in sim (inter-drone PDoA mesh only; M4a cancelled) | ✅ M4 done |
 | 4 | Sensor weights in mass model (config-driven) | ✅ Done |
-| 5 | Config-driven, portable, MLflow-logged evals | ✅ Done for M1–M3 gates |
+| 5 | Config-driven, portable, MLflow-logged evals | ✅ Done for M1–M4 gates |
 
-**Still open:** UWB (obj 3), disturbance flags (§3.5), Phase-1 exit gate M5 (±10 cm under noise+turbulence). Thermal LWIR deferred (§4.3).
+**Still open:** disturbance flags (§3.5), Phase-1 exit gate M5 (±10 cm under noise+turbulence). Thermal LWIR deferred (§4.3).
 
 ---
 
@@ -200,7 +199,7 @@ Mass for Flow deck v2 (**1.6 g**, both chips) is already in `payload.yaml`. Both
 
 **Gate (`eval_scripts/flow_gate.py`):** live PASS on `phase1_pid_tune --no-radar --headless` — `/cf_0/flow` ~100 Hz; hover valid fraction 100%, hover RMS ~0.31 m/s (single-frame noise floor at `flow_std_px=2.0`); forward RMSE vs debug_truth ~0.32 m/s, mean vx bias ~−0.02 m/s; smooth-patch dropout valid fraction ~8%. See `.cursor/docs/M3b_Optical_Flow_Implementation_Plan.md`.
 
-**Status: DONE, gated live.** Mass already counted in Flow deck v2 line item. Does not block M4.
+**Status: DONE, gated live.** Mass already counted in Flow deck v2 line item. M4 (UWB) also complete.
 
 ### 4.3 Thermal / LWIR camera — DEFERRED (out of scope Phase 1)
 Not implemented now (you selected IR ToF). Recorded here so the option is documented if revisited:
@@ -210,48 +209,98 @@ Not implemented now (you selected IR ToF). Recorded here so the option is docume
 
 ---
 
-## 5. Workstream D — UWB sensor (REVISED FOR v3 — read the banner at the top of this doc)
+## 5. Workstream D — UWB sensor (M4 — inter-drone PDoA mesh)
 
-**There is no native Gazebo UWB sensor.** UWB is modelled **analytically** — this is the correct and standard approach, and it fits `AGENTS.md §1` (anchors are state, positions never known constants).
+**Build authority:** `.cursor/docs/M4_UWB_Relative_Positioning_Implementation_Plan.md` — supersedes the C++ plugin sketch below wherever they disagree.
 
-**v3 changes the primary architecture.** §5.1–5.4 below (drone↔anchor + anchor↔anchor ranging to dropped pucks) is the **v2 design**. It is **not deleted** — v3 Phase 2 item 1 explicitly keeps it as a **frozen, one-time baseline control arm** ("run it once, properly, and freeze the results. Every W1 claim is reported against this."). But it is no longer what M4 is *for*. The new primary deliverable is **§5.5: an inter-drone UWB PDoA plugin** — a gz-sim System plugin, not a simple analytic ROS node, because it needs efficient per-pair geometry in each drone's own body frame every sim step (same reason `radarays_gz2` is a C++ System plugin and not a Python node).
+**There is no native Gazebo UWB sensor.** UWB is modelled **analytically** by a **Python `rclpy` node** (`perception/uwb_sim/uwb_node.py`), not a gz-sim System plugin — see M4 plan §1.1 reversal (compute budget does not justify C++).
 
-**M4 is therefore split:**
-- **M4a** (small, lower priority): keep/finish the v2 analytic range node below, run it once for the control-arm dataset, freeze results.
-- **M4b** (the real work, and gated earlier than "M4" implied — v3 wants a basic version working to *exit Phase 0*): the inter-drone PDoA plugin, §5.5.
+**M4a cancelled.** The v2 drone↔anchor analytic node (`uwb_range_node.py`, `uwb.yaml`, `uwb_anchors.yaml`) and **physical anchor pucks** are **not** being implemented.
 
-### 5.1 Architecture (v2 design — M4a, control-arm only) — **NOT STARTED**A ROS 2 node `perception/uwb_sim/uwb_range_node.py` (rclpy, per `AGENTS.md §6.3`):
-- **Inputs:** drone ground-truth pose (from gz `/cf_*/odom` or a gz→ROS pose bridge) and a set of **anchor world positions** from `configs/sensors/uwb_anchors.yaml`.
-- **Per range measurement** (drone↔anchor, and **anchor↔anchor** — cheap, stiffens the chain per roadmap Ph2.3):
-  1. True Euclidean distance `d`.
-  2. Add **Gaussian noise** σ ≈ **0.10 m** (DWM1000 ±10 cm datasheet spec).
-  3. **NLOS / multipath outliers:** raycast between the two endpoints against the world mesh (reuse the `rmagine`/Embree map already loaded by the radar plugin, or a lightweight Python occlusion check). If occluded → add a **positive NLOS bias** + inflate σ, and with probability `p_dropout` **drop** the measurement. This is what makes tunnel UWB realistic.
-  4. Respect **max range** (~10 m tested for the Loco deck) → beyond it, drop.
-- **Output:** a custom/`std_msgs`-style range array or `sensor_msgs`-compatible message on `/cf_0/uwb/ranges`, timestamped, with `(anchor_id, range, sigma, los_flag)`.
+**Reference nodes without pucks:** if the mission needs fixed physical reference points later, **other drones** serve that purpose — e.g. a drone lands/holds and acts as a mesh peer (same PDoA range+bearing as any flying neighbor). The **entrance/base-station** node is a static world peer (same maths; pose surveyed).
 
-### 5.2 Anchors are configurable entities, positions are NOT truth (M4a)
-- `configs/sensors/uwb_anchors.yaml` holds anchor **world** positions **for the simulator to generate ranges from** — this is the sim oracle, analogous to Gazebo ground truth.
-- **Critical (`AGENTS.md §1 Tier A`):** downstream (Phase 2) the EKF must **not** read these YAML positions. Anchors are instantiated at the dropping drone's *drifted estimated* pose and refined as state. Keep a hard wall: the sim range generator knows true anchor positions; the estimator never does. Document this at the top of both files.
-- **Geometry for evals:** use **floor-only / coplanar** anchor layouts (`AGENTS.md §5`) — dropped pucks land on the floor → bad vertical DOP. Do not use idealized floor/wall/ceiling placements.
+### 5.1 Inter-drone UWB PDoA node (M4 — sole deliverable)
 
-### 5.3 Noise params → `configs/sensors/uwb.yaml` (Tier B) (M4a)
-`sigma_los: 0.10`, `nlos_bias_mean`, `nlos_sigma`, `p_dropout_nlos`, `max_range: 10.0`, `ranging_rate` (Loco: ~80 Hz/anchor with 6 anchors), `anchor_to_anchor: true`.
+**Status: DONE, gated live (2026-07-30).** One swarm-wide node with airtime budget + round-robin scheduler (M4 plan §1.3). Offline: `uwb_model.py --selftest` (17/17 PASS). Live: `uwb_gate.py` **PASS 12/12** on `phase1_pid_tune -n 2 --spacing 2.0 --no-radar --headless --no-flow`.
 
-### 5.4 Mass (M4a — RETIRED from the live payload budget, v3)
-Was: UWB Loco deck **3.3 g** + carried anchor pucks (⚠ placeholder). **Both retired from `payload.yaml`'s live budget** — see §2. The Loco deck's *analytic ranging math* (§5.1–5.3) is still used for the M4a control-arm run; its *mass line* just isn't part of the airframe anymore because the real hardware being flown for v3 is the PDoA module in §5.5, not this deck.
+**Implementation:**
 
-### 5.5 Inter-drone UWB PDoA plugin (M4b — v3 primary deliverable)
+| Component | Path | Role |
+|---|---|---|
+| Config | `configs/sensors/uwb_pdoa.yaml` | All Tier B knobs (noise, AoA cone, airtime, static peers) |
+| Edge codec | `perception/uwb_sim/uwb_edges.py` | 48-byte `PointCloud2` record; `pack_edges()` / `unpack_edges()` |
+| Pure model | `perception/uwb_sim/uwb_model.py` | Geometry, noise, LOS, scheduler — no `rclpy` |
+| ROS wrapper | `perception/uwb_sim/uwb_node.py` | Subscribes `/cf_<id>/odom`; publishes edge topics |
+| Exit gate | `eval_scripts/uwb_gate.py` | Checks A1–G (range, bidirectional identity, AoA cone, rel-pos, entrance node) |
+| Launcher | `eval_scripts/phase0_gate.sh` | `-n N`, `--spacing`, `--no-uwb`, `--uwb-config`; kills stale `uwb_node` |
 
-**Decision:** a gz-sim **System plugin** (C++, sibling to `radarays_gz2` — same reasoning: needs per-entity-pair geometry computed against live sim state every step, which is what System plugins are for, not a decision to prefer C++ generally per `AGENTS.md §1`/`§6.5`).
+**ROS topics:**
 
-- **Per drone pair, per update tick, emit:** range (m), azimuth (rad), elevation (rad) — **in the observing drone's own body frame** (this is what makes mutual-bearing yaw-constraint factors possible in Phase 2's mesh estimator: two drones each report a bearing to the other, and disagreement/consistency between those two bearings is an observable that constrains their relative yaw).
-- **Identity is always known** — UWB ranging is a two-way physical exchange (TWR/PDoA), not a passive detection, so there's no data-association ambiguity to model (unlike radar returns). Emit `(peer_id, range, azimuth, elevation, in_aoa_cone: bool)`.
-- **AoA field-of-view cone (~90–120°, configurable):** outside the cone, still emit the **range-only** edge (`azimuth`/`elevation` null or flagged invalid) rather than dropping the measurement entirely — per the v3 roadmap, range-only edges still contribute to the pose graph, just without the rigidity that range+bearing edges give it.
-- **Noise model (placeholder until Phase 1's external-validation gate):** range noise is roughly omnidirectional (TWR ranging doesn't care about orientation); angle noise **grows off-boresight** and must reproduce the ETH-PBL dual-antenna characterization the v3 roadmap cites (~2.4° mean accuracy within ±45° of boresight, for a *larger, tuned* module — budget conservatively, 5–15°, for the ~4–5 cm antenna spacing a nano-drone can actually fit, until real bench data says otherwise). NLOS/multipath outliers via the same occlusion-raycast approach as §5.1.3.
-- **Entrance/base-station node:** a fixed, non-drone entity with its own PDoA unit — this is the "gauge" the whole mesh's absolute position is hung off of. Model it as a static world entity the plugin treats like any other peer (so the same range+bearing math applies uniformly), not a special case.
-- **Config → `configs/sensors/uwb_pdoa.yaml`** (Tier B, new — see §6): `sigma_range_m`, `aoa_fov_deg`, `angle_error_deg_at_boresight`, `angle_error_growth_model` (placeholder functional form until Phase 1 validation replaces it), `nlos_bias_mean`, `nlos_sigma`, `p_dropout_nlos`, `max_range_m`, `update_rate_hz`, `entrance_node_pose` (this one *is* allowed to be a known constant — it's a real fixed base station, not a dropped/drifted anchor).
-- **Gate (part of v3's Phase 0 exit criterion, i.e. wanted before this plan's own M4b is "done"):** two SITL drones exchanging simulated UWB range+bearing measurements on a ROS topic, including correct range-only fallback when a neighbor is outside the AoA cone.
-- **Status: NOT STARTED.** This is the next real implementation task after this doc revision.
+| Topic | Purpose |
+|---|---|
+| `/cf_<id>/uwb/edges` | Per-drone measured edges (flying drones) |
+| `/uwb/peer_<id>/edges` | Static peers (entrance node) — not `/uwb/1000/edges` (invalid ROS 2 name) |
+| `/uwb/edges_all` | Aggregate mesh (gate + RViz) |
+| `/uwb/edges_truth` | Sim oracle (Tier A) — estimator must **never** subscribe |
+
+**Per drone pair, per scheduled exchange, emit:** range (m), azimuth (rad), elevation (rad) in the **observer's body frame**, plus validity flags. **Shared range noise** per TWR exchange (both observers see the same `r_meas`). Outside the **180° AoA cone**, emit **range-only** edges (bearing flagged invalid) — gate check C validates this via spawn asymmetry (drone 0 ahead, drone 1 behind).
+
+**Live gate metrics (representative PASS run):**
+
+| Check | Result |
+|---|---|
+| A1 edge rate | PASS (~10 Hz target after dedupe) |
+| A2 range error mean | ~0.08 m |
+| B bidirectional range identity | 100% |
+| C bearing-valid fraction (leg A) | 100% |
+| D azimuth RMS | ~8.5° |
+| E relative-position error mean | ~0.38 m |
+| F entrance node range error mean | ~0.08 m |
+| G aggregate | **12/12 PASS** |
+
+NLOS live behaviour is covered by offline selftest checks 8–10; not a separate live gate leg.
+
+#### §1.5 deltas from this doc's original §5 sketch (resolved — do not revert)
+
+| Original §5 sketch | Built implementation | Why |
+|---|---|---|
+| C++ gz-sim System plugin | **Python `rclpy` node** | M4 plan §1.1 — compute does not justify C++ |
+| flat `update_rate_hz` | **airtime budget + neighbour cap + round-robin scheduler** | §1.3 — flat rate hides mesh scaling limit |
+| separate M4a + M4b codebases | **one node, one model** | Range-only anchor = static peer with bearing disabled |
+| three config files | **one `uwb_pdoa.yaml`** | Peer list + noise model in one place |
+| antenna spacing "~4–5 cm" | **`antenna_spacing_m: 0.023` (≈ λ/2 at 6.5 GHz)** | >λ/2 is phase-ambiguous — physics error |
+| NLOS range bias only | **NLOS also invalidates bearing by default** | Multipath AoA points at reflector, not peer |
+| — | **antenna-delay bias sampled once at startup** | Persistent 10–30 cm offset if omitted |
+| — | **`--selftest` (17 checks, no ROS/sim)** | Retires correctness risk before Gazebo |
+
+#### Mid-level decision 8 — AoA cone width
+
+**Target: 180°** as the practical maximum while maintaining usable bearing accuracy. A dual-antenna PDoA module on a small airframe is fundamentally limited by **front vs. back ambiguity** on the azimuth axis — widening the cone beyond ~180° reintroduces that ambiguity without extra motion or hardware.
+
+> **Side note (360° azimuth):** full **360° bearing** is possible if the drone performs a **slight yaw twitch** — a small deliberate yaw motion and comparison of bearing readings before/after disambiguates whether the peer is in the forward vs. rear half-plane. Not in M4 scope; document as a future estimator/motion primitive if needed.
+
+#### Future work (not M4 scope)
+
+> **Swarm measurement reinforcement:** inter-drone **relative range and bearing** can **reinforce or correct local positioning drift** — e.g. if one drone's IMU/flow odometry drifts slightly, consistent range+bearing to neighbors (and mutual bearings) provide cross-checks that tighten the local state without requiring anchor pucks. Lands in Phase 2 mesh fusion / later swarm positioning work.
+
+### 5.2 Cancelled — M4a drone↔anchor control arm (do not implement)
+
+The following v2 design is **retained in git history / v3 roadmap references only** — **do not build**:
+
+- `perception/uwb_sim/uwb_range_node.py`, `configs/sensors/uwb.yaml`, `configs/sensors/uwb_anchors.yaml`
+- Dropped puck anchors, anchor↔anchor ranging, Loco-deck mass line
+
+If v3 Phase 2 ever needs a range-only baseline comparison, that can be a one-off script — not a Phase 1 milestone.
+
+### 5.3 M4 milestone breakdown (M4 plan §7.1)
+
+| Sub-milestone | Scope | Status |
+|---|---|---|
+| **M4-0** | Multi-drone launch (`phase0_gate.sh -n N`) | ✅ DONE |
+| **M4-1** | `uwb_model.py` + `uwb_edges.py` + `--selftest` | ✅ DONE (17/17) |
+| **M4-2** | `uwb_node.py` live; edge topics + RViz mesh | ✅ DONE |
+| **M4-3** | `uwb_gate.py` passes A–G | ✅ DONE (12/12) |
+| **M4-4** | Landed peers + mesh LOS in cave world (control arm) | ⏸ NOT RUN — config-only, low priority |
 
 ---
 
@@ -268,9 +317,8 @@ configs/
   sensors/
     tof.yaml                # IR ToF (M3a) — DONE
     optical_flow.yaml       # PMW3901 flow (M3b) — DONE (separate file, not inside tof.yaml)
-    uwb.yaml                # M4a (control-arm only) — NOT STARTED
-    uwb_anchors.yaml        # M4a sim-oracle anchor positions — NOT STARTED
-    uwb_pdoa.yaml           # M4b inter-drone PDoA params — NOT STARTED
+    uwb_pdoa.yaml           # M4 inter-drone PDoA params — DONE
+    # M4a cancelled: no uwb.yaml, uwb_anchors.yaml, or uwb_range_node.py
 ```
 
 `payload.yaml` sketch (reflects the v3-revised, **live** budget — actual file has real datasheet sources and per-component `enabled` flags, see §2):
@@ -298,8 +346,7 @@ components:
 | IR ToF stream (M3a) | `tof_gate.py` | rate + altitude tracking — **DONE, PASS** |
 | Optical flow stream (M3b) | `flow_gate.py` | ~100 Hz; texture valid; smooth-patch dropout — **DONE, PASS (2026-07-28)** |
 | Disturbance sweep (M2b) | hover/waypoint under `--sensor-noise` etc. | **NOT STARTED** |
-| UWB stream (M4a, control-arm only) | `uwb_range_node` self-test | **NOT STARTED** |
-| UWB PDoA mesh edge (M4b, v3 primary) | gate TBD | **NOT STARTED** |
+| UWB PDoA mesh edge (M4) | `uwb_gate.py` | **DONE, PASS 12/12** — range err mean ~0.08 m, bidir identity 100%, bearing-valid A 100%, az RMS ~8.5°, rel-pos err mean ~0.38 m, entrance range err mean ~0.08 m |
 | **Phase-1 exit gate (M5)** | hover/waypoint sweep | **±10 cm hold under noise + turbulence — NOT STARTED** |
 
 The Phase-1 exit gate is the roadmap's: stable loaded-mass flight under realistic noise **before** any radar/UWB fusion (that's Phase 2).
@@ -327,16 +374,17 @@ The Phase-1 exit gate is the roadmap's: stable loaded-mass flight under realisti
 | `perception/flow_sim/flow_node.py` | M3b — analytic PMW3901 sim |
 | `eval_scripts/flow_gate.py` | M3b exit gate |
 | `configs/sensors/optical_flow.yaml` | M3b config |
-| `eval_scripts/phase0_gate.sh` | M3a/M3b wiring (ToF inject, odom bridge, flow node, `--no-flow`) |
+| `eval_scripts/phase0_gate.sh` | M3a/M3b/M4 wiring (ToF, odom bridge, flow, `-n N`, UWB node launch) |
+| `configs/sensors/uwb_pdoa.yaml` | M4 config |
+| `perception/uwb_sim/uwb_edges.py` | M4 PointCloud2 edge codec |
+| `perception/uwb_sim/uwb_model.py` | M4 pure model + `--selftest` |
+| `perception/uwb_sim/uwb_node.py` | M4 rclpy wrapper |
+| `eval_scripts/uwb_gate.py` | M4 exit gate |
 
 ### Not started ❌
 
 | File | Milestone |
 |---|---|
-| `perception/uwb_sim/uwb_range_node.py` | M4a — control-arm only |
-| `configs/sensors/uwb.yaml`, `uwb_anchors.yaml` | M4a |
-| gz-sim UWB PDoA System plugin (name TBD, e.g. `uwb_pdoa_gz`) | M4b — v3 primary |
-| `configs/sensors/uwb_pdoa.yaml` | M4b |
 | M5 exit gate script (noise + turbulence sweep) | M5 |
 | `phase0_gate.sh` pass-through for `--sensor-noise` / wind / turbulence | M2b / §3.5 |
 
@@ -344,10 +392,10 @@ The Phase-1 exit gate is the roadmap's: stable loaded-mass flight under realisti
 
 | Item | Notes |
 |---|---|
-| `configs/rviz/radar.rviz` | ToF/flow/UWB displays not fully wired |
+| `configs/rviz/radar.rviz` | UWB PointCloud2 on `/uwb/edges_all` wired; ToF/flow displays partial |
 | `configs/sensors/tof.yaml` → `multi_ranger.enabled` | Disabled; optional Phase 3 |
 | Thermal deck mass + sim | Deferred §4.3 |
-| README / `AGENTS.md §3` | Updated incrementally; M3b added 2026-07-28 |
+| README / `AGENTS.md §3` | Updated incrementally; M3b added 2026-07-28; M4 gated 2026-07-30 |
 
 **Untouched:** the CrazySim submodule (`model.sdf.jinja` etc.) — all changes via launch-time injection + configs.
 ---
@@ -361,10 +409,10 @@ The Phase-1 exit gate is the roadmap's: stable loaded-mass flight under realisti
 3. **M3 — Flow deck sensors** (§4): **COMPLETE (2026-07-28).**
    - **M3a — IR ToF: DONE, gated live.** Gate: rate ~29.9 Hz, altitude error 0.8–1.8 cm at hover plateaus. See §4.1.
    - **M3b — PMW3901 optical flow: DONE, gated live.** Gate: ~100 Hz, smooth-patch dropout ~8% valid. See §4.2.
-4. **M4 — UWB, REDEFINED by v3** (§5): **NOT STARTED.** Split into **M4a** (control-arm analytic node) and **M4b** (inter-drone PDoA plugin — next major task).
+4. **M4 — UWB inter-drone PDoA mesh** (§5): **DONE, gated live (2026-07-30).** M4a (anchor pucks / analytic range node) **cancelled**. Built as Python analytic node per M4 plan (not C++ plugin). Sub-milestones: M4-0…M4-3 ✅; M4-4 (landed peers + mesh LOS) not run.
 5. **M5 — Phase-1 exit gate** (§7): **NOT STARTED.** ±10 cm hold under noise+turbulence on the full loaded airframe.
 
-**What's left for Phase 1:** M4 (UWB), M2b disturbance flags, M5 exit gate. M1→M2→M3 critical path is done.
+**What's left for Phase 1:** M2b disturbance flags, M5 exit gate. M1→M2→M3→M4 critical path is done.
 
 ---
 
@@ -373,7 +421,7 @@ The Phase-1 exit gate is the roadmap's: stable loaded-mass flight under realisti
 - **"IR sensor" meaning** — RESOLVED: Flow deck = VL53L1x ToF (M3a, §4.1) + PMW3901 optical flow (M3b, §4.2) as separate chips. Thermal LWIR deferred (§4.3).
 - **Airframe choice** — brushed 2.1 likely fails T/W once radar+GAP9 are added (pucks retired, v3 — one less item pushing toward Brushless); the Brushless is Tier B but the mass model will force this decision with data (§3.3).
 - **⚠ Placeholder masses** (radar, GAP9 shield, UWB PDoA module) — the physics is only as accurate as these; get a scale on the real parts once chosen (v3 defers all hardware purchase to Phase 11 — see roadmap). Until then, clearly label sim results as provisional. (Anchor pucks removed from this list — retired entirely, v3.)
-- **UWB architecture superseded** — v2's drone↔anchor puck design is retained *only* as a frozen baseline control arm (§5.1–5.4, M4a); it is not the thing M4 is building toward anymore. Don't let new work quietly assume anchors are still the primary inter-drone sensing mechanism — see §5.5/M4b.
+- **UWB architecture** — **RESOLVED (2026-07-30).** M4a cancelled (no pucks, no `uwb_range_node`). M4 built as inter-drone PDoA Python node (§5.1, M4 plan). Fixed reference points → **landed drones** as mesh peers or static `static_peers` in config. AoA default **180°** (decision 8). Antenna spacing corrected to **λ/2 (0.023 m)** — parent doc's "~4–5 cm" was phase-ambiguous. NLOS invalidates bearing by default. Airtime budget models mesh scaling honestly.
 - **ROS↔gz bridging** — RESOLVED for ToF + flow: `phase0_gate.sh` auto-launches `ros_gz_bridge` for `/cf_0/tof_down` and `/cf_0/odom` (flow node) when the workspace that provides it (`${ROS_GZ_WS:-$HOME/ros2_ws}`, sourced by `setup_env.sh`) is present; ToF verified ~27–28 Hz, flow ~100 Hz. If that workspace isn't set up on a given machine, the script warns and continues with gz-native topics only.
 - **Known repo nit (not this phase):** `RadarSensorSystem.cpp` has a hard-coded default `/home/ethan/...` mesh path (overridden by SDF `mesh_path`, so functional). Flagging per the path-portability rule; fix opportunistically.
 - **MuJoCo — new dependency flagged by v3, not yet installed.** v3 lists MuJoCo (for the Phase 6 perching gate) as a direct Phase 0 checklist item ("Install and validate MuJoCo, confirm it can simulate at minimum a basic gripping/perching mechanism"). Out of scope for *this* Phase 1 plan (perching is a later phase), but tracked here since it's an environment-setup item the same team will hit soon — not addressed by this revision.
@@ -388,7 +436,7 @@ Phase 1 ends at sensor plumbing + stable loaded-mass flight. The meeting clarifi
 |---|---|---|
 | Obstacle avoidance (mmWave + hard-coded rules) | Radar exists (`/radar/points`); avoidance logic **not built** | Phase 3 |
 | Auction floor exploration (ToF grid) | Down-ToF **built** (M3); Multi-ranger **disabled**; auction logic **not built** | Phase 7 |
-| Local / global / swarm positioning | ToF + flow **built** (M3); UWB PDoA **not started** (M4b); estimator **not built** | Phase 2 |
+| Local / global / swarm positioning | ToF + flow **built** (M3); UWB PDoA **built & gated** (M4); estimator **not built** | Phase 2 |
 | Path tracing `(v, Δψ)` breadcrumbs | **Not built** | Phase 2 log + Phase 7 RTH |
 | Human detection — IR ToF | **Misnomer in meeting** — ToF = altitude/floor only | M3 done; no change |
 | Human detection — thermal IR | Deferred (§4.3) | Phase 5/6 |

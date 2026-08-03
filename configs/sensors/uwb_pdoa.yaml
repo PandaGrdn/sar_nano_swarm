@@ -1,0 +1,91 @@
+# Inter-drone UWB ranging + PDoA bearing — Phase 1 M4.
+# See .cursor/docs/M4_UWB_Relative_Positioning_Implementation_Plan.md
+#
+# Simulated analytically by perception/uwb_sim/uwb_node.py. There is no native
+# Gazebo UWB sensor; analytic modelling is the correct and standard approach.
+#
+# ARCHITECTURE (v3): no anchor pucks are dropped inside the structure — we are
+# not manufacturing pucks. Physical reference points, if we add them, are either
+# (a) drones that LAND and act as static nodes, or (b) MiFly-style passive
+# retroreflective tags (plan doc §12, not built). The ONLY node whose pose is a
+# legitimate known constant is the fixed entrance/base-station gauge.
+#
+# ⚠ AGENTS.md §1 Tier A — SIM ORACLE WALL: the `static_peers` positions below are
+# how the SIMULATOR generates measurements. The estimator must NEVER read this
+# file. A `landed` peer's position is a STATE VARIABLE: it landed at a drifted
+# estimated pose. Only `type: entrance` is a surveyed constant.
+#
+# FIDELITY (AGENTS.md §5): range geometry + noise are high fidelity. Angle
+# fidelity is only as good as the placeholder off-boresight model below, which
+# stands until v3 roadmap Phase 1 item 1's external-validation gate replaces it.
+# Do not claim angle accuracy outside a validated envelope, and do not claim
+# anything about a specific unbuilt PDoA module until Phase 11 bench data exists.
+# UNMODELLED: TWR clock drift / carrier frequency offset; inter-radio chirp
+# interference (Phase 7); material-specific attenuation.
+
+# ── radio / array geometry ────────────────────────────────────────────────────
+channel_centre_hz: 6.5e9      # UWB ch5. lambda = c / this = ~0.0461 m
+antenna_spacing_m: 0.023      # ~lambda/2. > lambda/2 is PHASE AMBIGUOUS — plan §2.3.1.
+                              # The node WARNS at startup if this exceeds lambda/2.
+n_antennas: 3                 # 3 = L-array -> azimuth + elevation. 2 = azimuth only.
+boresight_axis: [1.0, 0.0, 0.0]   # body FLU. Forward-facing => REAR BLIND SPOT for
+                              # bearing (range still works). Plan §2.3.4 — this is a
+                              # real design consequence, not a modelling shortcut.
+aoa_fov_deg: 100.0            # full cone angle; outside it -> range-only fallback
+
+# ── range noise (Tier B) ──────────────────────────────────────────────────────
+sigma_range_los_m: 0.10       # DW-class TWR, ~+/-10 cm
+antenna_delay_bias_sigma_m: 0.05   # PER-DEVICE CONSTANT offset, sampled once at startup.
+                              # Pair bias = bias_i + bias_j. NOT included in the reported
+                              # sigma — the estimator is meant to have to deal with it
+                              # (plan §2.2.1). Set 0.0 to disable.
+max_range_m: 30.0
+p_dropout_at_max_range: 0.5   # link-budget dropout, scales as (r/max_range)^2
+
+# ── bearing noise (Tier B, ⚠ PLACEHOLDER until externally validated) ──────────
+angle_error_model: inv_cos    # inv_cos | linear | constant
+sigma_boresight_deg: 8.0      # conservative for a nano-scale array. ETH-PBL report ~2.4 deg
+                              # within +/-45 deg for a LARGER tuned module — do not adopt
+                              # that number for a Crazyflie-sized board without bench data.
+
+# ── NLOS / multipath ──────────────────────────────────────────────────────────
+nlos_bias_mean_m: 0.35        # always POSITIVE (abs of the draw) — a blocked path is longer
+nlos_bias_sigma_m: 0.25
+nlos_sigma_mult: 3.0          # sigma_range inflation under NLOS
+p_dropout_nlos: 0.35
+nlos_invalidates_bearing: true  # plan §2.5 — a multipath AoA points at the REFLECTOR
+
+# ── occlusion / LOS test (plan §5) ────────────────────────────────────────────
+los_model: boxes              # boxes | mesh | always_los
+occluder_boxes: []            # list of {name, x_min, x_max, y_min, y_max, z_min, z_max}
+                              # e.g. a wall for the NLOS selftest:
+                              # - {name: wall, x_min: 0.9, x_max: 1.1, y_min: -5.0,
+                              #    y_max: 5.0, z_min: 0.0, z_max: 3.0}
+mesh_path: ""                 # relative to SAR_NANO_SWARM_ROOT; used when los_model: mesh.
+                              # Same .obj the radar plugin raycasts, e.g.
+                              # sim_worlds/darpa_subt_worlds/worlds/models/cave_world/meshes/cave_world.obj
+
+# ── schedule / airtime (plan §1.3, §2.6) ──────────────────────────────────────
+ranging_rate_hz: 10.0         # per-pair rate with the channel to itself
+max_exchanges_per_s: 400      # TOTAL channel budget shared by the whole swarm.
+                              # At N=50 (1225 pairs) this is ~0.33 Hz/pair — that limit is
+                              # REAL and must stay visible. Do not raise it to make a gate pass.
+max_neighbors_per_drone: 6
+scheduler_tick_hz: 50.0
+
+# ── static peers ──────────────────────────────────────────────────────────────
+# type: entrance -> surveyed constant, the mesh gauge (FLAG_PEER_IS_SURVEYED)
+# type: landed   -> a drone that landed. Position here is SIM ORACLE ONLY.
+static_peers:
+  - {id: 1000, type: entrance, position_xyz_m: [-2.0, 0.0, 0.30], yaw_deg: 0.0}
+
+# ── misc ──────────────────────────────────────────────────────────────────────
+odom_stale_s: 0.5
+publish_aggregate: true
+publish_ground_truth: true    # /uwb/edges_truth — SIM ORACLE, AGENTS.md §1 Tier A.
+                              # The estimator must NEVER subscribe to it.
+model_phase_wrap: false       # plan §2.3.5 — hook built, off by default
+elevation_mirror_prob: 0.0    # plan §2.3.5 — hook built, off by default
+seed: 0
+
+mlflow_experiment: "phase1_uwb_pdoa"
