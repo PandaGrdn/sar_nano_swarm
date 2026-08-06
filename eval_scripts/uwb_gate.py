@@ -20,6 +20,7 @@ import argparse
 import math
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -56,6 +57,12 @@ NAN_FRAC_MIN = 1.00
 REL_POS_ERR_MEAN_MAX_M = 0.45
 EDGE_RATE_TOL = 0.20
 ENTRANCE_PEER_ID = 1000
+_RESTART_MSG = (
+    "[uwb_gate] Restart sim before retrying:\n"
+    "  pkill -9 -f 'gz sim'; pkill -9 -x cf2; pkill -9 -f uwb_node\n"
+    "  ./eval_scripts/phase0_gate.sh -w phase1_pid_tune -n 2 --spacing 2.0 --no-radar\n"
+    "  python3 -u eval_scripts/uwb_gate.py   # first cflib client — no connect tests before this"
+)
 
 
 class _Timeout(Exception):
@@ -64,6 +71,88 @@ class _Timeout(Exception):
 
 def _alarm(sig, frame):
     raise _Timeout()
+
+
+def _cflib_cache_dir() -> str:
+    cache = os.path.join(_REPO_ROOT, "cache")
+    os.makedirs(cache, exist_ok=True)
+    return cache
+
+
+def _count_cf2() -> int:
+    try:
+        out = subprocess.run(
+            ["pgrep", "-x", "cf2"], capture_output=True, text=True, check=False
+        )
+    except FileNotFoundError:
+        return -1
+    return len([ln for ln in out.stdout.splitlines() if ln.strip()])
+
+
+def _port_bound(port: int) -> bool:
+    try:
+        out = subprocess.run(
+            ["ss", "-ulnp"], capture_output=True, text=True, check=False
+        )
+    except FileNotFoundError:
+        return False
+    needle = f":{port}"
+    return needle in out.stdout
+
+
+def _wait_for_sitl(args) -> None:
+    ports = [19850 + args.cf_id_0, 19850 + args.cf_id_1]
+    deadline = time.time() + args.connect_wait
+    print(
+        f"[uwb_gate] waiting for SITL on UDP {ports[0]} and {ports[1]} "
+        f"(up to {args.connect_wait:.0f}s) …"
+    )
+    while time.time() < deadline:
+        if all(_port_bound(p) for p in ports):
+            n_cf2 = _count_cf2()
+            if n_cf2 >= 0 and n_cf2 < 2:
+                print(
+                    f"[uwb_gate] WARN: only {n_cf2}/2 cf2 process(es) — handshake may fail",
+                    file=sys.stderr,
+                )
+            print("[uwb_gate] SITL UDP ports up")
+            return
+        time.sleep(0.5)
+    raise SystemExit(
+        f"[uwb_gate] TIMEOUT: cflib ports not ready after {args.connect_wait:.0f}s.\n"
+        f"{_RESTART_MSG}"
+    )
+
+
+def _open_sync_crazyflie(uri: str, cache: str, label: str, timeout_s: float):
+    from cflib.crazyflie import Crazyflie
+    from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+
+    print(f"[uwb_gate] connecting {label} at {uri} (timeout {timeout_s:.0f}s) …")
+    holder: dict = {"scf": None, "err": None}
+
+    def _worker():
+        try:
+            scf = SyncCrazyflie(uri, cf=Crazyflie(rw_cache=cache))
+            scf.__enter__()
+            holder["scf"] = scf
+        except Exception as exc:
+            holder["err"] = exc
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    if thread.is_alive():
+        raise SystemExit(
+            f"[uwb_gate] TIMEOUT ({timeout_s:.0f}s) connecting {label} at {uri}.\n"
+            f"{_RESTART_MSG}"
+        )
+    if holder["err"] is not None:
+        raise SystemExit(
+            f"[uwb_gate] FAIL connecting {label} at {uri}: {holder['err']}\n"
+            f"{_RESTART_MSG}"
+        )
+    return holder["scf"]
 
 
 @dataclass
@@ -179,78 +268,87 @@ class UwbRecorder:
 def run_dual_flight(args, windows: dict) -> bool:
     from pid_gains import load_gains, apply_gains, reset_estimator, reset_pose
     import cflib.crtp
-    from cflib.crazyflie import Crazyflie
-    from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
     from cflib.positioning.motion_commander import MotionCommander
 
+    _wait_for_sitl(args)
+
     gains = load_gains(args.gains)
+    cache = _cflib_cache_dir()
     cflib.crtp.init_drivers()
     signal.signal(signal.SIGALRM, _alarm)
     diverged = False
 
     uri0 = f"udp://127.0.0.1:{19850 + args.cf_id_0}"
     uri1 = f"udp://127.0.0.1:{19850 + args.cf_id_1}"
-    print(f"[uwb_gate] opening BOTH SyncCrazyflie contexts first …")
 
+    scf0 = scf1 = None
     try:
-        with SyncCrazyflie(uri0, cf=Crazyflie(rw_cache="./cache")) as scf0:
-            with SyncCrazyflie(uri1, cf=Crazyflie(rw_cache="./cache")) as scf1:
-                for idx, scf in ((0, scf0), (1, scf1)):
-                    cf = scf.cf
-                    apply_gains(cf, gains)
-                    try:
-                        reset_pose(
-                            args.world,
-                            f"{args.model_prefix}_{idx}",
-                            xyz=(float(idx * args.spacing), 0.0, args.hover_height),
-                        )
-                    except Exception as e:
-                        print(f"[uwb_gate] reset_pose drone {idx} skipped: {e}", file=sys.stderr)
-                    reset_estimator(cf, "kalman")
-                time.sleep(2.0)
-                for scf in (scf0, scf1):
-                    try:
-                        scf.cf.platform.send_arming_request(True)
-                    except Exception:
-                        pass
-                time.sleep(0.5)
+        scf0 = _open_sync_crazyflie(uri0, cache, "drone 0", args.connect_timeout)
+        scf1 = _open_sync_crazyflie(uri1, cache, "drone 1", args.connect_timeout)
+        print("[uwb_gate] both drones connected — starting flight legs …")
 
-                signal.setitimer(signal.ITIMER_REAL, 300.0)
-                mc0 = MotionCommander(scf0, default_height=args.hover_height)
-                mc1 = MotionCommander(scf1, default_height=args.hover_height)
-                with mc0, mc1:
-                    print("[uwb_gate] leg 0: takeoff/settle 3 s …")
-                    time.sleep(3.0)
+        for idx, scf in ((0, scf0), (1, scf1)):
+            cf = scf.cf
+            apply_gains(cf, gains)
+            try:
+                reset_pose(
+                    args.world,
+                    f"{args.model_prefix}_{idx}",
+                    xyz=(float(idx * args.spacing), 0.0, args.hover_height),
+                )
+            except Exception as e:
+                print(f"[uwb_gate] reset_pose drone {idx} skipped: {e}", file=sys.stderr)
+            reset_estimator(cf, "kalman")
+        time.sleep(2.0)
+        for scf in (scf0, scf1):
+            try:
+                scf.cf.platform.send_arming_request(True)
+            except Exception:
+                pass
+        time.sleep(0.5)
 
-                    print("[uwb_gate] leg 1: hold 6 s (window A) …")
-                    windows["A"] = (time.time(), None)
-                    time.sleep(6.0)
-                    windows["A"] = (windows["A"][0], time.time())
+        signal.setitimer(signal.ITIMER_REAL, 300.0)
+        mc0 = MotionCommander(scf0, default_height=args.hover_height)
+        mc1 = MotionCommander(scf1, default_height=args.hover_height)
+        with mc0, mc1:
+            print("[uwb_gate] leg 0: takeoff/settle 3 s …")
+            time.sleep(3.0)
 
-                    print("[uwb_gate] leg 2: drone0 turn_left 150°, settle 2 s, hold (window B) …")
-                    mc0.turn_left(150)
-                    time.sleep(2.0)
-                    windows["B"] = (time.time(), None)
-                    time.sleep(5.0)
-                    windows["B"] = (windows["B"][0], time.time())
-                    print(f"[uwb_gate] window B captured {windows['B']}")
+            print("[uwb_gate] leg 1: hold 6 s (window A) …")
+            windows["A"] = (time.time(), None)
+            time.sleep(6.0)
+            windows["A"] = (windows["A"][0], time.time())
 
-                    print("[uwb_gate] leg 3: drone0 turn_right 150°, drone1 up 0.6 m (window C) …")
-                    mc0.turn_right(150)
-                    time.sleep(2.0)
-                    mc1.up(0.6)
-                    windows["C"] = (time.time(), None)
-                    time.sleep(5.0)
-                    windows["C"] = (windows["C"][0], time.time())
+            print("[uwb_gate] leg 2: drone0 turn_left 150°, settle 2 s, hold (window B) …")
+            mc0.turn_left(150)
+            time.sleep(2.0)
+            windows["B"] = (time.time(), None)
+            time.sleep(5.0)
+            windows["B"] = (windows["B"][0], time.time())
+            print(f"[uwb_gate] window B captured {windows['B']}")
 
-                    print("[uwb_gate] leg 4: stop …")
-                    mc0.stop()
-                    mc1.stop()
+            print("[uwb_gate] leg 3: drone0 turn_right 150°, drone1 up 0.6 m (window C) …")
+            mc0.turn_right(150)
+            time.sleep(2.0)
+            mc1.up(0.6)
+            windows["C"] = (time.time(), None)
+            time.sleep(5.0)
+            windows["C"] = (windows["C"][0], time.time())
+
+            print("[uwb_gate] leg 4: stop …")
+            mc0.stop()
+            mc1.stop()
     except _Timeout:
         diverged = True
-        print("[uwb_gate] TIMEOUT", file=sys.stderr)
+        print("[uwb_gate] TIMEOUT during flight", file=sys.stderr)
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
+        for scf in (scf1, scf0):
+            if scf is not None:
+                try:
+                    scf.__exit__(None, None, None)
+                except Exception:
+                    pass
 
     return diverged
 
@@ -326,6 +424,18 @@ def main():
     parser.add_argument("--cf-id-1", type=int, default=1)
     parser.add_argument("--spacing", type=float, default=2.0)
     parser.add_argument("--hover-height", type=float, default=0.5)
+    parser.add_argument(
+        "--connect-wait",
+        type=float,
+        default=90.0,
+        help="Seconds to wait for cflib UDP ports before connecting (default: 90)",
+    )
+    parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=25.0,
+        help="Per-drone SyncCrazyflie connect timeout in seconds (default: 25)",
+    )
     parser.add_argument("--no-mlflow", action="store_true")
     args = parser.parse_args()
 
@@ -342,7 +452,6 @@ def main():
     sigma_b_deg = float(cfg["sigma_boresight_deg"])
 
     recorder = UwbRecorder()
-    time.sleep(2.0)
 
     windows: Dict[str, Tuple[float, Optional[float]]] = {}
     diverged = run_dual_flight(args, windows)

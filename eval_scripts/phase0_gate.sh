@@ -386,6 +386,24 @@ PYEOF
   popd > /dev/null
 done
 
+# ── wait for cflib UDP ports + firmware settle (uwb_gate / cflib connect) ─────
+info "Waiting for cflib UDP ports (${CFLIB_PORTS[*]}) …"
+for _port in "${CFLIB_PORTS[@]}"; do
+  _port_ok=false
+  for _i in $(seq 1 45); do
+    if ss -ulnp 2>/dev/null | grep -q ":${_port} "; then
+      _port_ok=true
+      break
+    fi
+    sleep 1
+  done
+  [[ "$_port_ok" == true ]] || warn "cflib port ${_port} not bound after 45s — gate scripts may fail."
+done
+_cf2_n="$(pgrep -x cf2 2>/dev/null | wc -l | tr -d ' ')"
+[[ "${_cf2_n:-0}" -ge "$NUM_DRONES" ]] || warn "Only ${_cf2_n:-0}/${NUM_DRONES} cf2 process(es) — check sitl_make/build/*/error.log"
+info "SITL settle (3 s for CfFirm handshake) …"
+sleep 3
+
 # ── bridge gz topics to ROS 2 ────────────────────────────────────────────────
 if [[ "$USE_TOF" == true || "$USE_FLOW" == true || "$USE_UWB" == true ]] && command -v ros2 &>/dev/null && ros2 pkg prefix ros_gz_bridge &>/dev/null; then
   _bridge_args=()
