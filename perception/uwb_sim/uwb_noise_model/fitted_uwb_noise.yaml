@@ -1,0 +1,37 @@
+# -- noise calibration (auto-generated -- re-run fit_uwb_noise.py) --
+noise_calibration:
+  source: "ETH-PBL UWB_DualAntenna_AoA (Margiani et al. 2023), fitted 2026-08-06"
+  conditions: "STATIC / LOS / tripod-mounted lab rotation sweep; not flight/NLOS"
+  dataset_channel_hz: 6489600000.0
+  dataset_antenna_spacing_m: 0.0231
+  dataset_pdoa_sign: -1.0
+  range_method: per_run_demeaned_dist_mm
+  range_bias_m: 0.0053
+  range_sigma_m: 0.0873
+  range_by_distance_m:
+    0.5: {bias_m: 0.0088, sigma_m: 0.0943, n: 1892}
+    1.0: {bias_m: 0.0197, sigma_m: 0.1200, n: 1768}
+    1.5: {bias_m: 0.0114, sigma_m: 0.1090, n: 1791}
+    2.0: {bias_m: 0.0249, sigma_m: 0.1527, n: 1756}
+    2.5: {bias_m: -0.0005, sigma_m: 0.0796, n: 1780}
+    3.0: {bias_m: -0.0003, sigma_m: 0.0701, n: 1771}
+    3.5: {bias_m: -0.0037, sigma_m: 0.0869, n: 1697}
+    4.0: {bias_m: 0.0010, sigma_m: 0.0982, n: 1777}
+    4.5: {bias_m: 0.0012, sigma_m: 0.0772, n: 1793}
+    5.0: {bias_m: -0.0009, sigma_m: 0.0794, n: 1694}
+    5.5: {bias_m: -0.0036, sigma_m: 0.0873, n: 1789}
+  angle_bias_deg: 3.706
+  angle_sigma_deg:
+    model: piecewise_linear
+    params:
+      a_deg: 4.795      # sigma at boresight
+      b_deg_per_deg: 0.1649  # sigma grows with |off-boresight angle|
+  aoa_fov_deg: 90.0
+
+# Top-level sim knobs (consumed by uwb_model.py):
+sigma_range_los_m: 0.0873
+range_bias_m: 0.0053
+angle_error_model: piecewise_linear
+sigma_boresight_deg: 4.795
+angle_sigma_slope_deg_per_deg: 0.1649
+aoa_fov_deg: 90.0

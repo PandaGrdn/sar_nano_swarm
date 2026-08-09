@@ -15,11 +15,8 @@
 # file. A `landed` peer's position is a STATE VARIABLE: it landed at a drifted
 # estimated pose. Only `type: entrance` is a surveyed constant.
 #
-# FIDELITY (AGENTS.md §5): range geometry + noise are high fidelity. Angle
-# fidelity is only as good as the placeholder off-boresight model below, which
-# stands until v3 roadmap Phase 1 item 1's external-validation gate replaces it.
-# Do not claim angle accuracy outside a validated envelope, and do not claim
-# anything about a specific unbuilt PDoA module until Phase 11 bench data exists.
+# FIDELITY (AGENTS.md §5): range/angle noise from ETH-PBL rotation dataset (fit_uwb_noise.py).
+# Angle fidelity follows fitted piecewise_linear model until Phase 11 bench data exists.
 # UNMODELLED: TWR clock drift / carrier frequency offset; inter-radio chirp
 # interference (Phase 7); material-specific attenuation.
 
@@ -31,10 +28,11 @@ n_antennas: 3                 # 3 = L-array -> azimuth + elevation. 2 = azimuth 
 boresight_axis: [1.0, 0.0, 0.0]   # body FLU. Forward-facing => REAR BLIND SPOT for
                               # bearing (range still works). Plan §2.3.4 — this is a
                               # real design consequence, not a modelling shortcut.
-aoa_fov_deg: 100.0            # full cone angle; outside it -> range-only fallback
+aoa_fov_deg: 90.0
 
 # ── range noise (Tier B) ──────────────────────────────────────────────────────
-sigma_range_los_m: 0.10       # DW-class TWR, ~+/-10 cm
+sigma_range_los_m: 0.0873
+range_bias_m: 0.0053
 antenna_delay_bias_sigma_m: 0.05   # PER-DEVICE CONSTANT offset, sampled once at startup.
                               # Pair bias = bias_i + bias_j. NOT included in the reported
                               # sigma — the estimator is meant to have to deal with it
@@ -42,11 +40,10 @@ antenna_delay_bias_sigma_m: 0.05   # PER-DEVICE CONSTANT offset, sampled once at
 max_range_m: 30.0
 p_dropout_at_max_range: 0.5   # link-budget dropout, scales as (r/max_range)^2
 
-# ── bearing noise (Tier B, ⚠ PLACEHOLDER until externally validated) ──────────
-angle_error_model: inv_cos    # inv_cos | linear | constant
-sigma_boresight_deg: 8.0      # conservative for a nano-scale array. ETH-PBL report ~2.4 deg
-                              # within +/-45 deg for a LARGER tuned module — do not adopt
-                              # that number for a Crazyflie-sized board without bench data.
+# ── bearing noise (Tier B — ETH-PBL fitted, STATIC/LOS lab data) ───────────────
+angle_error_model: piecewise_linear
+sigma_boresight_deg: 4.795    # fitted boresight sigma (paper reports ~2.4 deg in +/-45 deg)
+angle_sigma_slope_deg_per_deg: 0.1649
 
 # ── NLOS / multipath ──────────────────────────────────────────────────────────
 nlos_bias_mean_m: 0.35        # always POSITIVE (abs of the draw) — a blocked path is longer
@@ -89,3 +86,9 @@ elevation_mirror_prob: 0.0    # plan §2.3.5 — hook built, off by default
 seed: 0
 
 mlflow_experiment: "phase1_uwb_pdoa"
+
+# -- noise calibration (fit_uwb_noise.py 2026-08-06) --
+noise_calibration:
+  source: "ETH-PBL UWB_DualAntenna_AoA (Margiani et al. 2023), fitted 2026-08-06"
+  conditions: "STATIC / LOS / tripod -- not flight/NLOS"
+  dataset_antenna_spacing_m: 0.0231

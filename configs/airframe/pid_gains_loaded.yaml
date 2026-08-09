@@ -46,7 +46,8 @@ posCtlPid:
   yKi: 0.0
   yKd: 0.0
   yKff: 0.0
-  zKp: 3.5985284373248057
+  #zKp: 3.5985284373248057
+  zKp: 2.75
   zKi: 0.5
   zKd: 0.0
   zKff: 0.0

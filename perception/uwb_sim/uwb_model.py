@@ -91,6 +91,11 @@ def sigma_ang(theta_rad: float, cfg: dict) -> float:
     cos_floor = math.cos(math.radians(aoa_fov) / 2.0)
     if model == "constant":
         return sigma_b
+    if model == "piecewise_linear":
+        a_deg = float(cfg.get("sigma_boresight_deg", 0.0))
+        b = float(cfg.get("angle_sigma_slope_deg_per_deg", 0.0))
+        theta_deg = math.degrees(abs(theta_rad))
+        return math.radians(max(a_deg + b * theta_deg, EPS))
     if model == "linear":
         return sigma_b * (1.0 + theta_rad / max(math.radians(aoa_fov) / 2.0, EPS))
     # inv_cos (default)
@@ -445,7 +450,8 @@ class UwbModel:
             dev_b.device_id, 0.0
         )
         range_noise = float(self.rng.normal(0.0, sigma_r))
-        r_meas = r_true + bias_ij + nlos_bias + range_noise
+        range_bias = float(self.cfg.get("range_bias_m", 0.0))
+        r_meas = r_true + bias_ij + range_bias + nlos_bias + range_noise
 
         geom_a = compute_peer_geometry(
             pa, dev_a.R_bw, pb, self.boresight_unit(), float(self.cfg["aoa_fov_deg"])
