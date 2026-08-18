@@ -8,5 +8,9 @@ numpy
 tomli
 PyYAML
 
+# Optional: mesh raycast for UWB NLOS (plan §5.2)
+# trimesh
+# embreex
+
 # Optional: MuJoCo backend for CrazySim
 # mujoco

@@ -18,6 +18,8 @@
 #   -m, --model  MODEL   crazyflie | crazyflie_thrust_upgrade  (default: crazyflie)
 #   -x X                 Spawn X position in metres (default: 0)
 #   -y Y                 Spawn Y position in metres (default: 0)
+#   -n, --num-drones N    Number of Crazyflie drones to spawn (default: 1)
+#       --spacing M      Metres between drone spawn points on X axis (default: 1.5)
 #       --mesh PATH      Mesh file for radar raycasting.
 #                        Relative paths are resolved against $SAR_NANO_SWARM_ROOT.
 #                        Defaults are auto-detected for built-in worlds; for custom
@@ -32,6 +34,9 @@
 #       --no-flow        Skip PMW3901 optical-flow node (perception/flow_sim/flow_node.py).
 #       --flow-config PATH
 #                         Path to optical_flow.yaml [default: configs/sensors/optical_flow.yaml]
+#       --no-uwb         Skip inter-drone UWB PDoA node (perception/uwb_sim/uwb_node.py).
+#       --uwb-config PATH
+#                         Path to uwb_pdoa.yaml [default: configs/sensors/uwb_pdoa.yaml]
 #       --no-rviz        Skip RViz launch.
 #       --headless       Skip Gazebo GUI (server + SITL only, useful for CI).
 #       --check          Gate-check mode: start headless, wait 15 s, verify
@@ -46,7 +51,7 @@
 #                      Default: <repo>/install/radarays_gz2/lib
 #
 # cfclient connection URI printed at startup:
-#   udp://127.0.0.1:19850   (drone ID 0)
+#   udp://127.0.0.1:19850+N   (drone ID N)
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -65,6 +70,8 @@ Usage: ./eval_scripts/phase0_gate.sh [OPTIONS]
   -m, --model  MODEL   crazyflie | crazyflie_thrust_upgrade  [default: crazyflie]
   -x X                 Spawn X  [default: 0]
   -y Y                 Spawn Y  [default: 0]
+  -n, --num-drones N    Number of drones  [default: 1]
+      --spacing M      Spawn spacing on X axis (m)  [default: 1.5]
       --mesh PATH      Mesh for radar raycasting (rel to SAR_NANO_SWARM_ROOT)
       --no-radar       Skip radar plugin
       --no-payload     Skip mass/inertia payload rewrite
@@ -73,6 +80,8 @@ Usage: ./eval_scripts/phase0_gate.sh [OPTIONS]
       --tof-config PATH  tof.yaml to use [default: configs/sensors/tof.yaml]
       --no-flow        Skip PMW3901 optical-flow node
       --flow-config PATH  optical_flow.yaml [default: configs/sensors/optical_flow.yaml]
+      --no-uwb         Skip UWB PDoA node
+      --uwb-config PATH  uwb_pdoa.yaml [default: configs/sensors/uwb_pdoa.yaml]
       --no-rviz        Skip RViz
       --headless       Skip Gazebo GUI
       --check          Headless gate-check (prints PASS/FAIL)
@@ -85,6 +94,8 @@ WORLD="phase0_tunnel_gate"
 MODEL="crazyflie"
 SPAWN_X=0
 SPAWN_Y=0
+NUM_DRONES=1
+SPACING=1.5
 MESH_ARG=""
 USE_RADAR=true
 USE_PAYLOAD=true
@@ -93,6 +104,8 @@ USE_TOF=true
 TOF_CONFIG=""
 USE_FLOW=true
 FLOW_CONFIG=""
+USE_UWB=true
+UWB_CONFIG=""
 USE_RVIZ=true
 USE_GUI=true
 GATE_CHECK=false
@@ -103,6 +116,8 @@ while [[ $# -gt 0 ]]; do
     -m|--model)   MODEL="$2";       shift 2 ;;
     -x)           SPAWN_X="$2";     shift 2 ;;
     -y)           SPAWN_Y="$2";     shift 2 ;;
+    -n|--num-drones) NUM_DRONES="$2"; shift 2 ;;
+    --spacing)    SPACING="$2";    shift 2 ;;
     --mesh)       MESH_ARG="$2";    shift 2 ;;
     --no-radar)   USE_RADAR=false;  shift   ;;
     --no-payload) USE_PAYLOAD=false; shift  ;;
@@ -111,6 +126,8 @@ while [[ $# -gt 0 ]]; do
     --tof-config) TOF_CONFIG="$2"; shift 2 ;;
     --no-flow)    USE_FLOW=false;  shift   ;;
     --flow-config) FLOW_CONFIG="$2"; shift 2 ;;
+    --no-uwb)     USE_UWB=false;   shift   ;;
+    --uwb-config) UWB_CONFIG="$2"; shift 2 ;;
     --no-rviz)    USE_RVIZ=false;   shift   ;;
     --headless)   USE_GUI=false;    shift   ;;
     --check)      GATE_CHECK=true; USE_RVIZ=false; USE_GUI=false; shift ;;
@@ -234,8 +251,10 @@ cleanup() {
 trap cleanup SIGINT SIGTERM EXIT
 
 # ── kill stale instances ──────────────────────────────────────────────────────
-info "Stopping any running cf2 instances …"
+info "Stopping any running cf2 / UWB nodes …"
 pkill -x cf2 2>/dev/null || true
+pkill -f "uwb_node.py" 2>/dev/null || true
+pkill -f "uwb_sim" 2>/dev/null || true
 sleep 1
 
 # ── start Gazebo server ───────────────────────────────────────────────────────
@@ -256,28 +275,30 @@ for _i in $(seq 1 30); do
 done
 [[ "$_gz_ready" == true ]] || warn "Gazebo did not respond after 30 s — continuing anyway."
 
-# ── generate Crazyflie SDF ────────────────────────────────────────────────────
-CF_ID=0
-CFLIB_PORT=$((19850 + CF_ID))
-CFFIRM_PORT=$((19950 + CF_ID))
-SDF_TMP="/tmp/${MODEL}_${CF_ID}.sdf"
+# ── per-drone: generate SDF, inject sensors, spawn, wait, start SITL ─────────
+CFLIB_PORTS=()
+for CF_ID in $(seq 0 $((NUM_DRONES - 1))); do
+  CFLIB_PORT=$((19850 + CF_ID))
+  CFFIRM_PORT=$((19950 + CF_ID))
+  CFLIB_PORTS+=("$CFLIB_PORT")
+  SDF_TMP="/tmp/${MODEL}_${CF_ID}.sdf"
+  SPAWN_XI=$(python3 -c "print(${SPAWN_X} + ${CF_ID} * ${SPACING})")
 
-rm -f "$SDF_TMP"
-mkdir -p "$BUILD_DIR/$CF_ID"
-info "Generating Crazyflie SDF …"
-python3 "$JINJA_GEN" \
-  "$MODELS_DIR/${MODEL}/model.sdf.jinja" \
-  "$MODELS_DIR" \
-  --cffirm_udp_port "$CFFIRM_PORT" \
-  --cflib_udp_port  "$CFLIB_PORT" \
-  --cf_id           "$CF_ID" \
-  --cf_name         "cf" \
-  --output-file     "$SDF_TMP"
+  rm -f "$SDF_TMP"
+  mkdir -p "$BUILD_DIR/$CF_ID"
+  info "Generating Crazyflie SDF for drone ${CF_ID} …"
+  python3 "$JINJA_GEN" \
+    "$MODELS_DIR/${MODEL}/model.sdf.jinja" \
+    "$MODELS_DIR" \
+    --cffirm_udp_port "$CFFIRM_PORT" \
+    --cflib_udp_port  "$CFLIB_PORT" \
+    --cf_id           "$CF_ID" \
+    --cf_name         "cf" \
+    --output-file     "$SDF_TMP"
 
-# ── inject radar plugin ───────────────────────────────────────────────────────
-if [[ "$USE_RADAR" == true ]]; then
-  info "Injecting radarays_gz2 plugin (mesh: $MESH_PATH) …"
-  python3 - "$SDF_TMP" "$MESH_PATH" <<'PYEOF'
+  if [[ "$USE_RADAR" == true ]]; then
+    info "Injecting radarays_gz2 plugin on drone ${CF_ID} (mesh: $MESH_PATH) …"
+    python3 - "$SDF_TMP" "$MESH_PATH" <<'PYEOF'
 import sys, xml.etree.ElementTree as ET
 
 ET.register_namespace('', 'http://sdformat.org/schemas/root.xsd')
@@ -297,113 +318,112 @@ mesh_elem.text = sys.argv[2]
 tree.write(sys.argv[1], encoding='unicode')
 print(f"[radar-inject] Plugin injected into {sys.argv[1]}")
 PYEOF
-fi
-
-# ── rewrite mass/CoM/inertia for the loaded payload (Phase 1 step 1) ─────────
-# Recomputes base_link's <inertial> from configs/airframe/payload.yaml (base
-# airframe + every enabled sensor/compute deck) so downstream flight dynamics,
-# PID tuning, and the thrust-margin check reflect the real loaded drone, not
-# the stock 27 g default. See
-# .cursor/docs/Phase1_Physical_Fidelity_and_Sensor_Implementation_Plan.md
-if [[ "$USE_PAYLOAD" == true ]]; then
-  _payload_cfg="${PAYLOAD_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/airframe/payload.yaml}"
-  [[ "$_payload_cfg" != /* ]] && _payload_cfg="$SAR_NANO_SWARM_ROOT/$_payload_cfg"
-  if [[ ! -f "$_payload_cfg" ]]; then
-    warn "Payload config not found: $_payload_cfg — skipping mass/inertia rewrite."
-  else
-    info "Applying payload mass/inertia model ($_payload_cfg) …"
-    python3 "$SAR_NANO_SWARM_ROOT/eval_scripts/apply_payload.py" "$SDF_TMP" --payload "$_payload_cfg"
-
-    info "Checking thrust margin …"
-    python3 "$SAR_NANO_SWARM_ROOT/eval_scripts/thrust_margin_check.py" "$SDF_TMP" \
-      --config "$SAR_NANO_SWARM_ROOT/configs/airframe/thrust_margin.yaml" \
-      || warn "Thrust-margin check failed — drone may be under-thrusted for this payload."
   fi
-fi
 
-# ── inject IR ToF rangefinder sensor(s) (Phase 1 M3, §4.1) ───────────────────
-# Pure-geometry gpu_lidar beam(s) into base_link. Mass already accounted for
-# in payload.yaml (flow_deck_v2 component) — this only adds the sensor element.
-if [[ "$USE_TOF" == true ]]; then
-  _tof_cfg="${TOF_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/sensors/tof.yaml}"
-  [[ "$_tof_cfg" != /* ]] && _tof_cfg="$SAR_NANO_SWARM_ROOT/$_tof_cfg"
-  if [[ ! -f "$_tof_cfg" ]]; then
-    warn "ToF config not found: $_tof_cfg — skipping sensor injection."
-  else
-    info "Injecting IR ToF sensor(s) ($_tof_cfg) …"
-    python3 "$SAR_NANO_SWARM_ROOT/eval_scripts/apply_tof_sensor.py" "$SDF_TMP" \
-      --config "$_tof_cfg" --cf-id "$CF_ID"
+  if [[ "$USE_PAYLOAD" == true ]]; then
+    _payload_cfg="${PAYLOAD_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/airframe/payload.yaml}"
+    [[ "$_payload_cfg" != /* ]] && _payload_cfg="$SAR_NANO_SWARM_ROOT/$_payload_cfg"
+    if [[ ! -f "$_payload_cfg" ]]; then
+      warn "Payload config not found: $_payload_cfg — skipping mass/inertia rewrite."
+    else
+      info "Applying payload mass/inertia model on drone ${CF_ID} ($_payload_cfg) …"
+      python3 "$SAR_NANO_SWARM_ROOT/eval_scripts/apply_payload.py" "$SDF_TMP" --payload "$_payload_cfg"
+
+      if [[ "$CF_ID" -eq 0 ]]; then
+        info "Checking thrust margin …"
+        python3 "$SAR_NANO_SWARM_ROOT/eval_scripts/thrust_margin_check.py" "$SDF_TMP" \
+          --config "$SAR_NANO_SWARM_ROOT/configs/airframe/thrust_margin.yaml" \
+          || warn "Thrust-margin check failed — drone may be under-thrusted for this payload."
+      fi
+    fi
   fi
-fi
 
-# ── spawn Crazyflie in Gazebo ─────────────────────────────────────────────────
-info "Spawning ${MODEL}_${CF_ID} at (${SPAWN_X}, ${SPAWN_Y}) …"
-gz service \
-  -s "/world/${WORLD_NAME}/create" \
-  --reqtype  gz.msgs.EntityFactory \
-  --reptype  gz.msgs.Boolean \
-  --timeout  5000 \
-  --req "sdf_filename: \"${SDF_TMP}\",
-         pose: {position: {x: ${SPAWN_X}, y: ${SPAWN_Y}, z: 0.5}},
-         name: \"${MODEL}_${CF_ID}\",
-         allow_renaming: 1"
-
-# ── wait for drone sensors to come online before starting firmware ───────────
-# In heavy worlds (e.g. cave), the drone's gz sensor plugins take time to init.
-# Starting cf2 too early drops the first IMU packets and the estimator never
-# recovers (canfly stays 0, drone won't arm). Wait until /cf_0/odom publishes.
-info "Waiting for drone sensors (/cf_${CF_ID}/odom) to come online …"
-_drone_ready=false
-for _i in $(seq 1 30); do
-  if timeout 2 gz topic -e -t "/cf_${CF_ID}/odom" -n 1 >/dev/null 2>&1; then
-    _drone_ready=true
-    break
-  fi
-  sleep 1
-done
-if [[ "$_drone_ready" == true ]]; then
-  info "Drone sensors publishing. Giving them 2s to stabilise …"
-  sleep 2
-else
-  warn "Drone odom not detected after 30s — starting firmware anyway."
-fi
-
-# ── CRITICAL: cf2 needs CF2_SIM_MODEL to bind its SITL sensor interface to the
-# gz drone. Without it, IMU never reaches the firmware and the estimator locks.
-export CF2_SIM_MODEL="gz_${MODEL}"
-
-# ── start SITL firmware ───────────────────────────────────────────────────────
-info "Starting SITL firmware (instance ${CF_ID}) …"
-pushd "$BUILD_DIR/$CF_ID" > /dev/null
-"$CF2_BIN" "$CFFIRM_PORT" > out.log 2> error.log &
-_PIDS+=($!)
-popd > /dev/null
-
-# ── optional: bridge ToF gz topic(s) to ROS 2 for Phase-2 EKF consumption ────
-# ros_gz_bridge lives in the separate source-built workspace sourced by
-# setup_env.sh (${ROS_GZ_WS:-$HOME/ros2_ws}/install) — NOT the apt package, so
-# `apt-cache policy ros-humble-ros-gz-bridge` alone will look like it's
-# missing even when it's actually available here. Verified live (2026-07-21):
-# bridges /cf_${CF_ID}/tof_down (gz.msgs.LaserScan) -> ROS
-# sensor_msgs/msg/LaserScan, confirmed publishing at ~27-28 Hz via
-# `ros2 topic hz`.
-if [[ "$USE_TOF" == true || "$USE_FLOW" == true ]] && command -v ros2 &>/dev/null && ros2 pkg prefix ros_gz_bridge &>/dev/null; then
-  _bridge_topics=()
   if [[ "$USE_TOF" == true ]]; then
-    _bridge_topics+=("/cf_${CF_ID}/tof_down@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan")
+    _tof_cfg="${TOF_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/sensors/tof.yaml}"
+    [[ "$_tof_cfg" != /* ]] && _tof_cfg="$SAR_NANO_SWARM_ROOT/$_tof_cfg"
+    if [[ ! -f "$_tof_cfg" ]]; then
+      warn "ToF config not found: $_tof_cfg — skipping sensor injection."
+    else
+      info "Injecting IR ToF sensor(s) on drone ${CF_ID} ($_tof_cfg) …"
+      python3 "$SAR_NANO_SWARM_ROOT/eval_scripts/apply_tof_sensor.py" "$SDF_TMP" \
+        --config "$_tof_cfg" --cf-id "$CF_ID"
+    fi
   fi
-  if [[ "$USE_FLOW" == true ]]; then
-    _bridge_topics+=("/cf_${CF_ID}/odom@nav_msgs/msg/Odometry[gz.msgs.Odometry")
+
+  info "Spawning ${MODEL}_${CF_ID} at (${SPAWN_XI}, ${SPAWN_Y}) …"
+  gz service \
+    -s "/world/${WORLD_NAME}/create" \
+    --reqtype  gz.msgs.EntityFactory \
+    --reptype  gz.msgs.Boolean \
+    --timeout  5000 \
+    --req "sdf_filename: \"${SDF_TMP}\",
+           pose: {position: {x: ${SPAWN_XI}, y: ${SPAWN_Y}, z: 0.5}},
+           name: \"${MODEL}_${CF_ID}\",
+           allow_renaming: 1"
+
+  info "Waiting for drone ${CF_ID} sensors (/cf_${CF_ID}/odom) to come online …"
+  _drone_ready=false
+  for _i in $(seq 1 30); do
+    if timeout 2 gz topic -e -t "/cf_${CF_ID}/odom" -n 1 >/dev/null 2>&1; then
+      _drone_ready=true
+      break
+    fi
+    sleep 1
+  done
+  if [[ "$_drone_ready" == true ]]; then
+    info "Drone ${CF_ID} sensors publishing. Giving them 2s to stabilise …"
+    sleep 2
+  else
+    warn "Drone ${CF_ID} odom not detected after 30s — starting firmware anyway."
   fi
-  info "Bridging gz topics to ROS 2: ${_bridge_topics[*]} …"
-  ros2 run ros_gz_bridge parameter_bridge "${_bridge_topics[@]}" &
+
+  export CF2_SIM_MODEL="gz_${MODEL}"
+
+  info "Starting SITL firmware (instance ${CF_ID}) …"
+  pushd "$BUILD_DIR/$CF_ID" > /dev/null
+  "$CF2_BIN" "$CFFIRM_PORT" > out.log 2> error.log &
   _PIDS+=($!)
-elif [[ "$USE_TOF" == true || "$USE_FLOW" == true ]]; then
+  popd > /dev/null
+done
+
+# ── wait for cflib UDP ports + firmware settle (uwb_gate / cflib connect) ─────
+info "Waiting for cflib UDP ports (${CFLIB_PORTS[*]}) …"
+for _port in "${CFLIB_PORTS[@]}"; do
+  _port_ok=false
+  for _i in $(seq 1 45); do
+    if ss -ulnp 2>/dev/null | grep -q ":${_port} "; then
+      _port_ok=true
+      break
+    fi
+    sleep 1
+  done
+  [[ "$_port_ok" == true ]] || warn "cflib port ${_port} not bound after 45s — gate scripts may fail."
+done
+_cf2_n="$(pgrep -x cf2 2>/dev/null | wc -l | tr -d ' ')"
+[[ "${_cf2_n:-0}" -ge "$NUM_DRONES" ]] || warn "Only ${_cf2_n:-0}/${NUM_DRONES} cf2 process(es) — check sitl_make/build/*/error.log"
+info "SITL settle (3 s for CfFirm handshake) …"
+sleep 3
+
+# ── bridge gz topics to ROS 2 ────────────────────────────────────────────────
+if [[ "$USE_TOF" == true || "$USE_FLOW" == true || "$USE_UWB" == true ]] && command -v ros2 &>/dev/null && ros2 pkg prefix ros_gz_bridge &>/dev/null; then
+  _bridge_args=()
+  for i in $(seq 0 $((NUM_DRONES - 1))); do
+    if [[ "$USE_TOF" == true ]]; then
+      _bridge_args+=("/cf_${i}/tof_down@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan")
+    fi
+    if [[ "$USE_FLOW" == true || "$USE_UWB" == true ]]; then
+      _bridge_args+=("/cf_${i}/odom@nav_msgs/msg/Odometry[gz.msgs.Odometry")
+    fi
+  done
+  info "Bridging gz topics to ROS 2 (${#_bridge_args[@]} mappings) …"
+  ros2 run ros_gz_bridge parameter_bridge "${_bridge_args[@]}" &
+  _PIDS+=($!)
+elif [[ "$USE_TOF" == true || "$USE_FLOW" == true || "$USE_UWB" == true ]]; then
   warn "ros_gz_bridge not installed — gz-native topics not bridged to ROS."
   warn "Install with: sudo apt install ros-humble-ros-gz-bridge (or source setup_env.sh)."
 fi
 
-# ── launch PMW3901 optical-flow node (Phase 1 M3b, §4.2) ───────────────────────
+# ── launch PMW3901 optical-flow node (Phase 1 M3b) — drone 0 only ───────────
 if [[ "$USE_FLOW" == true ]]; then
   _flow_cfg="${FLOW_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/sensors/optical_flow.yaml}"
   [[ "$_flow_cfg" != /* ]] && _flow_cfg="$SAR_NANO_SWARM_ROOT/$_flow_cfg"
@@ -412,9 +432,25 @@ if [[ "$USE_FLOW" == true ]]; then
   elif ! command -v ros2 &>/dev/null; then
     warn "ros2 not on PATH — skipping optical-flow node (source setup_env.sh)."
   else
-    info "Starting PMW3901 optical-flow node ($_flow_cfg) …"
+    info "Starting PMW3901 optical-flow node ($_flow_cfg, cf_0) …"
     python3 -u "$SAR_NANO_SWARM_ROOT/perception/flow_sim/flow_node.py" \
-      --config "$_flow_cfg" --cf-id "$CF_ID" &
+      --config "$_flow_cfg" --cf-id 0 &
+    _PIDS+=($!)
+  fi
+fi
+
+# ── launch UWB PDoA node (Phase 1 M4) — one node for the whole swarm ─────────
+if [[ "$USE_UWB" == true ]]; then
+  _uwb_cfg="${UWB_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/sensors/uwb_pdoa.yaml}"
+  [[ "$_uwb_cfg" != /* ]] && _uwb_cfg="$SAR_NANO_SWARM_ROOT/$_uwb_cfg"
+  if [[ ! -f "$_uwb_cfg" ]]; then
+    warn "UWB config not found: $_uwb_cfg — skipping UWB node."
+  elif ! command -v ros2 &>/dev/null; then
+    warn "ros2 not on PATH — skipping UWB node (source setup_env.sh)."
+  else
+    info "Starting UWB PDoA node ($_uwb_cfg, ${NUM_DRONES} drones) …"
+    python3 -u "$SAR_NANO_SWARM_ROOT/perception/uwb_sim/uwb_node.py" \
+      --config "$_uwb_cfg" --num-drones "$NUM_DRONES" &
     _PIDS+=($!)
   fi
 fi
@@ -457,16 +493,22 @@ echo ""
 echo "  ╔═══════════════════════════════════════════════╗"
 echo "  ║          Simulation ready                     ║"
 echo "  ╠═══════════════════════════════════════════════╣"
-echo "  ║  cfclient URI : udp://127.0.0.1:${CFLIB_PORT}      ║"
+echo "  ║  Drones       : ${NUM_DRONES}"
+echo "  ║  cfclient URIs:"
+for _p in "${CFLIB_PORTS[@]}"; do
+  echo "  ║    udp://127.0.0.1:${_p}"
+done
 echo "  ║  World        : ${WORLD_NAME}"
-echo "  ║  Model        : ${MODEL}_${CF_ID}"
+echo "  ║  Model        : ${MODEL}_0..$((NUM_DRONES - 1))"
 echo "  ║  Radar        : ${USE_RADAR}"
 echo "  ║  Payload model: ${USE_PAYLOAD}"
 echo "  ║  ToF sensor   : ${USE_TOF}"
 echo "  ║  Optical flow : ${USE_FLOW}"
+echo "  ║  UWB          : ${USE_UWB}"
 echo "  ║  Radar topic  : /radar/points  (~10 Hz)"
-echo "  ║  ToF topic    : /cf_${CF_ID}/tof_down  (gz-native, ~30 Hz)"
-echo "  ║  Flow topic   : /cf_${CF_ID}/flow  (ROS, ~100 Hz)"
+echo "  ║  ToF topic    : /cf_<id>/tof_down  (gz-native, ~30 Hz)"
+echo "  ║  Flow topic   : /cf_0/flow  (ROS, ~100 Hz)"
+echo "  ║  UWB topic    : /cf_<id>/uwb/edges  (~scheduler tick Hz)"
 echo "  ╚═══════════════════════════════════════════════╝"
 echo ""
 
