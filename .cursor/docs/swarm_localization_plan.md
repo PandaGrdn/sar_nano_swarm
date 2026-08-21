@@ -82,9 +82,13 @@ Truth is used **only** inside `eval_scripts/` and inside the RIO stub's internal
 | D19 | Antenna-delay bias | Estimator must **not** be given the per-device bias; it must survive it as unmodeled error | M4 deliberately excluded it from reported σ. Keep it honest |
 | D20 | Landed peers | `type: landed` peers are treated as **normal drones whose velocity is zero**, with their own uncertainty — *not* as zero-uncertainty anchors | A landed drone's position is only as good as its estimate when it landed. Only the entrance node is ground truth |
 
-**Two standing conflicts with the roadmap — already adjudicated, do not act on them, just record them in `.cursor/docs/P2_DEVIATIONS.md`:**
+### 1.1 Precedence over the roadmap
 
-- Roadmap §PHASE 2 item 6 says "implement centralized graph optimization first … defer distributed implementation." **D1 overrides this**: the distributed per-drone filter is built first, and the centralized solver is kept as the offline reference bound (D15, P2-7). The message-budget measurement the roadmap asks for is satisfied by the comms-volume metric in §6.1.
+**Where this document and `Simulation_Training_Optimization_Roadmap_v3_MOONSHOT.md` disagree, this document wins.** The roadmap's Phase 2 section is a scoping sketch written before the M4 sensor model existed; D1–D20 above are the decisions actually being implemented. Do not "reconcile" the two by changing anything here, and do not stop to ask which is right. Note the divergence in `.cursor/docs/P2_DEVIATIONS.md` and keep going.
+
+The two divergences that already exist, so you recognise them rather than treating them as mistakes:
+
+- Roadmap §PHASE 2 item 6 says "implement centralized graph optimization first … defer distributed implementation." **D1 supersedes it**: the distributed per-drone filter is built first, and the centralized solver is kept as the offline reference bound (D15, P2-7). The message-budget number the roadmap wanted comes out of the comms-volume metric in §6.1 anyway.
 - Roadmap §PHASE 2 items 1 and 8 want **altitude factors** (baro + `/cf_<id>/tof_down`) and **optical flow** (`/cf_<id>/flow`) fused into the local estimator. Both sim nodes already exist and are gated (`tof_gate.py`, `flow_gate.py`). **They are deliberately out of scope here** — in this milestone all odometry enters through the single `RioDelta` interface (D5), so the real RIO front end can be swapped in without touching the filter. Fusing flow/ToF/baro is a later milestone, not an omission.
 
 ---
@@ -358,7 +362,11 @@ r = u_ij + u_ji                       # zero when frames are consistent
 
 This is a 3-vector residual sensitive to `(ψ_i - ψ_j)`. Jacobians w.r.t. `ψ_i` and `ψ_j` follow from `∂R/∂ψ`. Use `psi_observer`, `roll_observer`, `pitch_observer` from the rebroadcast row for `R_j`, not `j`'s state-broadcast values — they must be the attitude at the instant of *that* measurement. This is the mechanism that makes relative yaw observable without a magnetometer — do not omit it.
 
-⚠ **Expect mutual-yaw pairs to be scarce with the shipped UWB config, and instrument for it.** `aoa_fov_deg: 90.0` with `boresight_axis: [1,0,0]` gives a ±45° forward bearing cone. In a single-file corridor, the trailing drone sees the leader but the leader's rear blind spot means the reverse edge is range-only — so D8 (one-sided rebroadcast) fires often while D11 (needs *both* directions in the same 0.2 s window) may almost never fire. Log `n_mutual_yaw_pairs_per_s` as a first-class metric from P2-6 onward. If it is near zero, that is a **finding about the sensor geometry**, not a bug to tune away: report it, and note that the roadmap's yaw-glance manoeuvre and 180° AoA cone are the intended future remedies (both out of scope here). Design the P2-6 corridor scenario so the two drones face each other for part of it, or mutual yaw is untestable.
+⚠ **Mutual-yaw pairs will be scarce with the shipped UWB config. This is a known, accepted limitation — measure it, do not engineer around it.** `aoa_fov_deg: 90.0` with `boresight_axis: [1,0,0]` gives a ±45° forward bearing cone. In a single-file corridor, the trailing drone sees the leader but the leader's rear blind spot makes the reverse edge range-only — so D8 (one-sided rebroadcast) fires often while D11 (needs *both* directions inside the same `mutual_yaw_max_dt_s` window) may fire rarely or never.
+
+Still implement D11 in full: the entrance node is a fixed-yaw observer in the mesh (§4.3e), junctions and turns do produce facing pairs, and a wider cone later makes the mechanism pay off without a rewrite.
+
+**Do not** widen `aoa_fov_deg`, choreograph flight paths to manufacture facing pairs, add yaw-glance manoeuvres, or relax the pairing window to raise the count. Log `n_mutual_yaw_pairs_per_s` as a first-class metric from P2-6 onward and report whatever it is. A near-zero count is a **result about this sensor geometry**, and reporting it honestly alongside the yaw-drift curve is more valuable than a rate propped up by a scenario built to flatter it.
 
 **(e) Entrance anchor (D12).** Identify entrance edges by the `FLAG_PEER_IS_SURVEYED` flag bit on the edge row; take the position from `entrance.position_xyz_m` in the estimator's own config (never from `uwb_pdoa.yaml`). Treat it as measurement (a) or (b) against a neighbor whose covariance is `entrance.sigma_m²·I`. Because its covariance is ~0, CI will assign nearly all correction to the drone — which is correct.
 
@@ -423,7 +431,11 @@ Build `eval_scripts/swarm_loc_gate.py` following `uwb_gate.py`'s structure: `sys
 
 ### P2-6 — Reciprocal bearing + mutual yaw
 Implement D8 and D11 end-to-end.
-**Gate:** in a two-drone corridor test where drone 0 sees drone 1 (bearing) and drone 1 sees drone 0 only in its rear cone (range-only), drone 1's position error using the rebroadcast bearing is materially lower than with `d·d'` alone; yaw error stays bounded over 5 minutes with no magnetometer, whereas with `use_mutual_yaw: false` it drifts. Also report `n_mutual_yaw_pairs_per_s` — see the FOV warning in §4.3(d); if the scripted path never puts the two drones' cones on each other, the yaw half of this gate is vacuous and the path must be fixed, not the threshold.
+**Gate — D8 half (blocking):** in a two-drone corridor test where drone 0 sees drone 1 (bearing) and drone 1 sees drone 0 only in its rear cone (range-only), drone 1's position error using the rebroadcast bearing is materially lower than with `d·d'` alone.
+
+**D11 half (reporting, not blocking):** report `n_mutual_yaw_pairs_per_s` and the yaw-error curve with `use_mutual_yaw` true vs false. Per §4.3(d), the ±45° cone means the mutual-yaw pair rate may be near zero on this scenario, in which case the two yaw curves will look alike. **That outcome passes the gate** — record the pair rate and the curves in `.cursor/docs/P2_DEVIATIONS.md` and move on to P2-7. Do not alter the scenario, the cone, or the pairing window to make yaw drift appear.
+
+Correctness of the D11 implementation is established offline instead, in the P2-2 Jacobian checks and a P2-3-style synthetic case with facing observers — not by the live pair rate.
 
 ### P2-7 — Centralized reference solver
 `eval_scripts/central_reference.py`: read a full run's logged measurements, solve one batch least-squares over all drone poses at all keyframes, output the reference trajectory. Log measurements to disk during the run (`swarm_loc_node.py --log-measurements <path>`, one `.npz` per drone) — do not try to reconstruct them from a rosbag.
@@ -465,7 +477,7 @@ Run identical scenarios under each condition:
 3. **RIO + range-only UWB** — the Guo et al. comparison arm
 4. **RIO + range + bearing** — the proposed system
 5. **Full, minus entrance anchor** (`disable_entrance: true`) — expect internally consistent but globally drifting mesh
-6. **Full, minus mutual yaw** — expect yaw drift
+6. **Full, minus mutual yaw** — isolates D11. Expect yaw drift *only where mutual-yaw pairs actually occur*; on scenarios where the ±45° cone yields no facing pairs this arm will be indistinguishable from condition 7, which is the honest answer and not a failed run. Always report this arm next to `n_mutual_yaw_pairs_per_s`, or the comparison is uninterpretable.
 7. **Full** — proposed system
 8. **Centralized reference** (P2-7) — upper bound
 
@@ -484,7 +496,7 @@ Record in `.cursor/docs/P2_DEVIATIONS.md` and in every results write-up:
 3. **NLOS and link-budget parameters are *not* fitted** — `nlos_bias_mean_m`, `nlos_sigma_mult`, `p_dropout_nlos`, `p_dropout_at_max_range` are Tier-B guesses, and NLOS is precisely the regime the corridor stress tests (P2-8) lean on.
 4. **No clock drift modeled** (D18).
 5. **Roll/pitch assumed accurate** (D4) — true in normal flight, less so under aggressive maneuvers or downwash.
-6. **Bearing cone is ±45°, not 180°** — `aoa_fov_deg: 90.0`. The roadmap discusses 180° as the eventual default and a yaw-glance manoeuvre for full 360° coverage; neither is implemented. Every bearing-availability and mutual-yaw number in these results is specific to the ±45° cone and will improve if the cone widens. State the cone next to every such number.
+6. **Bearing cone is ±45°, not 180°, and mutual yaw is starved by it** — `aoa_fov_deg: 90.0`. D11 requires bearing in *both* directions within one short window, which a forward-only ±45° cone rarely produces in corridor formations. **This is accepted as-is for this milestone; no workaround is in scope.** The consequence is that the yaw-observability claim (D11) is demonstrated analytically and in synthetic facing-pair cases, but may be weakly or not at all exercised in the live runs — say so explicitly rather than letting the reader assume it carried the results. The roadmap's 180° cone and yaw-glance manoeuvre are the eventual remedies; neither is implemented. State the cone next to every bearing-availability and mutual-yaw number.
 7. **Landed peers are not anchors** (D20) — if a future milestone wants surveyed landed anchors, that is a new decision, not an implicit one.
 8. **CI is conservative by construction** — it will underclaim accuracy relative to an optimal correlated fusion. This is intentional; do not "fix" it by switching to naive fusion.
 9. **Altitude aiding is absent.** Baro, `/cf_<id>/tof_down`, and `/cf_<id>/flow` are simulated and gated but deliberately unused (see §1). A coplanar corridor mesh gives the vertical channel almost nothing, so Z error here is a floor, not a final number.
