@@ -1,0 +1,67 @@
+x-base-image: &base_image ghcr.io/arpg/coloradar-lib:latest
+x-dataset-volume: &dataset_volume /Users/monika/Downloads/coloradar-library-main/data/coloradar:/data/coloradar
+
+
+services:
+  base:
+    image: *base_image
+    working_dir: /app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DOCKER_DATASET_VOLUME_PATH=./data/coloradar
+
+  get_export_config_template:
+    extends:
+      service: base
+    volumes:
+      - ./export:/export
+    command: cp /src/coloradar_lib/export-config-template.yaml /export/export-config.yaml
+
+  build_maps:
+    extends:
+      service: base
+    volumes:
+      - .:/app
+      - *dataset_volume
+    command: python3 scripts/build_maps.py
+
+  sample_maps:
+    extends:
+      service: base
+    volumes:
+      - .:/app
+      - *dataset_volume
+    command: python3 scripts/sample_maps.py
+
+  export_dataset:
+    extends:
+      service: base
+    volumes:
+      - .:/app
+      - ./export:/export
+      - *dataset_volume
+    command: python3 scripts/export_dataset.py
+
+  visualize_run:
+    extends:
+      service: base
+    environment:
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - .:/app
+      - ./export:/export
+      - *dataset_volume
+    command: python3 scripts/visualize_run.py --name 2_23_2021_edgar_classroom_run4 --step 10
+
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile.demo
+      args:
+        BASE_IMAGE: *base_image
+    volumes:
+      - .:/app
+      - *dataset_volume
+    ports:
+      - "8888:8888"
