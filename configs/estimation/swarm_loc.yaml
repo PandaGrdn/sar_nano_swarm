@@ -1,0 +1,74 @@
+# Swarm relative localization estimator — roadmap Phase 2.
+# See .cursor/docs/swarm_localization_plan.md
+# ⚠ AGENTS.md §1 Tier A: the estimator reads THIS file only. It must never read
+# configs/sensors/uwb_pdoa.yaml (that is how the SIMULATOR generates measurements).
+
+estimator:
+  rate_hz: 50                      # filter propagation rate
+  state_init_sigma_p_m: 0.05
+  state_init_sigma_v_mps: 0.05
+  state_init_sigma_psi_deg: 5.0    # D14
+  yaw_bias_walk_sigma: 1.0e-4
+  scale_init: 1.0
+  scale_init_sigma: 0.02
+  cov_floor_p_m: 0.01              # prevents over-confidence collapse
+  max_cov_p_m: 50.0                # divergence detector threshold
+
+# ── launch geometry (D13) ─────────────────────────────────────────────────────
+# MUST mirror phase0_gate.sh -x / -y / --spacing. Surveyed deployment geometry,
+# not a truth read: drone i initializes at (spawn_x0_m + i*spacing_m, spawn_y_m, spawn_z_m).
+launch:
+  spawn_x0_m: 0.0
+  spawn_y_m: 0.0
+  spawn_z_m: 0.5
+  spacing_m: 1.5
+  init_yaw_deg: 0.0                # D14 — common launch heading, no magnetometer
+
+# ── entrance gauge (D12) ──────────────────────────────────────────────────────
+entrance:
+  position_xyz_m: [-2.0, 0.0, 0.30]   # surveyed constant; matches the M4 entrance peer
+  sigma_m: 0.01
+
+measurements:
+  use_bearing: true
+  use_reciprocal_bearing: true     # D8
+  use_range_only_fallback: true    # D9
+  use_range_rate: true
+  use_mutual_yaw: true             # D11
+  range_rate_window: 5             # D10 — samples, NOT a fixed dt (§4.3c)
+  nis_gate_chi2_p: 0.99            # D16
+  mutual_yaw_max_dt_s: 0.2         # D11 / §4.3d pairing window
+  max_measurement_age_s: 0.5       # D18 / §4.5 — discard older than this
+
+comms:
+  broadcast_rate_hz: 10            # D17
+  latency_ms: 20
+  packet_loss: 0.02
+  max_neighbors: 6                 # keep equal to uwb_pdoa.yaml max_neighbors_per_drone;
+                                   # a larger value here buys nothing — M4 will not
+                                   # produce edges to peers outside its own k-neighbour graph
+
+fusion:
+  method: covariance_intersection  # D6 — do not change
+  ci_omega_search: fast            # 'fast' = closed-form trace-min; 'grid' = 21-point sweep
+
+rio:
+  source: stub                     # stub | real
+  vel_bias_walk: 1.0e-3
+  yaw_walk_deg_per_min: 3.0
+  scale_error: 1.02
+  sigma_p: 0.02
+  sigma_psi_deg: 0.5
+  dropout_rate: 0.02
+  dropout_duration_s: 0.5
+  dropout_q_scale: 25.0            # §4.2 — Q inflation while valid == False
+
+ablation:
+  disable_uwb: false
+  disable_bearing: false
+  disable_entrance: false
+  disable_rio: false
+  uwb_noise_scale: 1.0             # §6.2 — 2.0 for the pessimistic arm
+
+seed: 0
+mlflow_experiment: "phase2_swarm_loc"
