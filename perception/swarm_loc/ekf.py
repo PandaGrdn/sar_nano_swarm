@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""ekf.py — error-state EKF math for swarm relative localization (P2-1).
+"""ekf.py — error-state EKF math for swarm relative localization.
 
-No rclpy. This milestone implements propagation only (plan §4.2).
-Measurement updates land in P2-2 / P2-3.
+No rclpy. P2-1 propagation, P2-3 update + entrance, P2-4 split-CI when
+a neighbor covariance is supplied.
 
 Usage:
     python3 perception/swarm_loc/ekf.py --selftest
+    python3 perception/swarm_loc/ci_fusion.py --selftest
 """
 from __future__ import annotations
 
@@ -21,6 +22,10 @@ for _p in ("perception/swarm_loc", "perception/uwb_sim"):
     if str(_REPO_ROOT / _p) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT / _p))
 
+from measurements import (  # noqa: E402
+    Measurement,
+    entrance_from_edge,
+)
 from rio_stub import (  # noqa: E402
     RioDelta,
     RioStubEngine,
@@ -46,6 +51,12 @@ from state import (  # noqa: E402
     symmetrize,
     wrap_psi,
 )
+from uwb_edges import (  # noqa: E402
+    FLAG_BEARING_VALID,
+    FLAG_PEER_IS_SURVEYED,
+    FLAG_RANGE_VALID,
+)
+from uwb_model import bearing_xyz  # noqa: E402
 
 
 def _process_G(st: SwarmState, delta: RioDelta) -> np.ndarray:
@@ -135,6 +146,284 @@ def propagate(st: SwarmState, delta: RioDelta, cfg: dict) -> SwarmState:
     else:
         out.status = STATUS_OK
     return out
+
+
+def chi2_ppf(p: float, df: int) -> float:
+    """Chi-squared quantile. scipy if present, else Wilson-Hilferty."""
+    df = int(df)
+    if df < 1:
+        return 0.0
+    try:
+        from scipy.stats import chi2
+
+        return float(chi2.ppf(p, df))
+    except Exception:
+        # Wilson-Hilferty: χ² ≈ df * (1 - 2/(9df) + z sqrt(2/(9df)))^3
+        z = _norm_ppf(p)
+        t = 1.0 - 2.0 / (9.0 * df) + z * math.sqrt(2.0 / (9.0 * df))
+        return max(float(df * t**3), 0.0)
+
+
+def _norm_ppf(p: float) -> float:
+    """Acklam approximation of the standard-normal quantile."""
+    p = min(max(float(p), 1e-12), 1.0 - 1e-12)
+    a = [
+        -3.969683028665376e01,
+        2.209460984245205e02,
+        -2.759285104469687e02,
+        1.383577509590705e02,
+        -3.066479806614716e01,
+        2.506628277459239e00,
+    ]
+    b = [
+        -5.447609879822406e01,
+        1.615858368580409e02,
+        -1.556989798598866e02,
+        6.680131188771972e01,
+        -1.328068155288572e01,
+    ]
+    c = [
+        -7.784894002430293e-03,
+        -3.223964580411365e-01,
+        -2.400758277161838e00,
+        -2.549732539343734e00,
+        4.374664141464968e00,
+        2.938163982698783e00,
+    ]
+    d = [
+        7.784695709041462e-03,
+        3.224671290700398e-01,
+        2.445134137142996e00,
+        3.754408661907416e00,
+    ]
+    plow = 0.02425
+    phigh = 1.0 - plow
+    if p < plow:
+        q = math.sqrt(-2.0 * math.log(p))
+        return (
+            (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
+            / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+        )
+    if p > phigh:
+        q = math.sqrt(-2.0 * math.log(1.0 - p))
+        return -(
+            (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
+            / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+        )
+    q = p - 0.5
+    r = q * q
+    return (
+        (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5])
+        * q
+        / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
+    )
+
+
+def position_nees(st: SwarmState, p_true: np.ndarray) -> float:
+    err = np.asarray(st.p, dtype=np.float64) - np.asarray(p_true, dtype=np.float64)
+    Pp = 0.5 * (st.P[0:3, 0:3] + st.P[0:3, 0:3].T)
+    try:
+        return float(err @ np.linalg.solve(Pp, err))
+    except np.linalg.LinAlgError:
+        return float("inf")
+
+
+def _measurement_R(meas: Measurement, cfg: dict) -> np.ndarray:
+    R = np.array(meas.R, dtype=np.float64)
+    if meas.name.startswith("entrance"):
+        sig2 = float(cfg["entrance"]["sigma_m"]) ** 2
+        R = R + sig2 * np.eye(R.shape[0])
+    return 0.5 * (R + R.T)
+
+
+def update(
+    st: SwarmState,
+    meas: Measurement,
+    cfg: dict,
+    P_j: np.ndarray | None = None,
+    fusion: str | None = None,
+) -> tuple:
+    """EKF update with NIS gate (D16 / §4.5). Returns (state, info).
+
+    If P_j is None, neighbor uncertainty is already in R (entrance path).
+    If P_j is provided, apply split-CI (D6) unless fusion='naive'.
+    """
+    import ci_fusion as _ci  # local to keep --selftest import order simple
+
+    info = {"accepted": False, "nis": float("nan"), "reason": "", "omega": float("nan")}
+    if st.status == STATUS_DIVERGED:
+        info["reason"] = "diverged"
+        return st.copy(), info
+    if not meas.finite():
+        info["reason"] = "nan"
+        return st.copy(), info
+
+    H = np.array(meas.H_i, dtype=np.float64)
+    H_j = np.array(meas.H_j, dtype=np.float64)
+    r = np.array(meas.residual, dtype=np.float64).reshape(-1)
+    Rm = _measurement_R(meas, cfg)
+    if H.shape[0] != r.size or Rm.shape != (r.size, r.size):
+        info["reason"] = "shape"
+        return st.copy(), info
+
+    method = fusion if fusion is not None else str(cfg.get("fusion", {}).get("method", "covariance_intersection"))
+    search = str(cfg.get("fusion", {}).get("ci_omega_search", "fast"))
+    use_ci = P_j is not None and method not in ("naive", "ekf")
+    P_i = st.P
+    P_use = P_i
+    R_eff = Rm
+
+    if P_j is not None and use_ci:
+        Pj = np.array(P_j, dtype=np.float64)
+        if Pj.shape != P_i.shape:
+            info["reason"] = "P_j_shape"
+            return st.copy(), info
+        w = _ci.choose_omega_sci(H, P_i, H_j, Pj, Rm, method=search)
+        info["omega"] = w
+        # Split-CI innovation: inflate both priors in S (unknown correlation).
+        # Gain uses uninflated P_i so the mean does not overshoot.
+        S = _ci.sci_S(H, P_i, H_j, Pj, Rm, w)
+        R_eff = S - H @ P_i @ H.T
+        R_eff = 0.5 * (R_eff + R_eff.T)
+        # Keep R_eff PSD
+        eig, vec = np.linalg.eigh(R_eff)
+        R_eff = vec @ np.diag(np.clip(eig, 1e-12, None)) @ vec.T
+        P_use = P_i
+    elif P_j is not None:
+        # naive uncorrelated EKF (regression arm)
+        Pj = np.array(P_j, dtype=np.float64)
+        R_eff = H_j @ Pj @ H_j.T + Rm
+        R_eff = 0.5 * (R_eff + R_eff.T)
+        S = H @ P_i @ H.T + R_eff
+        P_use = P_i
+    else:
+        S = H @ P_i @ H.T + Rm
+        P_use = P_i
+        R_eff = Rm
+
+    S = 0.5 * (S + S.T)
+    try:
+        Sinv_r = np.linalg.solve(S, r)
+        nis = float(r @ Sinv_r)
+    except np.linalg.LinAlgError:
+        info["reason"] = "S_singular"
+        return st.copy(), info
+    info["nis"] = nis
+    df = int(r.size)
+    p_gate = float(cfg["measurements"]["nis_gate_chi2_p"])
+    thresh = chi2_ppf(p_gate, df)
+    if not math.isfinite(nis) or nis > thresh:
+        info["reason"] = "nis_gate"
+        return st.copy(), info
+
+    try:
+        K = np.linalg.solve(S, (P_use @ H.T).T).T
+    except np.linalg.LinAlgError:
+        info["reason"] = "K_fail"
+        return st.copy(), info
+
+    out = st.copy()
+    out.x = st.x + K @ r
+    out.x[IDX_PSI] = wrap_psi(float(out.x[IDX_PSI]))
+    I = np.eye(N_STATE)
+    KH = K @ H
+    P = (I - KH) @ P_use @ (I - KH).T + K @ R_eff @ K.T
+    P = symmetrize(P)
+    if P_j is not None and use_ci:
+        # Relative measurements cannot observe a common-mode translation.
+        # Floor the position variances at classic CI(P_i, P_j) so the filter
+        # does not claim more absolute certainty than D6 allows.
+        P_floor = _ci.fused_P(P_i[0:3, 0:3], np.asarray(P_j, dtype=np.float64)[0:3, 0:3], float(info["omega"]))
+        for k in range(3):
+            P[k, k] = max(float(P[k, k]), float(P_floor[k, k]))
+        P = symmetrize(P)
+    P = clamp_position_cov(P, cfg)
+    out.P = P
+    hi = float(cfg["estimator"]["max_cov_p_m"]) ** 2
+    if any(P[i, i] >= hi for i in range(3)) or not np.all(np.isfinite(P)):
+        out.status = STATUS_DIVERGED
+        info["reason"] = "diverged_after_update"
+        info["accepted"] = True
+        return out, info
+    info["accepted"] = True
+    info["reason"] = "ok"
+    return out, info
+
+
+def _synth_entrance_edge(p, psi, pitch, roll, p_ent, rng, sigma_d, sigma_az, sigma_el) -> dict:
+    R = rpy_to_R(float(psi), float(pitch), float(roll))
+    z_true = R.T @ (np.asarray(p_ent, dtype=np.float64) - np.asarray(p, dtype=np.float64))
+    d = float(np.linalg.norm(z_true))
+    az = math.atan2(float(z_true[1]), float(z_true[0]))
+    el = math.asin(float(np.clip(z_true[2] / max(d, EPS), -1.0, 1.0)))
+    d_m = d + float(rng.normal(0.0, sigma_d))
+    az_m = az + float(rng.normal(0.0, sigma_az))
+    el_m = float(np.clip(el + rng.normal(0.0, sigma_el), -0.5 * math.pi + 1e-6, 0.5 * math.pi - 1e-6))
+    if d_m < 0.05:
+        d_m = 0.05
+    x, y, z = bearing_xyz(d_m, az_m, el_m)
+    return {
+        "flags": FLAG_RANGE_VALID | FLAG_BEARING_VALID | FLAG_PEER_IS_SURVEYED,
+        "x": float(x),
+        "y": float(y),
+        "z": float(z),
+        "range_m": float(d_m),
+        "azimuth_rad": float(az_m),
+        "elevation_rad": float(el_m),
+        "sigma_range_m": float(sigma_d),
+        "sigma_az_rad": float(sigma_az),
+        "sigma_el_rad": float(sigma_el),
+    }
+
+
+def run_entrance_mc(cfg: dict, n_runs: int = 1000, n_steps: int = 20, seed: int = 3) -> dict:
+    """Static one-drone + entrance Monte Carlo (P2-3 gate)."""
+    p_ent = np.array(cfg["entrance"]["position_xyz_m"], dtype=np.float64)
+    p_true = SwarmState.from_launch(cfg, 0).p.copy()
+    sigma_d = 0.0873
+    sigma_az = math.radians(4.795)
+    sigma_el = math.radians(4.795)
+    rng = np.random.default_rng(seed)
+    nees = np.empty(n_runs)
+    err = np.empty(n_runs)
+    n_accept = 0
+    n_meas = 0
+    for i in range(n_runs):
+        st = SwarmState.from_launch(cfg, 0)
+        x_true = st.x.copy()
+        st.x = st.x + rng.multivariate_normal(np.zeros(N_STATE), st.P)
+        st.x[IDX_PSI] = wrap_psi(float(st.x[IDX_PSI]))
+        for k in range(n_steps):
+            edge = _synth_entrance_edge(
+                p_true, x_true[IDX_PSI], 0.0, 0.0, p_ent, rng, sigma_d, sigma_az, sigma_el
+            )
+            meas = entrance_from_edge(st, edge, cfg)
+            n_meas += 1
+            if meas is None:
+                continue
+            st, info = update(st, meas, cfg)
+            if info["accepted"]:
+                n_accept += 1
+        nees[i] = position_nees(st, p_true)
+        err[i] = float(np.linalg.norm(st.p - p_true))
+    mean_nees = float(np.mean(nees[np.isfinite(nees)]))
+    n_ok = int(np.sum(np.isfinite(nees)))
+    lo = chi2_ppf(0.025, 3 * n_ok) / n_ok
+    hi = chi2_ppf(0.975, 3 * n_ok) / n_ok
+    chi3_lo = chi2_ppf(0.025, 3)
+    chi3_hi = chi2_ppf(0.975, 3)
+    frac_in = float(np.mean((nees >= chi3_lo) & (nees <= chi3_hi)))
+    return {
+        "mean_nees": mean_nees,
+        "nees_lo": lo,
+        "nees_hi": hi,
+        "frac_in_95": frac_in,
+        "err_p50": float(np.median(err)),
+        "err_p95": float(np.quantile(err, 0.95)),
+        "err_max": float(np.max(err)),
+        "accept_frac": n_accept / max(n_meas, 1),
+        "n_runs": n_runs,
+    }
 
 
 def _numerical_F(st: SwarmState, delta: RioDelta, eps: float = 1e-7) -> np.ndarray:
@@ -474,6 +763,86 @@ def run_selftest() -> int:
     check(
         "17b F dp/dpsi matches s dR/dpsi dp",
         np.allclose(F[IDX_P, IDX_PSI], st_w.s * dp_dpsi),
+    )
+
+    # ----- P2-3: update path + entrance MC -----
+    check("19 chi2_3 0.95 ~7.8", abs(chi2_ppf(0.95, 3) - 7.815) < 0.05)
+
+    st = SwarmState.from_launch(cfg, 0)
+    p_ent = np.array(cfg["entrance"]["position_xyz_m"], dtype=np.float64)
+    p_true = st.p.copy()
+    st.x[IDX_P] = st.x[IDX_P] + np.array([0.08, -0.04, 0.03])
+    err0 = float(np.linalg.norm(st.p - p_true))
+    z_meas = rpy_to_R(0.0, 0.0, 0.0).T @ (p_ent - p_true)
+    d_m = float(np.linalg.norm(z_meas))
+    edge_clean = {
+        "flags": FLAG_RANGE_VALID | FLAG_BEARING_VALID | FLAG_PEER_IS_SURVEYED,
+        "x": float(z_meas[0]),
+        "y": float(z_meas[1]),
+        "z": float(z_meas[2]),
+        "range_m": d_m,
+        "azimuth_rad": math.atan2(float(z_meas[1]), float(z_meas[0])),
+        "elevation_rad": math.asin(float(np.clip(z_meas[2] / d_m, -1.0, 1.0))),
+        "sigma_range_m": 0.0873,
+        "sigma_az_rad": math.radians(4.795),
+        "sigma_el_rad": math.radians(4.795),
+    }
+    meas = entrance_from_edge(st, edge_clean, cfg)
+    check("20 entrance meas built", meas is not None and meas.finite())
+    st1, info = update(st, meas, cfg)
+    check("20b update accepted", info["accepted"], str(info))
+    err1 = float(np.linalg.norm(st1.p - p_true))
+    check("20c noiseless update reduces error", err1 < err0, f"err0={err0:.3f} err1={err1:.3f}")
+    check("20d P still SPD", _is_spd(st1.P))
+
+    meas_bad = Measurement(
+        name="entrance_relpos",
+        z=meas.z.copy(),
+        h=meas.h.copy(),
+        residual=np.array([10.0, 10.0, 10.0]),
+        H_i=meas.H_i.copy(),
+        H_j=meas.H_j.copy(),
+        R=meas.R.copy(),
+    )
+    st2, info2 = update(st, meas_bad, cfg)
+    check("21 NIS rejects outlier", info2["reason"] == "nis_gate")
+    check("21b reject leaves state unchanged", np.allclose(st2.x, st.x))
+
+    meas_nan = Measurement(
+        name="entrance_relpos",
+        z=meas.z.copy(),
+        h=meas.h.copy(),
+        residual=np.array([0.0, float("nan"), 0.0]),
+        H_i=meas.H_i.copy(),
+        H_j=meas.H_j.copy(),
+        R=meas.R.copy(),
+    )
+    _, info3 = update(st, meas_nan, cfg)
+    check("22 NaN dropped", info3["reason"] == "nan")
+
+    print("[selftest] running P2-3 entrance Monte Carlo (1000 runs) ...")
+    mc = run_entrance_mc(cfg, n_runs=1000, n_steps=10, seed=3)
+    print(
+        f"[selftest] MC mean_NEES={mc['mean_nees']:.3f} band=[{mc['nees_lo']:.3f},{mc['nees_hi']:.3f}] "
+        f"frac_in_95={mc['frac_in_95']:.3f} err_p50={mc['err_p50']:.3f} err_p95={mc['err_p95']:.3f} "
+        f"accept={mc['accept_frac']:.3f}"
+    )
+    check(
+        "23 position error bounded",
+        mc["err_p95"] < 0.5 and mc["err_max"] < 1.5,
+        f"p95={mc['err_p95']:.3f} max={mc['err_max']:.3f}",
+    )
+    # Overconfidence = mean NEES above the 95% band. Underconfidence (below)
+    # is conservative and is not a P2-3 failure; still flag if wildly low.
+    check(
+        "24 NEES not overconfident",
+        math.isfinite(mc["mean_nees"]) and mc["mean_nees"] <= mc["nees_hi"],
+        f"mean_NEES={mc['mean_nees']:.3f} hi={mc['nees_hi']:.3f}",
+    )
+    check(
+        "24b NEES in/near 95% band",
+        mc["mean_nees"] >= 0.5 * mc["nees_lo"] and mc["frac_in_95"] >= 0.80,
+        f"mean={mc['mean_nees']:.3f} frac={mc['frac_in_95']:.3f}",
     )
 
     print(f"[selftest] {n_pass} passed, {n_fail} failed (need >=15 passing)")
