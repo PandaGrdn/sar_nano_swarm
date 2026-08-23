@@ -12,7 +12,7 @@ estimator:
   scale_init: 1.0
   scale_init_sigma: 0.02
   cov_floor_p_m: 0.01              # prevents over-confidence collapse
-  max_cov_p_m: 50.0                # divergence detector threshold
+  max_cov_p_m: 2.0                 # σ_p abort — tunnel-scale; plan default was 50 m (see P2_DEVIATIONS.md)
 
 # ── launch geometry (D13) ─────────────────────────────────────────────────────
 # MUST mirror phase0_gate.sh -x / -y / --spacing. Surveyed deployment geometry,

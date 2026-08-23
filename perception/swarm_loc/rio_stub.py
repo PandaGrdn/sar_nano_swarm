@@ -262,8 +262,14 @@ def _run_node(args) -> int:
                 self._on_odom,
                 qos_profile_sensor_data,
             )
-            # Publishing `/rio/delta` PointCloud2 is P2-5 (swarm_msgs.py).
-            # P2-1 only needs the corruption engine + this truth subscription.
+            from swarm_msgs import pack_rio, rio_row_from_delta  # noqa: E402
+            from sensor_msgs.msg import PointCloud2
+
+            self._pack_rio = pack_rio
+            self._rio_row = rio_row_from_delta
+            self._pub = self.create_publisher(
+                PointCloud2, f"/cf_{args.cf_id}/rio/delta", qos_profile_sensor_data
+            )
             self.get_logger().warn(
                 "⚠ AGENTS.md §1 Tier A: this node reads /cf_"
                 f"{args.cf_id}/odom (Gazebo truth) and must never be imported "
@@ -290,9 +296,11 @@ def _run_node(args) -> int:
             dp, dpsi, roll, pitch, dt = true_delta_from_poses(
                 self._prev_p, self._prev_R, p, R, self._prev_t, stamp
             )
-            _delta = engine.corrupt(stamp, dt, dp, dpsi, roll, pitch)
+            delta = engine.corrupt(stamp, dt, dp, dpsi, roll, pitch)
             self._prev_p, self._prev_R, self._prev_t = p, R, stamp
             self._prev_wall = wall
+            msg_out = self._pack_rio([self._rio_row(delta)], stamp, "body")
+            self._pub.publish(msg_out)
 
     rclpy.init()
     node = RioStubNode()
