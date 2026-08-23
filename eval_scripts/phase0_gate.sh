@@ -488,7 +488,11 @@ if [[ "$USE_SWARM_LOC" == true ]]; then
 fi
 
 # ── launch RViz ───────────────────────────────────────────────────────────────
-RVIZ_CFG="$SAR_NANO_SWARM_ROOT/configs/rviz/radar.rviz"
+if [[ "$USE_SWARM_LOC" == true ]]; then
+  RVIZ_CFG="$SAR_NANO_SWARM_ROOT/configs/rviz/swarm_loc.rviz"
+else
+  RVIZ_CFG="$SAR_NANO_SWARM_ROOT/configs/rviz/radar.rviz"
+fi
 
 if [[ "$USE_RVIZ" == true ]]; then
   if ! command -v rviz2 &>/dev/null; then

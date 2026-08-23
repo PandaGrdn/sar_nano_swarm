@@ -193,6 +193,31 @@ def relpos_from_edge(
     )
 
 
+def reciprocal_relpos(
+    p_i,
+    p_j,
+    psi_j: float,
+    pitch_j: float,
+    roll_j: float,
+    z_body_ji,
+    sigma_d: float,
+    sigma_az: float,
+    sigma_el: float,
+    d: Optional[float] = None,
+    az: Optional[float] = None,
+    el: Optional[float] = None,
+) -> Optional[Measurement]:
+    """D8: peer j measured bearing to us. h = R_jᵀ (p_i - p_j).
+
+    Built from relpos with observer=j, target=i, then H blocks swapped so
+    H_i is ours and H_j is the neighbor's.
+    """
+    m = relpos(p_j, p_i, psi_j, pitch_j, roll_j, z_body_ji, sigma_d, sigma_az, sigma_el, d, az, el)
+    m.H_i, m.H_j = m.H_j, m.H_i
+    m.name = "reciprocal_relpos"
+    return m
+
+
 # ---------------------------------------------------------------------------
 # (b) range-only
 # ---------------------------------------------------------------------------
@@ -502,10 +527,14 @@ def run_selftest() -> int:
     m = relpos(p_i, p_j, psi, pitch, roll, z_true, 0.05, 0.02, 0.02)
     check("3 relpos residual zero", float(np.linalg.norm(m.residual)) < 1e-12)
     check("3b relpos finite", m.finite())
+    z_ji_true = rpy_to_R(0.3, -0.05, 0.02).T @ (p_i - p_j)
+    mr = reciprocal_relpos(p_i, p_j, 0.3, -0.05, 0.02, z_ji_true, 0.05, 0.02, 0.02)
+    check("3c reciprocal residual zero", float(np.linalg.norm(mr.residual)) < 1e-12)
+    check("3d reciprocal name", mr.name == "reciprocal_relpos")
 
     # --- 100 randomized Jacobian checks ---
     rng = np.random.default_rng(2)
-    max_a = max_b = max_c = max_d = 0.0
+    max_a = max_b = max_c = max_d = max_r = 0.0
     n_geom = 100
     failed = []
     for k in range(n_geom):
@@ -631,6 +660,59 @@ def run_selftest() -> int:
         if ed_i >= 1e-6 or ed_j >= 1e-6:
             failed.append(("d", k, ed_i, ed_j))
 
+        # D8 reciprocal: same geometry as (a) but observer is j
+        z_ji = rpy_to_R(g["psi_j"], g["pitch_j"], g["roll_j"]).T @ (g["p_i"] - g["p_j"])
+        mrec = reciprocal_relpos(
+            g["p_i"],
+            g["p_j"],
+            g["psi_j"],
+            g["pitch_j"],
+            g["roll_j"],
+            z_ji,
+            0.08,
+            0.03,
+            0.03,
+        )
+        x_i_r = np.zeros(N_STATE)
+        x_i_r[IDX_P] = g["p_i"]
+        x_j_r = np.zeros(N_STATE)
+        x_j_r[IDX_P] = g["p_j"]
+        x_j_r[IDX_PSI] = g["psi_j"]
+
+        def h_r_i(x, g=g, z_ji=z_ji):
+            return reciprocal_relpos(
+                x[IDX_P],
+                g["p_j"],
+                g["psi_j"],
+                g["pitch_j"],
+                g["roll_j"],
+                z_ji,
+                0.08,
+                0.03,
+                0.03,
+            ).h
+
+        def h_r_j(x, g=g, z_ji=z_ji):
+            return reciprocal_relpos(
+                g["p_i"],
+                x[IDX_P],
+                float(x[IDX_PSI]),
+                g["pitch_j"],
+                g["roll_j"],
+                z_ji,
+                0.08,
+                0.03,
+                0.03,
+            ).h
+
+        Hr_i = _numdiff_h(h_r_i, x_i_r)
+        Hr_j = _numdiff_h(h_r_j, x_j_r)
+        er_i = float(np.max(np.abs(mrec.H_i - Hr_i)))
+        er_j = float(np.max(np.abs(mrec.H_j - Hr_j)))
+        max_r = max(max_r, er_i, er_j)
+        if er_i >= 1e-6 or er_j >= 1e-6:
+            failed.append(("r", k, er_i, er_j))
+
     check(
         "4 Jac (a) 100 geom <1e-6",
         max_a < 1e-6 and not any(f[0] == "a" for f in failed),
@@ -650,6 +732,11 @@ def run_selftest() -> int:
         "7 Jac (d) 100 geom <1e-6",
         max_d < 1e-6 and not any(f[0] == "d" for f in failed),
         f"max={max_d:.3e}",
+    )
+    check(
+        "7b Jac reciprocal 100 geom <1e-6",
+        max_r < 1e-6 and not any(f[0] == "r" for f in failed),
+        f"max={max_r:.3e} nfail={sum(1 for f in failed if f[0]=='r')}",
     )
 
     # facing pair: residual ~ 0 when both attitudes consistent with geometry

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""swarm_loc_node.py — per-drone rclpy wrapper for the swarm-loc EKF (P2-5).
+"""swarm_loc_node.py — per-drone rclpy wrapper for the swarm-loc EKF (P2-5/P2-6).
 
 One process per drone. Odometry enters only via /cf_<id>/rio/delta.
 Must never subscribe to /cf_*/odom, /uwb/edges_truth, or /cf_*/flow/debug_truth.
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import heapq
+import math
 import sys
 import time
 from collections import defaultdict, deque
@@ -26,7 +27,14 @@ for _p in ("perception/swarm_loc", "perception/uwb_sim"):
         sys.path.insert(0, str(_REPO_ROOT / _p))
 
 from ekf import propagate, update  # noqa: E402
-from measurements import from_edge, range_rate, range_rate_regression  # noqa: E402
+from measurements import (  # noqa: E402
+    cartesian_cov_from_spherical,
+    from_edge,
+    mutual_yaw,
+    range_rate,
+    range_rate_regression,
+    reciprocal_relpos,
+)
 from rio_stub import load_config, resolve_config_path  # noqa: E402
 from state import STATUS_DIVERGED, SwarmState  # noqa: E402
 from swarm_msgs import (  # noqa: E402
@@ -36,9 +44,11 @@ from swarm_msgs import (  # noqa: E402
     pack_state,
     rio_delta_from_row,
     state_row_from_filter,
+    unpack_bearing,
     unpack_rio,
     unpack_state,
 )
+from uwb_model import bearing_xyz  # noqa: E402
 from uwb_edges import (  # noqa: E402
     FLAG_BEARING_VALID,
     FLAG_PEER_IS_SURVEYED,
@@ -89,6 +99,7 @@ class SwarmLocNode:
     """Filter loop. Instantiated only after rclpy import (see _run_node)."""
 
     def __init__(self, node, cf_id: int, num_drones: int, cfg: dict):
+        from geometry_msgs.msg import PoseStamped
         from rclpy.qos import qos_profile_sensor_data
         from sensor_msgs.msg import PointCloud2
 
@@ -105,6 +116,12 @@ class SwarmLocNode:
         self._neighbors: Dict[int, dict] = {}
         self._range_win: Dict[int, Deque] = defaultdict(lambda: deque(maxlen=32))
         self._pending_rebroadcast: List[dict] = []
+        self._own_bearing: Dict[int, dict] = {}
+        self._peer_bearing_to_us: Dict[int, dict] = {}
+        self._n_mutual_yaw = 0
+        self._n_reciprocal = 0
+        self._t0_wall = time.time()
+        self._last_metric_wall = self._t0_wall
         rng = np.random.default_rng(int(cfg.get("seed", 0)) + self.cf_id)
         comms = cfg["comms"]
         self._tx = DelayedDropQueue(
@@ -121,6 +138,9 @@ class SwarmLocNode:
         )
         self._pub_brg = node.create_publisher(
             PointCloud2, f"/cf_{self.cf_id}/swarm_loc/bearing_rebroadcast", qos
+        )
+        self._pub_pose = node.create_publisher(
+            PoseStamped, f"/cf_{self.cf_id}/swarm_loc/pose", qos
         )
         for topic in estimator_subscription_topics(self.cf_id, self.num_drones, cfg):
             if topic.endswith("/rio/delta"):
@@ -169,8 +189,10 @@ class SwarmLocNode:
         self._enqueue(float(rows[0]["stamp"]), "nb", rows[0])
 
     def _on_rebroadcast(self, msg) -> None:
-        # Stored for P2-6 (D8/D11). Subscribed now so the live graph is complete.
-        return
+        rows = unpack_bearing(msg)
+        if rows.size == 0:
+            return
+        self._enqueue(float(rows[0]["stamp"]), "rb", rows)
 
     def _drain(self) -> None:
         max_age = float(self.cfg["measurements"]["max_measurement_age_s"])
@@ -185,6 +207,8 @@ class SwarmLocNode:
                 self._store_neighbor(payload)
             elif kind == "uwb":
                 self._apply_uwb_rows(payload)
+            elif kind == "rb":
+                self._apply_rebroadcast(payload)
 
     def _store_neighbor(self, row) -> None:
         j = int(row["drone_id"])
@@ -216,6 +240,16 @@ class SwarmLocNode:
             peer = int(row["peer_id"])
             if flags & FLAG_BEARING_VALID:
                 self._n_bearing_period += 1
+                if use_bearing and math.isfinite(float(row["z"])):
+                    self._own_bearing[peer] = {
+                        "stamp": float(self.st.stamp),
+                        "range_m": float(row["range_m"]),
+                        "azimuth_rad": float(row["azimuth_rad"]),
+                        "elevation_rad": float(row["elevation_rad"]),
+                        "sigma_range_m": float(row["sigma_range_m"]),
+                        "sigma_az_rad": float(row["sigma_az_rad"]),
+                        "sigma_el_rad": float(row["sigma_el_rad"]),
+                    }
                 self._pending_rebroadcast.append(
                     {
                         "stamp": float(self.st.stamp),
@@ -256,6 +290,8 @@ class SwarmLocNode:
             meas = from_edge(self.st, nb["p"], edge, self.cfg)
             if meas is not None:
                 self.st, _ = update(self.st, meas, self.cfg, P_j=nb["P"], fusion="ci")
+            if use_bearing:
+                self._try_mutual_yaw(peer)
             if use_rr and (flags & FLAG_RANGE_VALID):
                 w = self._range_win[peer]
                 w.append((float(self.st.stamp), float(row["range_m"]), float(row["sigma_range_m"])))
@@ -272,12 +308,130 @@ class SwarmLocNode:
                     if mrr is not None:
                         self.st, _ = update(self.st, mrr, self.cfg, P_j=nb["P"], fusion="ci")
 
+    def _apply_rebroadcast(self, rows) -> None:
+        if self.st.status == STATUS_DIVERGED:
+            return
+        use_rec = bool(self.cfg["measurements"].get("use_reciprocal_bearing", True))
+        use_my = bool(self.cfg["measurements"].get("use_mutual_yaw", True))
+        if self.abl.get("disable_bearing"):
+            use_rec = False
+            use_my = False
+        max_age = float(self.cfg["measurements"]["max_measurement_age_s"])
+        pair_dt = float(self.cfg["measurements"]["mutual_yaw_max_dt_s"])
+        for row in rows:
+            obs = int(row["observer_id"])
+            if obs == self.cf_id or int(row["peer_id"]) != self.cf_id:
+                continue
+            rec = {
+                "stamp": float(row["stamp"]),
+                "range_m": float(row["range_m"]),
+                "azimuth_rad": float(row["azimuth_rad"]),
+                "elevation_rad": float(row["elevation_rad"]),
+                "sigma_range_m": float(row["sigma_range_m"]),
+                "sigma_az_rad": float(row["sigma_az_rad"]),
+                "sigma_el_rad": float(row["sigma_el_rad"]),
+                "psi_observer": float(row["psi_observer"]),
+                "roll_observer": float(row["roll_observer"]),
+                "pitch_observer": float(row["pitch_observer"]),
+            }
+            self._peer_bearing_to_us[obs] = rec
+            nb = self._neighbors.get(obs)
+            if nb is None or abs(self.st.stamp - nb["stamp"]) > max_age:
+                continue
+            own = self._own_bearing.get(obs)
+            have_own = own is not None and abs(self.st.stamp - float(own["stamp"])) <= pair_dt
+            if use_rec and not have_own:
+                z_ji = bearing_xyz(rec["range_m"], rec["azimuth_rad"], rec["elevation_rad"])
+                meas = reciprocal_relpos(
+                    self.st.p,
+                    nb["p"],
+                    rec["psi_observer"],
+                    rec["pitch_observer"],
+                    rec["roll_observer"],
+                    z_ji,
+                    rec["sigma_range_m"],
+                    rec["sigma_az_rad"],
+                    rec["sigma_el_rad"],
+                    rec["range_m"],
+                    rec["azimuth_rad"],
+                    rec["elevation_rad"],
+                )
+                if meas is not None:
+                    self.st, info = update(self.st, meas, self.cfg, P_j=nb["P"], fusion="ci")
+                    if info.get("accepted"):
+                        self._n_reciprocal += 1
+            if use_my:
+                self._try_mutual_yaw(obs)
+
+    def _try_mutual_yaw(self, peer: int) -> None:
+        if not bool(self.cfg["measurements"].get("use_mutual_yaw", True)):
+            return
+        if self.abl.get("disable_bearing"):
+            return
+        own = self._own_bearing.get(peer)
+        rec = self._peer_bearing_to_us.get(peer)
+        nb = self._neighbors.get(peer)
+        if own is None or rec is None or nb is None:
+            return
+        pair_dt = float(self.cfg["measurements"]["mutual_yaw_max_dt_s"])
+        if abs(float(own["stamp"]) - float(rec["stamp"])) > pair_dt:
+            return
+        z_ij = bearing_xyz(own["range_m"], own["azimuth_rad"], own["elevation_rad"])
+        z_ji = bearing_xyz(rec["range_m"], rec["azimuth_rad"], rec["elevation_rad"])
+        Rij = cartesian_cov_from_spherical(
+            own["range_m"],
+            own["azimuth_rad"],
+            own["elevation_rad"],
+            own["sigma_range_m"],
+            own["sigma_az_rad"],
+            own["sigma_el_rad"],
+        )
+        Rji = cartesian_cov_from_spherical(
+            rec["range_m"],
+            rec["azimuth_rad"],
+            rec["elevation_rad"],
+            rec["sigma_range_m"],
+            rec["sigma_az_rad"],
+            rec["sigma_el_rad"],
+        )
+        meas = mutual_yaw(
+            self.st.psi,
+            self.st.pitch,
+            self.st.roll,
+            z_ij,
+            rec["psi_observer"],
+            rec["pitch_observer"],
+            rec["roll_observer"],
+            z_ji,
+            Rij,
+            Rji,
+        )
+        if meas is None:
+            return
+        self.st, info = update(self.st, meas, self.cfg, P_j=nb["P"], fusion="ci")
+        if info.get("accepted"):
+            self._n_mutual_yaw += 1
+            self._own_bearing.pop(peer, None)
+            self._peer_bearing_to_us.pop(peer, None)
+
     def _on_tick(self) -> None:
         now_wall = time.time()
         self._drain()
         row = state_row_from_filter(self.st, self._seq, self._n_bearing_period)
         msg = pack_state([row], self.st.stamp, "world")
         self._pub_est.publish(msg)
+        pose = PoseStamped()
+        pose.header.frame_id = "world"
+        sec = int(self.st.stamp)
+        pose.header.stamp.sec = sec
+        pose.header.stamp.nanosec = int((self.st.stamp - sec) * 1e9)
+        pose.pose.position.x = float(self.st.p[0])
+        pose.pose.position.y = float(self.st.p[1])
+        pose.pose.position.z = float(self.st.p[2])
+        hy = 0.5 * float(self.st.psi)
+        pose.pose.orientation.z = math.sin(hy)
+        pose.pose.orientation.w = math.cos(hy)
+        self._pub_pose.publish(pose)
         for item in self._tx.pop_ready(now_wall):
             kind, payload = item
             if kind == "bc":
@@ -295,6 +449,15 @@ class SwarmLocNode:
         self._tx.push(now_wall, ("brg", brg))
         self._pending_rebroadcast = []
         self._n_bearing_period = 0
+        if now_wall - self._last_metric_wall >= 5.0:
+            elapsed = max(now_wall - self._t0_wall, 1e-6)
+            rate = self._n_mutual_yaw / elapsed
+            print(
+                f"[swarm_loc cf={self.cf_id}] n_mutual_yaw_pairs_per_s={rate:.4f} "
+                f"n_mutual_yaw={self._n_mutual_yaw} n_reciprocal={self._n_reciprocal}",
+                flush=True,
+            )
+            self._last_metric_wall = now_wall
 
 
 def _run_node(args) -> int:
@@ -346,6 +509,8 @@ def run_selftest() -> int:
     check("1b own uwb", "/cf_1/uwb/edges" in topics)
     check("1c neighbor broadcast", "/cf_0/swarm_loc/broadcast" in topics)
     check("1d no self broadcast sub", "/cf_1/swarm_loc/broadcast" not in topics)
+    check("1f neighbor rebroadcast", "/cf_0/swarm_loc/bearing_rebroadcast" in topics)
+    check("1g no self rebroadcast sub", "/cf_1/swarm_loc/bearing_rebroadcast" not in topics)
     check("1e entrance peer edges", "/uwb/peer_1000/edges" in topics)
     leaked = topics_contain_truth(topics)
     check("2 no truth topics", leaked == [], str(leaked))
