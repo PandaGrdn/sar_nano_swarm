@@ -40,6 +40,8 @@
 #       --no-swarm-loc   Skip per-drone swarm-loc estimator + RIO stub (P2-5).
 #       --swarm-loc-config PATH
 #                         Path to swarm_loc.yaml [default: configs/estimation/swarm_loc.yaml]
+#       --swarm-loc-log-dir PATH
+#                         Per-drone measurement .npz for central_reference.py (P2-7).
 #       --no-rviz        Skip RViz launch.
 #       --headless       Skip Gazebo GUI (server + SITL only, useful for CI).
 #       --check          Gate-check mode: start headless, wait 15 s, verify
@@ -87,6 +89,7 @@ Usage: ./eval_scripts/phase0_gate.sh [OPTIONS]
       --uwb-config PATH  uwb_pdoa.yaml [default: configs/sensors/uwb_pdoa.yaml]
       --no-swarm-loc   Skip swarm-loc estimator + RIO stub
       --swarm-loc-config PATH  swarm_loc.yaml [default: configs/estimation/swarm_loc.yaml]
+      --swarm-loc-log-dir PATH  write cf_<i>.npz measurement logs (P2-7)
       --no-rviz        Skip RViz
       --headless       Skip Gazebo GUI
       --check          Headless gate-check (prints PASS/FAIL)
@@ -113,6 +116,7 @@ USE_UWB=true
 UWB_CONFIG=""
 USE_SWARM_LOC=true
 SWARM_LOC_CONFIG=""
+SWARM_LOC_LOG_DIR=""
 USE_RVIZ=true
 USE_GUI=true
 GATE_CHECK=false
@@ -137,6 +141,7 @@ while [[ $# -gt 0 ]]; do
     --uwb-config) UWB_CONFIG="$2"; shift 2 ;;
     --no-swarm-loc) USE_SWARM_LOC=false; shift ;;
     --swarm-loc-config) SWARM_LOC_CONFIG="$2"; shift 2 ;;
+    --swarm-loc-log-dir) SWARM_LOC_LOG_DIR="$2"; shift 2 ;;
     --no-rviz)    USE_RVIZ=false;   shift   ;;
     --headless)   USE_GUI=false;    shift   ;;
     --check)      GATE_CHECK=true; USE_RVIZ=false; USE_GUI=false; shift ;;
@@ -476,12 +481,25 @@ if [[ "$USE_SWARM_LOC" == true ]]; then
     warn "ros2 not on PATH — skipping swarm-loc (source setup_env.sh)."
   else
     info "Starting RIO stub + swarm-loc ($_cfg, ${NUM_DRONES} drones) …"
+    _log_dir=""
+    if [[ -n "$SWARM_LOC_LOG_DIR" ]]; then
+      _log_dir="$SWARM_LOC_LOG_DIR"
+      [[ "$_log_dir" != /* ]] && _log_dir="$SAR_NANO_SWARM_ROOT/$_log_dir"
+      mkdir -p "$_log_dir"
+      info "swarm-loc measurement logs → $_log_dir"
+    fi
     for i in $(seq 0 $((NUM_DRONES - 1))); do
       python3 -u "$SAR_NANO_SWARM_ROOT/perception/swarm_loc/rio_stub.py" \
         --cf-id "$i" --config "$_cfg" &
       _PIDS+=($!)
-      python3 -u "$SAR_NANO_SWARM_ROOT/perception/swarm_loc/swarm_loc_node.py" \
-        --cf-id "$i" --num-drones "$NUM_DRONES" --config "$_cfg" &
+      if [[ -n "$_log_dir" ]]; then
+        python3 -u "$SAR_NANO_SWARM_ROOT/perception/swarm_loc/swarm_loc_node.py" \
+          --cf-id "$i" --num-drones "$NUM_DRONES" --config "$_cfg" \
+          --log-measurements "$_log_dir" &
+      else
+        python3 -u "$SAR_NANO_SWARM_ROOT/perception/swarm_loc/swarm_loc_node.py" \
+          --cf-id "$i" --num-drones "$NUM_DRONES" --config "$_cfg" &
+      fi
       _PIDS+=($!)
     done
   fi

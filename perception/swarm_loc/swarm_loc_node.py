@@ -6,6 +6,7 @@ Must never subscribe to /cf_*/odom, /uwb/edges_truth, or /cf_*/flow/debug_truth.
 
 Usage (setup_env.sh sourced):
     python3 -u perception/swarm_loc/swarm_loc_node.py --cf-id 0 --num-drones 3
+    python3 -u perception/swarm_loc/swarm_loc_node.py --cf-id 0 --log-measurements logs/
     python3 perception/swarm_loc/swarm_loc_node.py --selftest
 """
 from __future__ import annotations
@@ -27,6 +28,13 @@ for _p in ("perception/swarm_loc", "perception/uwb_sim"):
         sys.path.insert(0, str(_REPO_ROOT / _p))
 
 from ekf import propagate, update  # noqa: E402
+from meas_log import (  # noqa: E402
+    KIND_ENTRANCE_RELPOS,
+    KIND_RELPOS,
+    MeasurementLogger,
+    kind_from_edge,
+    resolve_log_path,
+)
 from measurements import (  # noqa: E402
     cartesian_cov_from_spherical,
     from_edge,
@@ -98,10 +106,12 @@ def _stamp_msg(msg) -> float:
 class SwarmLocNode:
     """Filter loop. Instantiated only after rclpy import (see _run_node)."""
 
-    def __init__(self, node, cf_id: int, num_drones: int, cfg: dict):
+    def __init__(self, node, cf_id: int, num_drones: int, cfg: dict, log_path=None):
         from geometry_msgs.msg import PoseStamped
         from rclpy.qos import qos_profile_sensor_data
         from sensor_msgs.msg import PointCloud2
+
+        self._PoseStamped = PoseStamped
 
         self.node = node
         self.cf_id = int(cf_id)
@@ -122,6 +132,9 @@ class SwarmLocNode:
         self._n_reciprocal = 0
         self._t0_wall = time.time()
         self._last_metric_wall = self._t0_wall
+        self._log = None
+        if log_path:
+            self._log = MeasurementLogger(self.cf_id, resolve_log_path(str(log_path), self.cf_id))
         rng = np.random.default_rng(int(cfg.get("seed", 0)) + self.cf_id)
         comms = cfg["comms"]
         self._tx = DelayedDropQueue(
@@ -173,6 +186,16 @@ class SwarmLocNode:
         delta = rio_delta_from_row(rows[0])
         if self.st.status != STATUS_DIVERGED:
             self.st = propagate(self.st, delta, self.cfg)
+        if self._log is not None:
+            self._log.add_rio(
+                delta.stamp,
+                delta.dt,
+                delta.delta_p_body,
+                delta.delta_psi,
+                delta.roll,
+                delta.pitch,
+                delta.valid,
+            )
         self._drain()
 
     def _on_uwb(self, msg) -> None:
@@ -277,6 +300,8 @@ class SwarmLocNode:
                 edge = {n: row[n] for n in row.dtype.names}
                 edge["flags"] = flags & ~FLAG_BEARING_VALID
                 edge["z"] = float("nan")
+            if self._log is not None:
+                self._log_uwb_edge(edge, peer)
             if surveyed:
                 meas = from_edge(self.st, None, edge, self.cfg)
                 if meas is not None:
@@ -420,7 +445,9 @@ class SwarmLocNode:
         row = state_row_from_filter(self.st, self._seq, self._n_bearing_period)
         msg = pack_state([row], self.st.stamp, "world")
         self._pub_est.publish(msg)
-        pose = PoseStamped()
+        if self._log is not None and self.st.stamp > 0.0:
+            self._log.add_est(self.st.stamp, self.st.p, self.st.v, self.st.psi, self.st.status)
+        pose = self._PoseStamped()
         pose.header.frame_id = "world"
         sec = int(self.st.stamp)
         pose.header.stamp.sec = sec
@@ -459,6 +486,41 @@ class SwarmLocNode:
             )
             self._last_metric_wall = now_wall
 
+    def _log_uwb_edge(self, edge, peer: int) -> None:
+        use_bearing = bool(self.cfg["measurements"].get("use_bearing", True))
+        if self.abl.get("disable_bearing"):
+            use_bearing = False
+        kind = kind_from_edge(edge, use_bearing)
+        z = None
+        if kind in (KIND_RELPOS, KIND_ENTRANCE_RELPOS):
+            z = [
+                float(edge["x"] if not isinstance(edge, dict) else edge.get("x", float("nan"))),
+                float(edge["y"] if not isinstance(edge, dict) else edge.get("y", float("nan"))),
+                float(edge["z"] if not isinstance(edge, dict) else edge.get("z", float("nan"))),
+            ]
+        self._log.add_uwb(
+            float(self.st.stamp),
+            kind,
+            self.cf_id,
+            int(peer),
+            float(edge["range_m"]),
+            float(edge["azimuth_rad"]),
+            float(edge["elevation_rad"]),
+            float(edge["sigma_range_m"]),
+            float(edge["sigma_az_rad"]),
+            float(edge["sigma_el_rad"]),
+            float(self.st.psi),
+            float(self.st.roll),
+            float(self.st.pitch),
+            z,
+        )
+
+    def flush_log(self) -> None:
+        if self._log is None:
+            return
+        path = self._log.save()
+        print(f"[swarm_loc cf={self.cf_id}] wrote measurements {path}", flush=True)
+
 
 def _run_node(args) -> int:
     cfg = load_config(resolve_config_path(args.config))
@@ -474,7 +536,13 @@ def _run_node(args) -> int:
     class _Node(Node):
         def __init__(self):
             super().__init__(f"swarm_loc_{args.cf_id}")
-            self.impl = SwarmLocNode(self, args.cf_id, args.num_drones, cfg)
+            self.impl = SwarmLocNode(
+                self,
+                args.cf_id,
+                args.num_drones,
+                cfg,
+                log_path=args.log_measurements or None,
+            )
 
     rclpy.init()
     node = _Node()
@@ -483,6 +551,7 @@ def _run_node(args) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        node.impl.flush_log()
         node.destroy_node()
         rclpy.shutdown()
     return 0
@@ -522,6 +591,8 @@ def run_selftest() -> int:
         "2c edges_truth caught",
         "/uwb/edges_truth" in topics_contain_truth(["/uwb/edges_truth"]),
     )
+    check("3 log path file", resolve_log_path("run/cf_0.npz", 2).name == "cf_0.npz")
+    check("3b log path dir", str(resolve_log_path("run", 2)).replace("\\", "/").endswith("run/cf_2.npz"))
     print(f"[selftest] {n_pass} passed, {n_fail} failed")
     print("[selftest] " + ("ALL PASS" if ok else "FAILED"))
     return 0 if ok else 1
@@ -533,6 +604,11 @@ def main():
     parser.add_argument("--config", default="configs/estimation/swarm_loc.yaml")
     parser.add_argument("--cf-id", type=int, default=0)
     parser.add_argument("--num-drones", type=int, default=3)
+    parser.add_argument(
+        "--log-measurements",
+        default="",
+        help="directory or .npz path; one file per drone for central_reference.py",
+    )
     args = parser.parse_args()
     if args.selftest:
         sys.exit(run_selftest())
