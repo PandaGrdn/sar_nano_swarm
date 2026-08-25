@@ -7,6 +7,7 @@ Prereq: sim from phase0_gate.sh, e.g.
 
 Usage (setup_env.sh sourced):
     python3 -u eval_scripts/swarm_loc_gate.py --num-drones 3 --duration 300
+    python3 -u eval_scripts/swarm_loc_gate.py --num-drones 3 --eval-dir /tmp/swarm_loc_eval
     python3 eval_scripts/swarm_loc_gate.py --selftest
 """
 from __future__ import annotations
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -32,7 +34,7 @@ if os.path.join(_REPO_ROOT, "eval_scripts") not in sys.path:
     sys.path.insert(0, os.path.join(_REPO_ROOT, "eval_scripts"))
 
 from swarm_loc_node import topics_contain_truth  # noqa: E402
-from swarm_msgs import unpack_state  # noqa: E402
+from swarm_msgs import STATE_DTYPE, unpack_state  # noqa: E402
 
 _RESTART_MSG = (
     "[swarm_loc_gate] Restart sim before retrying:\n"
@@ -115,13 +117,13 @@ def _wait_for_sitl(n: int, connect_wait: float) -> None:
     while time.time() < deadline:
         if all(_port_bound(p) for p in ports):
             n_cf2 = _count_cf2()
-            print(f"[swarm_loc_gate] SITL UDP ports up (cf2={n_cf2}) — settle 5 s …")
+            print(f"[swarm_loc_gate] SITL UDP ports up (cf2={n_cf2}) — settle 8 s …")
             if n_cf2 >= 0 and n_cf2 < n:
                 print(
                     f"[swarm_loc_gate] WARN: only {n_cf2}/{n} cf2 processes",
                     file=sys.stderr,
                 )
-            time.sleep(5.0)
+            time.sleep(8.0)
             return
         time.sleep(0.5)
     raise SystemExit(
@@ -180,7 +182,7 @@ def parse_ros2_node_info_subscribers(text: str) -> List[str]:
     return topics
 
 
-def node_info_subscribers(node_name: str) -> List[str]:
+def node_info_subscribers(node_name: str, quiet: bool = False) -> List[str]:
     names = [node_name]
     if node_name.startswith("/"):
         names.append(node_name[1:])
@@ -203,12 +205,12 @@ def node_info_subscribers(node_name: str) -> List[str]:
         topics = parse_ros2_node_info_subscribers(last)
         if topics:
             return topics
-    if last.strip():
+    if last.strip() and not quiet:
         print(f"[swarm_loc_gate] ros2 node info raw ({node_name}):\n{last[:800]}", file=sys.stderr)
     return []
 
 
-def inspect_estimator_subs(num_drones: int, attempts: int = 8) -> Tuple[bool, Dict[int, list], Dict[int, list]]:
+def inspect_estimator_subs(num_drones: int, attempts: int = 20) -> Tuple[bool, Dict[int, list], Dict[int, list]]:
     """Retry until each /swarm_loc_i lists subscribers. Fail only on truth topics."""
     truth_hits: Dict[int, list] = {}
     all_subs: Dict[int, list] = {}
@@ -217,8 +219,9 @@ def inspect_estimator_subs(num_drones: int, attempts: int = 8) -> Tuple[bool, Di
     for attempt in range(attempts):
         leaked_any = False
         readable = True
+        last = attempt == attempts - 1
         for i in range(num_drones):
-            subs = node_info_subscribers(f"/swarm_loc_{i}")
+            subs = node_info_subscribers(f"/swarm_loc_{i}", quiet=not last)
             all_subs[i] = subs
             leaked = topics_contain_truth(subs)
             truth_hits[i] = leaked
@@ -228,19 +231,21 @@ def inspect_estimator_subs(num_drones: int, attempts: int = 8) -> Tuple[bool, Di
                 readable = False
         if readable or leaked_any:
             break
-        time.sleep(0.5)
+        time.sleep(1.0)
     return (readable and not leaked_any), truth_hits, all_subs
 
 
 class EstimateRecorder:
     def __init__(self, num_drones: int):
         import rclpy
+        from nav_msgs.msg import Odometry
         from rclpy.executors import MultiThreadedExecutor
         from rclpy.node import Node
         from rclpy.qos import qos_profile_sensor_data
         from sensor_msgs.msg import PointCloud2
 
         self.rows: Dict[int, list] = {i: [] for i in range(num_drones)}
+        self.truth: Dict[int, list] = {i: [] for i in range(num_drones)}
 
         class _Node(Node):
             def __init__(self_inner):
@@ -251,6 +256,12 @@ class EstimateRecorder:
                         PointCloud2,
                         f"/cf_{i}/swarm_loc/estimate",
                         lambda msg, idx=i: self._on_est(idx, msg),
+                        qos,
+                    )
+                    self_inner.create_subscription(
+                        Odometry,
+                        f"/cf_{i}/odom",
+                        lambda msg, idx=i: self._on_odom(idx, msg),
                         qos,
                     )
 
@@ -265,6 +276,35 @@ class EstimateRecorder:
         arr = unpack_state(msg)
         if arr.size:
             self.rows[idx].append((time.time(), arr[0]))
+
+    def _on_odom(self, idx: int, msg) -> None:
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        stamp = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+        yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
+        self.truth[idx].append((stamp, float(p.x), float(p.y), float(p.z), float(yaw)))
+
+    def dump_eval(self, out_dir: str) -> None:
+        from eval_6_1 import TRUTH_DTYPE, write_eval_bundle
+
+        estimates = {}
+        truth = {}
+        for i, rec in self.rows.items():
+            if rec:
+                estimates[i] = np.array([row for _, row in rec], dtype=STATE_DTYPE)
+            else:
+                estimates[i] = np.zeros(0, dtype=STATE_DTYPE)
+        for i, rec in self.truth.items():
+            arr = np.zeros(len(rec), dtype=TRUTH_DTYPE)
+            for k, (stamp, x, y, z, psi) in enumerate(rec):
+                arr[k]["stamp"] = stamp
+                arr[k]["p_x"], arr[k]["p_y"], arr[k]["p_z"] = x, y, z
+                arr[k]["psi"] = psi
+            truth[i] = arr
+        write_eval_bundle(Path(out_dir), estimates, truth)
 
     def shutdown(self) -> None:
         try:
@@ -336,8 +376,9 @@ def connect_drones(args) -> list:
         t.start()
         if not done.wait(timeout_s):
             print(
-                "[swarm_loc_gate] cflib parallel open timed out "
-                "(radios wedged — usual after a crashed gate). Falling back to --no-fly.",
+                "[swarm_loc_gate] cflib parallel open timed out. "
+                "Do not treat this as a flight. Restart sim (pkill gz sim/cf2) and retry. "
+                "A hung cflib thread may still hold UDP — --no-fly fallback is not a fly.",
                 file=sys.stderr,
             )
             return None
@@ -510,13 +551,23 @@ def main():
     parser.add_argument("--hover-height", type=float, default=0.5)
     parser.add_argument("--duration", type=float, default=300.0)
     parser.add_argument("--connect-wait", type=float, default=90.0)
-    parser.add_argument("--connect-timeout", type=float, default=60.0)
+    parser.add_argument("--connect-timeout", type=float, default=90.0)
     parser.add_argument(
         "--no-fly",
         action="store_true",
         help="Skip cflib (drones stay on the ground). Still checks estimate rate / no-truth / diverge.",
     )
     parser.add_argument("--no-mlflow", action="store_true")
+    parser.add_argument(
+        "--eval-dir",
+        default="",
+        help="Write truth.npz + estimates.npz (odom subscribed here only) and run §6.1 metrics.",
+    )
+    parser.add_argument(
+        "--logs",
+        default="",
+        help="Measurement log dir from phase0_gate.sh --swarm-loc-log-dir (UWB mix / hops / CPU).",
+    )
     args = parser.parse_args()
     if args.selftest:
         sys.exit(run_selftest())
@@ -529,6 +580,8 @@ def main():
     n = int(args.num_drones)
 
     flight_fail = False
+    fly_fallback = False
+    explicit_no_fly = bool(args.no_fly)
     recorder = None
     try:
         if args.no_fly:
@@ -538,9 +591,13 @@ def main():
         else:
             scfs = connect_drones(args)
             if scfs is None:
-                args.no_fly = True
+                fly_fallback = True
                 recorder = EstimateRecorder(n)
-                print(f"[swarm_loc_gate] --no-fly fallback: recording {args.duration:.0f} s …")
+                print(
+                    "[swarm_loc_gate] radios did not connect — recording estimates on the ground. "
+                    "flight check will FAIL. Kill sim leftovers and rerun for a real fly.",
+                    flush=True,
+                )
                 time.sleep(float(args.duration))
             else:
                 recorder = EstimateRecorder(n)
@@ -572,7 +629,10 @@ def main():
     checks["finite"] = finite_ok
     checks["non_diverged"] = (not diverged) and (not flight_fail)
     checks["no_truth_subs"] = no_truth
-    checks["flight"] = not flight_fail
+    if explicit_no_fly:
+        checks["flight"] = True
+    else:
+        checks["flight"] = (not flight_fail) and (not fly_fallback)
     gate_pass = all(checks.values())
 
     print("\n[swarm_loc_gate] results:")
@@ -582,6 +642,27 @@ def main():
     for k, v in checks.items():
         print(f"  {'PASS' if v else 'FAIL'} {k}")
     print(f"\n[swarm_loc_gate] {'PASS' if gate_pass else 'FAIL'}")
+
+    eval_dir = args.eval_dir.strip()
+    if eval_dir and recorder is not None:
+        out = Path(eval_dir)
+        recorder.dump_eval(out)
+        n_truth = sum(len(recorder.truth[i]) for i in range(n))
+        print(f"[swarm_loc_gate] wrote {out / 'truth.npz'} and estimates.npz (odom samples={n_truth})")
+        logs = args.logs.strip() or (str(out) if list(out.glob("cf_*.npz")) else "")
+        try:
+            from eval_6_1 import evaluate, load_run, load_structured_npz, print_report, TRUTH_DTYPE
+
+            run = load_run(logs) if logs and Path(logs).exists() else None
+            truth = load_structured_npz(out / "truth.npz", TRUTH_DTYPE)
+            estimates = load_structured_npz(out / "estimates.npz")
+            report = evaluate(run, truth, estimates, out_dir=out)
+            print_report(report)
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            print(f"[swarm_loc_gate] eval_6_1 skipped: {e}", file=sys.stderr)
 
     if not args.no_mlflow:
         try:

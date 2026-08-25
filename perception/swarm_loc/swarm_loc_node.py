@@ -130,6 +130,16 @@ class SwarmLocNode:
         self._peer_bearing_to_us: Dict[int, dict] = {}
         self._n_mutual_yaw = 0
         self._n_reciprocal = 0
+        self._n_az_only = 0
+        self._n_update = 0
+        self._n_accept = 0
+        self._n_nis = 0
+        self._n_prop = 0
+        self._cpu_prop = 0.0
+        self._cpu_upd = 0.0
+        self._n_tx_bytes = 0
+        self._sum_nis = 0.0
+        self._n_nis_samples = 0
         self._t0_wall = time.time()
         self._last_metric_wall = self._t0_wall
         self._log = None
@@ -177,6 +187,24 @@ class SwarmLocNode:
         heapq.heappush(self._buf, (float(stamp), self._buf_seq, kind, payload))
         self._buf_seq += 1
 
+    def _apply_update(self, meas, P_j=None, fusion=None):
+        """Timed EKF update; counts NIS rejects (D16) for §6.1."""
+        if meas is None:
+            return {}
+        t0 = time.perf_counter()
+        self.st, info = update(self.st, meas, self.cfg, P_j=P_j, fusion=fusion)
+        self._cpu_upd += time.perf_counter() - t0
+        self._n_update += 1
+        if info.get("accepted"):
+            self._n_accept += 1
+        if info.get("reason") == "nis_gate":
+            self._n_nis += 1
+        nis = info.get("nis", float("nan"))
+        if isinstance(nis, (int, float)) and math.isfinite(float(nis)):
+            self._sum_nis += float(nis)
+            self._n_nis_samples += 1
+        return info
+
     def _on_rio(self, msg) -> None:
         if self.abl.get("disable_rio"):
             return
@@ -185,7 +213,10 @@ class SwarmLocNode:
             return
         delta = rio_delta_from_row(rows[0])
         if self.st.status != STATUS_DIVERGED:
+            t0 = time.perf_counter()
             self.st = propagate(self.st, delta, self.cfg)
+            self._cpu_prop += time.perf_counter() - t0
+            self._n_prop += 1
         if self._log is not None:
             self._log.add_rio(
                 delta.stamp,
@@ -261,6 +292,8 @@ class SwarmLocNode:
         for row in rows:
             flags = int(row["flags"])
             peer = int(row["peer_id"])
+            if (flags & FLAG_BEARING_VALID) and not math.isfinite(float(row["z"])):
+                self._n_az_only += 1
             if flags & FLAG_BEARING_VALID:
                 self._n_bearing_period += 1
                 if use_bearing and math.isfinite(float(row["z"])):
@@ -303,18 +336,14 @@ class SwarmLocNode:
             if self._log is not None:
                 self._log_uwb_edge(edge, peer)
             if surveyed:
-                meas = from_edge(self.st, None, edge, self.cfg)
-                if meas is not None:
-                    self.st, _ = update(self.st, meas, self.cfg)
+                self._apply_update(from_edge(self.st, None, edge, self.cfg))
                 continue
             nb = self._neighbors.get(peer)
             if nb is None:
                 continue
             if abs(self.st.stamp - nb["stamp"]) > max_age:
                 continue
-            meas = from_edge(self.st, nb["p"], edge, self.cfg)
-            if meas is not None:
-                self.st, _ = update(self.st, meas, self.cfg, P_j=nb["P"], fusion="ci")
+            self._apply_update(from_edge(self.st, nb["p"], edge, self.cfg), P_j=nb["P"], fusion="ci")
             if use_bearing:
                 self._try_mutual_yaw(peer)
             if use_rr and (flags & FLAG_RANGE_VALID):
@@ -329,9 +358,11 @@ class SwarmLocNode:
                 )
                 if rr is not None:
                     dprime, sig = rr
-                    mrr = range_rate(self.st.p, self.st.v, nb["p"], nb["v"], dprime, sig)
-                    if mrr is not None:
-                        self.st, _ = update(self.st, mrr, self.cfg, P_j=nb["P"], fusion="ci")
+                    self._apply_update(
+                        range_rate(self.st.p, self.st.v, nb["p"], nb["v"], dprime, sig),
+                        P_j=nb["P"],
+                        fusion="ci",
+                    )
 
     def _apply_rebroadcast(self, rows) -> None:
         if self.st.status == STATUS_DIVERGED:
@@ -382,7 +413,7 @@ class SwarmLocNode:
                     rec["elevation_rad"],
                 )
                 if meas is not None:
-                    self.st, info = update(self.st, meas, self.cfg, P_j=nb["P"], fusion="ci")
+                    info = self._apply_update(meas, P_j=nb["P"], fusion="ci")
                     if info.get("accepted"):
                         self._n_reciprocal += 1
             if use_my:
@@ -433,7 +464,7 @@ class SwarmLocNode:
         )
         if meas is None:
             return
-        self.st, info = update(self.st, meas, self.cfg, P_j=nb["P"], fusion="ci")
+        info = self._apply_update(meas, P_j=nb["P"], fusion="ci")
         if info.get("accepted"):
             self._n_mutual_yaw += 1
             self._own_bearing.pop(peer, None)
@@ -461,6 +492,8 @@ class SwarmLocNode:
         self._pub_pose.publish(pose)
         for item in self._tx.pop_ready(now_wall):
             kind, payload = item
+            data = getattr(payload, "data", b"")
+            self._n_tx_bytes += len(data)
             if kind == "bc":
                 self._pub_bc.publish(payload)
             else:
@@ -518,6 +551,28 @@ class SwarmLocNode:
     def flush_log(self) -> None:
         if self._log is None:
             return
+        elapsed = max(time.time() - self._t0_wall, 1e-6)
+        n_upd = max(self._n_update, 1)
+        n_prop = max(self._n_prop, 1)
+        self._log.set_stats(
+            n_nis_reject=self._n_nis,
+            n_update=self._n_update,
+            n_accept=self._n_accept,
+            n_az_only=self._n_az_only,
+            n_mutual_yaw=self._n_mutual_yaw,
+            n_reciprocal=self._n_reciprocal,
+            n_mutual_yaw_pairs_per_s=self._n_mutual_yaw / elapsed,
+            nis_reject_rate=self._n_nis / n_upd if self._n_update else 0.0,
+            mean_nis=self._sum_nis / max(self._n_nis_samples, 1) if self._n_nis_samples else float("nan"),
+            cpu_prop_s=self._cpu_prop,
+            cpu_update_s=self._cpu_upd,
+            n_prop=self._n_prop,
+            cpu_per_step_s=(self._cpu_prop / n_prop) + (self._cpu_upd / n_upd),
+            n_tx_bytes=self._n_tx_bytes,
+            comms_bytes_per_s=self._n_tx_bytes / elapsed,
+            wall_s=elapsed,
+            n_diverged=1.0 if self.st.status == STATUS_DIVERGED else 0.0,
+        )
         path = self._log.save()
         print(f"[swarm_loc cf={self.cf_id}] wrote measurements {path}", flush=True)
 

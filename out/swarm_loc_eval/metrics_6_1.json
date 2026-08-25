@@ -1,0 +1,65 @@
+{
+  "per_drone": {
+    "0": {
+      "n": 4700,
+      "ate_rmse_m": 1.3728519726802486,
+      "ate_p50_m": 1.1625036294989415,
+      "ate_p95_m": 2.556244505533029,
+      "rpe_rmse_m": 0.6006988727449891,
+      "yaw_rmse_rad": 0.3462943574329536,
+      "mean_nees": 234.01946415633205,
+      "frac_nees_in_95": 0.16702127659574467,
+      "n_nees": 4700,
+      "n_rpe": 4567,
+      "yaw_rmse_deg": 19.841205150103033
+    },
+    "1": {
+      "n": 4725,
+      "ate_rmse_m": 1.3188442733236738,
+      "ate_p50_m": 1.2838920995781282,
+      "ate_p95_m": 1.9716192962847565,
+      "rpe_rmse_m": 0.40975460480956366,
+      "yaw_rmse_rad": 0.3285455407426978,
+      "mean_nees": 205.3188008820835,
+      "frac_nees_in_95": 0.19068783068783068,
+      "n_nees": 4725,
+      "n_rpe": 4588,
+      "yaw_rmse_deg": 18.82427286240002
+    },
+    "2": {
+      "n": 4701,
+      "ate_rmse_m": 1.622113887167389,
+      "ate_p50_m": 1.547952370422208,
+      "ate_p95_m": 2.605530348206376,
+      "rpe_rmse_m": 0.455891119323783,
+      "yaw_rmse_rad": 2.542734161392474,
+      "mean_nees": 286.69529478337745,
+      "frac_nees_in_95": 0.15018081259306532,
+      "n_nees": 4701,
+      "n_rpe": 4567,
+      "yaw_rmse_deg": 145.68793587152547
+    }
+  },
+  "hops": {
+    "0": -1,
+    "1": -1,
+    "2": -1
+  },
+  "ate_vs_hops_m": {},
+  "mix": {},
+  "rpe_dt_s": 1.0,
+  "aoa_fov_note": "bearing cone \u00b145\u00b0 (aoa_fov_deg 90); live mutual-yaw often ~0",
+  "plot_files": [
+    "/mnt/d/GitHub/gps_denied_drones/out/swarm_loc_eval/plots/00_dashboard.png",
+    "/mnt/d/GitHub/gps_denied_drones/out/swarm_loc_eval/plots/01_error_vs_hops.png",
+    "/mnt/d/GitHub/gps_denied_drones/out/swarm_loc_eval/plots/02_ate_vs_time.png",
+    "/mnt/d/GitHub/gps_denied_drones/out/swarm_loc_eval/plots/03_xyz_error_vs_time.png",
+    "/mnt/d/GitHub/gps_denied_drones/out/swarm_loc_eval/plots/04_yaw_error_vs_time.png",
+    "/mnt/d/GitHub/gps_denied_drones/out/swarm_loc_eval/plots/05_nees_vs_time.png",
+    "/mnt/d/GitHub/gps_denied_drones/out/swarm_loc_eval/plots/06_xy_topdown.png",
+    "/mnt/d/GitHub/gps_denied_drones/out/swarm_loc_eval/plots/07_z_vs_time.png",
+    "/mnt/d/GitHub/gps_denied_drones/out/swarm_loc_eval/plots/08_rpe_vs_time.png",
+    "/mnt/d/GitHub/gps_denied_drones/out/swarm_loc_eval/plots/09_uwb_mix.png",
+    "/mnt/d/GitHub/gps_denied_drones/out/swarm_loc_eval/plots/10_sigma_p_vs_time.png"
+  ]
+}

@@ -122,6 +122,7 @@ class MeasurementLogger:
         self.rio: List[np.void] = []
         self.uwb: List[np.void] = []
         self.est: List[np.void] = []
+        self.stats: dict = {}
 
     def add_rio(self, stamp, dt, dp, dpsi, roll, pitch, valid) -> None:
         row = np.zeros(1, dtype=RIO_DTYPE)[0]
@@ -183,6 +184,11 @@ class MeasurementLogger:
         row["status"] = int(status)
         self.est.append(row)
 
+    def set_stats(self, **kwargs) -> None:
+        if not hasattr(self, "stats"):
+            self.stats = {}
+        self.stats.update({k: float(v) for k, v in kwargs.items()})
+
     def save(self, path: Optional[Union[str, Path]] = None) -> Path:
         out = Path(path) if path is not None else self.path
         if out is None:
@@ -192,23 +198,27 @@ class MeasurementLogger:
         rio = np.array(self.rio, dtype=RIO_DTYPE) if self.rio else np.zeros(0, dtype=RIO_DTYPE)
         uwb = np.array(self.uwb, dtype=UWB_DTYPE) if self.uwb else np.zeros(0, dtype=UWB_DTYPE)
         est = np.array(self.est, dtype=EST_DTYPE) if self.est else np.zeros(0, dtype=EST_DTYPE)
-        np.savez(
-            out,
-            drone_id=np.int32(self.drone_id),
-            rio=rio,
-            uwb=uwb,
-            estimate=est,
-        )
+        payload = {
+            "drone_id": np.int32(self.drone_id),
+            "rio": rio,
+            "uwb": uwb,
+            "estimate": est,
+        }
+        for k, v in self.stats.items():
+            payload[f"stat_{k}"] = np.float64(v)
+        np.savez(out, **payload)
         return out
 
 
 def load_drone_log(path: Union[str, Path]) -> dict:
     z = np.load(path, allow_pickle=False)
+    stats = {k[5:]: float(z[k]) for k in z.files if k.startswith("stat_")}
     return {
         "drone_id": int(z["drone_id"]),
         "rio": np.array(z["rio"], dtype=RIO_DTYPE),
         "uwb": np.array(z["uwb"], dtype=UWB_DTYPE),
         "estimate": np.array(z["estimate"], dtype=EST_DTYPE),
+        "stats": stats,
         "path": str(path),
     }
 
@@ -259,6 +269,7 @@ def run_selftest() -> int:
         1.0, KIND_RELPOS, 1, 0, 1.5, 0.0, 0.0, 0.08, 0.08, 0.08, 0.1, 0.0, 0.0, [1.5, 0.0, 0.0]
     )
     log.add_est(1.0, [1.5, 0.0, 0.5], [0.0, 0.0, 0.0], 0.1, 0)
+    log.set_stats(n_nis_reject=3, cpu_update_s=0.01)
     with tempfile.TemporaryDirectory() as td:
         path = log.save(Path(td) / "cf_1.npz")
         run = load_run(td)
@@ -268,6 +279,7 @@ def run_selftest() -> int:
         check("3d est psi", abs(float(run[1]["estimate"][0]["psi"]) - 0.1) < 1e-6)
         one = load_run(path)
         check("3e load by file", 1 in one and one[1]["uwb"].shape[0] == 1)
+        check("3f stats roundtrip", abs(run[1]["stats"].get("n_nis_reject", 0) - 3) < 1e-9)
 
     print(f"[selftest] {n_pass} passed, {n_fail} failed")
     print("[selftest] " + ("ALL PASS" if ok else "FAILED"))

@@ -22,6 +22,14 @@ The plan’s “easy run vs hard run” comparison is `eval_scripts/central_refe
 
 Offline gate numbers (mean ATE over drones): easy bearing+entrance `cent=0.066` `dist=0.045` `|c-d|=0.090`; hard range-only mesh `cent=0.039` `dist=0.186`. The hard-run gap is the price of sequential CI vs a joint batch solve.
 
+## §6.1 — live ATE uses gate odom, not the estimator
+
+`eval_scripts/eval_6_1.py` is the §6.1 metric harness. The estimator still must not subscribe to `/cf_*/odom`. The gate records Gazebo odom into `truth.npz` (`swarm_loc_gate.py --eval-dir`) plus full `STATE_DTYPE` estimates (covariance for NEES). Measurement `cf_*.npz` files have no `P`; without `estimates.npz`, ATE still runs from the log means but NEES is skipped.
+
+CPU is laptop `perf_counter` against the GAP9 **20 ms** budget at 50 Hz (~150 int-GOp/s). It is not a GAP9 measurement. A design that only fits a laptop fails the plan's intent even if the number looks small here.
+
+RPE uses Δt = 1 s translation error. ATE is RMSE with **no SE(3) alignment** (entrance gauge). Hop count is BFS on the logged UWB graph from entrance id 1000.
+
 ## P2-8 — stress + ablations are offline; live knobs are files
 
 Blocking gate: `python3 perception/swarm_loc/stress.py --selftest` and `python3 eval_scripts/run_ablations.py --selftest`.
