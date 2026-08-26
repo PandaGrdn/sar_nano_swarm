@@ -94,14 +94,21 @@ def symmetrize(P: np.ndarray) -> np.ndarray:
     return 0.5 * (P + P.T)
 
 
+def project_psd(P: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+    w, V = np.linalg.eigh(symmetrize(P))
+    return symmetrize(V @ np.diag(np.maximum(w, eps)) @ V.T)
+
+
 def clamp_position_cov(P: np.ndarray, cfg: dict) -> np.ndarray:
     est = cfg["estimator"]
     lo = float(est["cov_floor_p_m"]) ** 2
     hi = float(est["max_cov_p_m"]) ** 2
     out = P.copy()
-    for i in range(3):
-        out[i, i] = float(np.clip(out[i, i], lo, hi))
-    return out
+    Pp = 0.5 * (out[0:3, 0:3] + out[0:3, 0:3].T)
+    w, V = np.linalg.eigh(Pp)
+    w = np.clip(w, lo, hi)
+    out[0:3, 0:3] = V @ np.diag(w) @ V.T
+    return symmetrize(out)
 
 
 @dataclass
@@ -113,6 +120,7 @@ class SwarmState:
     stamp: float = 0.0
     status: int = STATUS_OK
     drone_id: int = 0
+    t_last_gauge_s: float = float("nan")  # last accepted entrance update stamp
 
     @property
     def p(self) -> np.ndarray:
@@ -146,6 +154,7 @@ class SwarmState:
             stamp=self.stamp,
             status=self.status,
             drone_id=self.drone_id,
+            t_last_gauge_s=self.t_last_gauge_s,
         )
 
     @classmethod

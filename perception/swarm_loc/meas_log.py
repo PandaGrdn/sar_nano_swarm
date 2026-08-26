@@ -42,6 +42,27 @@ KIND_NAME = {
     KIND_MUTUAL_YAW: "mutual_yaw",
 }
 
+MEAS_NAME_ID = {
+    "range": 0,
+    "relpos": 1,
+    "range_rate": 2,
+    "reciprocal_relpos": 3,
+    "entrance_range": 4,
+    "entrance_relpos": 5,
+    "mutual_yaw": 6,
+    "az_only": 7,
+}
+ID_MEAS_NAME = {v: k for k, v in MEAS_NAME_ID.items()}
+
+NIS_DTYPE = np.dtype(
+    [
+        ("stamp", "<f8"),
+        ("name_id", "<u4"),
+        ("nis", "<f4"),
+        ("accepted", "<u4"),
+    ]
+)
+
 UWB_DTYPE = np.dtype(
     [
         ("stamp", "<f8"),
@@ -122,6 +143,7 @@ class MeasurementLogger:
         self.rio: List[np.void] = []
         self.uwb: List[np.void] = []
         self.est: List[np.void] = []
+        self.nis: List[np.void] = []
         self.stats: dict = {}
 
     def add_rio(self, stamp, dt, dp, dpsi, roll, pitch, valid) -> None:
@@ -184,6 +206,14 @@ class MeasurementLogger:
         row["status"] = int(status)
         self.est.append(row)
 
+    def add_nis(self, stamp: float, name: str, nis: float, accepted: bool) -> None:
+        row = np.zeros(1, dtype=NIS_DTYPE)[0]
+        row["stamp"] = float(stamp)
+        row["name_id"] = int(MEAS_NAME_ID.get(str(name), 99))
+        row["nis"] = float(nis) if math.isfinite(float(nis)) else float("nan")
+        row["accepted"] = 1 if accepted else 0
+        self.nis.append(row)
+
     def set_stats(self, **kwargs) -> None:
         if not hasattr(self, "stats"):
             self.stats = {}
@@ -198,11 +228,13 @@ class MeasurementLogger:
         rio = np.array(self.rio, dtype=RIO_DTYPE) if self.rio else np.zeros(0, dtype=RIO_DTYPE)
         uwb = np.array(self.uwb, dtype=UWB_DTYPE) if self.uwb else np.zeros(0, dtype=UWB_DTYPE)
         est = np.array(self.est, dtype=EST_DTYPE) if self.est else np.zeros(0, dtype=EST_DTYPE)
+        nis = np.array(self.nis, dtype=NIS_DTYPE) if self.nis else np.zeros(0, dtype=NIS_DTYPE)
         payload = {
             "drone_id": np.int32(self.drone_id),
             "rio": rio,
             "uwb": uwb,
             "estimate": est,
+            "nis": nis,
         }
         for k, v in self.stats.items():
             payload[f"stat_{k}"] = np.float64(v)
@@ -213,11 +245,13 @@ class MeasurementLogger:
 def load_drone_log(path: Union[str, Path]) -> dict:
     z = np.load(path, allow_pickle=False)
     stats = {k[5:]: float(z[k]) for k in z.files if k.startswith("stat_")}
+    nis = np.array(z["nis"], dtype=NIS_DTYPE) if "nis" in z.files else np.zeros(0, dtype=NIS_DTYPE)
     return {
         "drone_id": int(z["drone_id"]),
         "rio": np.array(z["rio"], dtype=RIO_DTYPE),
         "uwb": np.array(z["uwb"], dtype=UWB_DTYPE),
         "estimate": np.array(z["estimate"], dtype=EST_DTYPE),
+        "nis": nis,
         "stats": stats,
         "path": str(path),
     }
@@ -269,6 +303,7 @@ def run_selftest() -> int:
         1.0, KIND_RELPOS, 1, 0, 1.5, 0.0, 0.0, 0.08, 0.08, 0.08, 0.1, 0.0, 0.0, [1.5, 0.0, 0.0]
     )
     log.add_est(1.0, [1.5, 0.0, 0.5], [0.0, 0.0, 0.0], 0.1, 0)
+    log.add_nis(1.0, "relpos", 1.2, True)
     log.set_stats(n_nis_reject=3, cpu_update_s=0.01)
     with tempfile.TemporaryDirectory() as td:
         path = log.save(Path(td) / "cf_1.npz")
@@ -280,6 +315,7 @@ def run_selftest() -> int:
         one = load_run(path)
         check("3e load by file", 1 in one and one[1]["uwb"].shape[0] == 1)
         check("3f stats roundtrip", abs(run[1]["stats"].get("n_nis_reject", 0) - 3) < 1e-9)
+        check("3g nis rows", run[1]["nis"].shape[0] == 1)
 
     print(f"[selftest] {n_pass} passed, {n_fail} failed")
     print("[selftest] " + ("ALL PASS" if ok else "FAILED"))

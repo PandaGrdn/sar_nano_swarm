@@ -31,6 +31,7 @@ for _p in ("perception/swarm_loc", "perception/uwb_sim", "eval_scripts"):
         sys.path.insert(0, str(_REPO_ROOT / _p))
 
 from meas_log import (  # noqa: E402
+    ID_MEAS_NAME,
     KIND_ENTRANCE_RANGE,
     KIND_ENTRANCE_RELPOS,
     KIND_RANGE,
@@ -110,6 +111,8 @@ def paired_errors(est: np.ndarray, truth: np.ndarray) -> dict:
     yaw = []
     nees = []
     sig_p = []
+    eig_min = []
+    eig_max = []
     stamps = []
     poses = []
     gts = []
@@ -129,12 +132,17 @@ def paired_errors(est: np.ndarray, truth: np.ndarray) -> dict:
         if P is not None:
             P = 0.5 * (P + P.T) + 1e-12 * np.eye(3)
             sig_p.append(float(np.sqrt(max(np.trace(P) / 3.0, 0.0))))
+            w = np.linalg.eigvalsh(P)
+            eig_min.append(float(w[0]))
+            eig_max.append(float(w[-1]))
             try:
                 nees.append(float(e @ np.linalg.solve(P, e)))
             except np.linalg.LinAlgError:
                 nees.append(float("inf"))
         else:
             sig_p.append(float("nan"))
+            eig_min.append(float("nan"))
+            eig_max.append(float("nan"))
             nees.append(float("nan"))
     err = np.asarray(err, dtype=np.float64)
     yaw = np.asarray(yaw, dtype=np.float64)
@@ -179,6 +187,8 @@ def paired_errors(est: np.ndarray, truth: np.ndarray) -> dict:
         "rpe_m": rpe.tolist(),
         "nees": nees.tolist(),
         "sig_p": sig_p,
+        "eig_min": eig_min,
+        "eig_max": eig_max,
         "est_pose": pos_a.tolist(),
         "gt_pose": gts_a.tolist(),
         "mean_nees": float(np.mean(finite_nees)) if finite_nees.size else float("nan"),
@@ -278,6 +288,128 @@ def uwb_mix(run: Dict[int, dict]) -> dict:
     }
 
 
+def entrance_edges_vs_time(run: Dict[int, dict], bin_s: float = 1.0) -> dict:
+    """Per-second count of edges to peer 1000, split bearing vs range."""
+    by_drone: Dict[int, dict] = {}
+    for i, rec in run.items():
+        buckets: Dict[int, List[int]] = defaultdict(lambda: [0, 0])  # bearing, range
+        uwb = rec.get("uwb")
+        if uwb is None or uwb.size == 0:
+            by_drone[i] = {"t": [], "bearing": [], "range": []}
+            continue
+        for row in uwb:
+            if int(row["peer_id"]) != ENTRANCE_ID:
+                continue
+            sec = int(math.floor(float(row["stamp"]) / bin_s))
+            k = int(row["kind"])
+            if k == KIND_ENTRANCE_RELPOS:
+                buckets[sec][0] += 1
+            else:
+                buckets[sec][1] += 1
+        secs = sorted(buckets)
+        by_drone[i] = {
+            "t": [s * bin_s for s in secs],
+            "bearing": [buckets[s][0] for s in secs],
+            "range": [buckets[s][1] for s in secs],
+        }
+    return {str(i): v for i, v in by_drone.items()}
+
+
+def nis_by_type(run: Dict[int, dict]) -> dict:
+    acc: Dict[str, List[float]] = defaultdict(list)
+    n_rej: Dict[str, int] = defaultdict(int)
+    for rec in run.values():
+        nis = rec.get("nis")
+        if nis is None or getattr(nis, "size", 0) == 0:
+            continue
+        for row in nis:
+            name = ID_MEAS_NAME.get(int(row["name_id"]), f"id_{int(row['name_id'])}")
+            v = float(row["nis"])
+            if math.isfinite(v):
+                acc[name].append(v)
+            if int(row["accepted"]) == 0:
+                n_rej[name] += 1
+    out = {}
+    for name, vals in acc.items():
+        a = np.asarray(vals, dtype=np.float64)
+        out[name] = {
+            "n": int(a.size),
+            "mean": float(np.mean(a)),
+            "p50": float(np.median(a)),
+            "p95": float(np.percentile(a, 95)),
+            "n_reject": int(n_rej.get(name, 0)),
+            "samples": a.tolist()[:4000],
+        }
+    return out
+
+
+def centroid_vs_shape(
+    estimates: Dict[int, np.ndarray], truth: Dict[int, np.ndarray]
+) -> dict:
+    """Formation centroid error vs shape error (truth-aligned, no SE3)."""
+    ids = sorted(set(estimates) & set(truth))
+    if len(ids) < 2:
+        return {"t": [], "centroid_m": [], "shape_m": [], "mean_ate_m": []}
+    t_ref = None
+    for i in ids:
+        est = estimates[i]
+        if est is not None and getattr(est, "size", 0):
+            t_ref = np.asarray(est["stamp"], dtype=np.float64)
+            break
+    if t_ref is None or t_ref.size == 0:
+        return {"t": [], "centroid_m": [], "shape_m": [], "mean_ate_m": []}
+    # subsample to ~5 Hz
+    step = max(int(round(0.2 / max(float(np.median(np.diff(t_ref))), 1e-3))), 1)
+    t_use = t_ref[::step]
+    cent = []
+    shape = []
+    ate = []
+    t_out = []
+    for t in t_use:
+        pest = []
+        pgt = []
+        ok = True
+        for i in ids:
+            row = estimates[i]
+            ts = np.asarray(row["stamp"], dtype=np.float64)
+            k = int(np.argmin(np.abs(ts - t)))
+            if abs(ts[k] - t) > 0.25:
+                ok = False
+                break
+            gt = interp_pose(truth[i], float(ts[k]))
+            if gt is None:
+                ok = False
+                break
+            pest.append(np.array([row[k]["p_x"], row[k]["p_y"], row[k]["p_z"]], dtype=np.float64))
+            pgt.append(gt[0:3])
+        if not ok or len(pest) < 2:
+            continue
+        pe = np.stack(pest)
+        pg = np.stack(pgt)
+        ce = pe.mean(axis=0)
+        cg = pg.mean(axis=0)
+        se = pe - ce
+        sg = pg - cg
+        cent.append(float(np.linalg.norm(ce - cg)))
+        shape.append(float(np.sqrt(np.mean(np.sum((se - sg) ** 2, axis=1)))))
+        ate.append(float(np.mean(np.linalg.norm(pe - pg, axis=1))))
+        t_out.append(float(t))
+    return {
+        "t": t_out,
+        "centroid_m": cent,
+        "shape_m": shape,
+        "mean_ate_m": ate,
+        "mean_centroid_m": float(np.mean(cent)) if cent else float("nan"),
+        "mean_shape_m": float(np.mean(shape)) if shape else float("nan"),
+        "centroid_explains_ate": bool(
+            cent
+            and ate
+            and float(np.mean(cent)) > 0.7 * float(np.mean(ate))
+            and float(np.mean(shape)) < 0.5 * float(np.mean(ate))
+        ),
+    }
+
+
 def error_vs_hops(per_drone: Dict[int, dict], hops: Dict[int, int]) -> Dict[int, float]:
     buckets: Dict[int, List[float]] = defaultdict(list)
     for i, m in per_drone.items():
@@ -344,6 +476,15 @@ def evaluate(
     mix = uwb_mix(logs) if logs else {}
     if n_div_est:
         mix["n_diverged_estimate_rows"] = n_div_est
+    nis_raw = nis_by_type(logs) if logs else {}
+    diag = {
+        "entrance_edges": entrance_edges_vs_time(logs) if logs else {},
+        "centroid_shape": centroid_vs_shape(estimates, truth),
+        "nis_by_type": {
+            k: {kk: vv for kk, vv in v.items() if kk != "samples"} for k, v in nis_raw.items()
+        },
+        "nis_samples": {k: v.get("samples", []) for k, v in nis_raw.items()},
+    }
     report = {
         "per_drone": {
             str(i): {k: v for k, v in per[i].items() if k not in SERIES_KEYS}
@@ -354,6 +495,19 @@ def evaluate(
         "mix": mix,
         "rpe_dt_s": RPE_DT_S,
         "aoa_fov_note": "bearing cone ±45° (aoa_fov_deg 90); live mutual-yaw often ~0",
+        "diag": {
+            "entrance_edges": diag["entrance_edges"],
+            "centroid_shape": {
+                k: v
+                for k, v in diag["centroid_shape"].items()
+                if k not in ("t", "centroid_m", "shape_m", "mean_ate_m")
+            },
+            "centroid_shape_series": {
+                k: diag["centroid_shape"].get(k, [])
+                for k in ("t", "centroid_m", "shape_m", "mean_ate_m")
+            },
+            "nis_by_type": diag["nis_by_type"],
+        },
     }
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -369,7 +523,7 @@ def evaluate(
             json.dump(yaw_series, f)
         if write_png:
             report["plot_files"] = write_plots(
-                per, hops_ate, mix, estimates, truth, out_dir, show=show
+                per, hops_ate, mix, estimates, truth, out_dir, show=show, diag=diag
             )
             with (out_dir / "metrics_6_1.json").open("w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2, default=str)
@@ -405,6 +559,20 @@ def print_report(report: dict) -> None:
             f"diverged={mix.get('n_diverged', 0)}"
         )
         print(f"  {mix.get('cpu_note', '')}")
+    cs = (report.get("diag") or {}).get("centroid_shape") or {}
+    if cs:
+        print(
+            f"  centroid_mean={cs.get('mean_centroid_m', float('nan')):.3f} m  "
+            f"shape_mean={cs.get('mean_shape_m', float('nan')):.3f} m  "
+            f"centroid_explains_ATE={cs.get('centroid_explains_ate', False)}"
+        )
+    nis_t = (report.get("diag") or {}).get("nis_by_type") or {}
+    if nis_t:
+        bits = [
+            f"{k}:mean={v.get('mean', float('nan')):.2f}/n={v.get('n', 0)}/rej={v.get('n_reject', 0)}"
+            for k, v in sorted(nis_t.items())
+        ]
+        print("  NIS by type: " + "; ".join(bits))
     print(f"  {report.get('aoa_fov_note', '')}")
     files = report.get("plot_files") or []
     if files:
@@ -516,6 +684,9 @@ def run_selftest() -> int:
         pngs = list((td / "out" / "plots").glob("*.png")) if (td / "out" / "plots").is_dir() else []
         check("6b matplotlib pngs", len(pngs) >= 8, f"n={len(pngs)}")
         check("6c dashboard", (td / "out" / "plots" / "00_dashboard.png").is_file())
+        check("6d entrance-edge plot", (td / "out" / "plots" / "11_entrance_edges.png").is_file())
+        cs = report.get("diag", {}).get("centroid_shape") or {}
+        check("6e centroid vs shape keys", "mean_centroid_m" in cs)
         mix = report["mix"]
         check("7 bearing fraction", mix["frac_bearing"] > 0.2)
         check("7b NIS reject rate", abs(mix["nis_reject_rate"] - 2 / 180) < 1e-9, str(mix["nis_reject_rate"]))

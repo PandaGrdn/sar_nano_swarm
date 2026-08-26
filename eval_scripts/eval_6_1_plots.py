@@ -32,6 +32,8 @@ SERIES_KEYS = (
     "rpe_m",
     "nees",
     "sig_p",
+    "eig_min",
+    "eig_max",
     "est_pose",
     "gt_pose",
 )
@@ -161,9 +163,10 @@ def write_plots(
     truth: Dict[int, np.ndarray],
     out_dir: Path,
     show: bool = False,
+    diag: dict | None = None,
 ) -> List[str]:
     if os.environ.get("EVAL_6_1_PLOT_WORKER") == "1":
-        return _write_plots_impl(per, hops_ate, mix, estimates, truth, out_dir, show)
+        return _write_plots_impl(per, hops_ate, mix, estimates, truth, out_dir, show, diag)
     payload = {
         "per": per,
         "hops_ate": hops_ate,
@@ -172,6 +175,7 @@ def write_plots(
         "truth": truth,
         "out_dir": str(out_dir),
         "show": bool(show),
+        "diag": diag or {},
     }
     tmp = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
     tmp.close()
@@ -183,7 +187,7 @@ def write_plots(
         r = subprocess.run(cmd, env=_child_env(), cwd=str(Path(__file__).resolve().parents[1]))
         if r.returncode != 0:
             print("[eval_6_1] child plot failed, trying in-process …", flush=True)
-            return _write_plots_impl(per, hops_ate, mix, estimates, truth, out_dir, show)
+            return _write_plots_impl(per, hops_ate, mix, estimates, truth, out_dir, show, diag)
     finally:
         try:
             os.unlink(tmp.name)
@@ -202,6 +206,7 @@ def _write_plots_impl(
     truth: Dict[int, np.ndarray],
     out_dir: Path,
     show: bool = False,
+    diag: dict | None = None,
 ) -> List[str]:
     plt = _pyplot(interactive=show)
     try:
@@ -357,6 +362,67 @@ def _write_plots_impl(
     _maybe_legend(ax)
     save(fig, "10_sigma_p_vs_time.png")
 
+    diag = diag or {}
+    fig, ax = plt.subplots(figsize=(7.4, 4.2))
+    for key, series in (diag.get("entrance_edges") or {}).items():
+        t = series.get("t") or []
+        if not t:
+            continue
+        ax.plot(t, series.get("bearing") or [], label=f"cf_{key} bearing", lw=1.2)
+        ax.plot(t, series.get("range") or [], ls="--", label=f"cf_{key} range", lw=1.2)
+    ax.set_xlabel("t (s)")
+    ax.set_ylabel("edges / s to peer 1000")
+    ax.set_title("Entrance-edge count (bearing vs range-only)")
+    _maybe_legend(ax, fontsize=8)
+    save(fig, "11_entrance_edges.png")
+
+    fig, ax = plt.subplots(figsize=(7.4, 4.2))
+    cs = diag.get("centroid_shape") or {}
+    t = cs.get("t") or []
+    if t:
+        ax.plot(t, cs.get("mean_ate_m") or [], label="mean |p_err|", lw=1.2)
+        ax.plot(t, cs.get("centroid_m") or [], label="centroid error", lw=1.2)
+        ax.plot(t, cs.get("shape_m") or [], label="shape error", lw=1.2)
+    ax.set_xlabel("t (s)")
+    ax.set_ylabel("m")
+    ax.set_title("Centroid vs shape (gauge starvation if centroid≈ATE)")
+    _maybe_legend(ax)
+    save(fig, "12_centroid_vs_shape.png")
+
+    fig, ax = plt.subplots(figsize=(7.4, 4.2))
+    samples = diag.get("nis_samples") or {}
+    if samples:
+        labels = []
+        data = []
+        for name in sorted(samples):
+            vals = samples[name]
+            if vals:
+                labels.append(name)
+                data.append(vals)
+        if data:
+            ax.boxplot(data, labels=labels, showfliers=False)
+    ax.set_ylabel("NIS")
+    ax.set_title("Live NIS by measurement type")
+    ax.tick_params(axis="x", rotation=20)
+    save(fig, "13_nis_by_type.png")
+
+    fig, axes = plt.subplots(2, 1, figsize=(7.4, 6.4), sharex=True)
+    for i in ids:
+        t = per[i].get("err_t") or []
+        emin = per[i].get("eig_min") or []
+        emax = per[i].get("eig_max") or []
+        if t and emin:
+            axes[0].plot(t, emin, label=f"cf_{i}", lw=1.1)
+        if t and emax:
+            axes[1].plot(t, emax, label=f"cf_{i}", lw=1.1)
+    axes[0].set_ylabel("min eig P_p (m²)")
+    axes[1].set_ylabel("max eig P_p (m²)")
+    axes[1].set_xlabel("t (s)")
+    axes[0].set_title("Position covariance eigenvalues")
+    _maybe_legend(axes[0], fontsize=8)
+    _maybe_legend(axes[1], fontsize=8)
+    save(fig, "14_p_eigenvalues.png")
+
     fig, axes = plt.subplots(2, 2, figsize=(10.8, 7.8))
     ax = axes[0, 0]
     if hops_ate:
@@ -417,6 +483,7 @@ if __name__ == "__main__":
             payload["truth"],
             Path(payload["out_dir"]),
             show=bool(payload.get("show")),
+            diag=payload.get("diag") or {},
         )
         sys.exit(0)
     print("eval_6_1_plots.py is imported by eval_6_1.py", file=sys.stderr)

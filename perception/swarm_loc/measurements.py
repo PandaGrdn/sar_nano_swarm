@@ -36,6 +36,7 @@ from state import (  # noqa: E402
     SwarmState,
     dR_dpsi,
     rpy_to_R,
+    wrap_psi,
 )
 from uwb_edges import FLAG_BEARING_VALID, FLAG_PEER_IS_SURVEYED  # noqa: E402
 from uwb_model import bearing_xyz  # noqa: E402
@@ -102,6 +103,64 @@ def spherical_to_cartesian_jacobian(d: float, az: float, el: float) -> np.ndarra
     )
 
 
+def wrap_el(el: float) -> float:
+    """Keep elevation in (-π/2, π/2)."""
+    return float(np.clip(el, -0.5 * math.pi + 1e-9, 0.5 * math.pi - 1e-9))
+
+
+def _xyz_to_sph(z) -> Tuple[float, float, float]:
+    z = np.asarray(z, dtype=np.float64).reshape(3)
+    d = float(np.linalg.norm(z))
+    az = math.atan2(float(z[1]), float(z[0]))
+    el = math.atan2(float(z[2]), math.hypot(float(z[0]), float(z[1])))
+    return d, az, el
+
+
+def wrapped_cartesian_innovation(z, h) -> np.ndarray:
+    """z-h in Cartesian, but az/el innovations wrapped to [-π, π].
+
+    A 2π azimuth wrap would otherwise look like a huge Cartesian residual
+    if the residual were formed in spherical coords without wrapping.
+    """
+    z = np.asarray(z, dtype=np.float64).reshape(3)
+    h = np.asarray(h, dtype=np.float64).reshape(3)
+    dz, az_z, el_z = _xyz_to_sph(z)
+    dh, az_h, el_h = _xyz_to_sph(h)
+    if dh < EPS:
+        return z - h
+    r_sph = np.array(
+        [dz - dh, wrap_psi(az_z - az_h), wrap_psi(el_z - el_h)],
+        dtype=np.float64,
+    )
+    J = spherical_to_cartesian_jacobian(dh, az_h, el_h)
+    return J @ r_sph
+
+
+def wrap_measurement_residual(meas: Measurement) -> np.ndarray:
+    """Innovation used by the EKF, with 1-D angular components wrapped.
+
+    Cartesian relpos uses z-h (already 2π-periodic in yaw of the rotation).
+    Injected residuals (NIS tests) are left as stored.
+    """
+    r = np.array(meas.residual, dtype=np.float64).reshape(-1)
+    name = meas.name
+    if r.size == 1 and name not in ("range", "range_rate", "entrance_range"):
+        if any(k in name for k in ("az", "el", "psi", "yaw")):
+            r[0] = wrap_psi(float(r[0]))
+            return r
+    if name in ("relpos", "entrance_relpos", "reciprocal_relpos"):
+        z = np.asarray(meas.z, dtype=np.float64).reshape(-1)
+        h = np.asarray(meas.h, dtype=np.float64).reshape(-1)
+        if z.size == 3 and h.size == 3 and np.allclose(r, z - h, atol=1e-9, equal_nan=True):
+            _, az_z, el_z = _xyz_to_sph(z)
+            _, az_h, el_h = _xyz_to_sph(h)
+            if abs(wrap_psi(az_z - az_h) - (az_z - az_h)) > 1e-12 or abs(
+                wrap_psi(el_z - el_h) - (el_z - el_h)
+            ) > 1e-12:
+                return wrapped_cartesian_innovation(z, h)
+    return r
+
+
 def cartesian_cov_from_spherical(
     d: float, az: float, el: float, sigma_d: float, sigma_az: float, sigma_el: float
 ) -> np.ndarray:
@@ -161,9 +220,13 @@ def relpos(
         d = float(np.linalg.norm(z))
     if az is None:
         az = math.atan2(float(z[1]), float(z[0]))
+    else:
+        az = wrap_psi(float(az))
     if el is None:
         rxy = math.hypot(float(z[0]), float(z[1]))
         el = math.atan2(float(z[2]), rxy)
+    else:
+        el = wrap_el(float(el))
     R_cart = cartesian_cov_from_spherical(
         float(d), float(az), float(el), float(sigma_d), float(sigma_az), float(sigma_el)
     )
@@ -352,6 +415,8 @@ def mutual_yaw(
     nji = _unit(zji)
     if nij is None or nji is None:
         return None
+    psi_i = wrap_psi(float(psi_i))
+    psi_j = wrap_psi(float(psi_j))
     Ri = rpy_to_R(psi_i, pitch_i, roll_i)
     Rj = rpy_to_R(psi_j, pitch_j, roll_j)
     uij = Ri @ nij
@@ -859,6 +924,29 @@ def run_selftest() -> int:
     # NaN guard
     mnan = relpos(p_i, p_j, 0.0, 0.0, 0.0, np.array([1.0, float("nan"), 0.0]), 0.1, 0.1, 0.1)
     check("14 NaN residual fails finite()", not mnan.finite())
+
+    # Angular wrap: residual straddling ±π must land in [-π, π]
+    daz = wrap_psi((math.pi - 0.01) - (-math.pi + 0.01))
+    check("15 wrap az residual ~ -0.02", abs(daz + 0.02) < 1e-6, f"daz={daz:.6f}")
+    z_hi = bearing_xyz(2.0, math.pi - 0.01, 0.0)
+    h_lo = bearing_xyz(2.0, -math.pi + 0.01, 0.0)
+    inn = wrapped_cartesian_innovation(z_hi, h_lo)
+    check(
+        "15b wrapped cartesian innov small at wrap boundary",
+        float(np.linalg.norm(inn)) < 0.15,
+        f"||r||={float(np.linalg.norm(inn)):.4f}",
+    )
+    m_wrap = Measurement(
+        "az_only",
+        np.array([math.pi - 0.01]),
+        np.array([-math.pi + 0.01]),
+        np.array([2.0 * math.pi - 0.02]),
+        np.zeros((1, N_STATE)),
+        np.zeros((1, N_STATE)),
+        np.array([[0.01]]),
+    )
+    rw = wrap_measurement_residual(m_wrap)
+    check("15c 1D wrap of ~2pi residual", abs(float(rw[0]) + 0.02) < 1e-6, f"r={float(rw[0]):.6f}")
 
     print(f"[selftest] {n_pass} passed, {n_fail} failed")
     print("[selftest] " + ("ALL PASS" if ok else "FAILED"))

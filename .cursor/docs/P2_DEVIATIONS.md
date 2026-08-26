@@ -30,6 +30,16 @@ CPU is laptop `perf_counter` against the GAP9 **20 ms** budget at 50 Hz (~150 in
 
 RPE uses Δt = 1 s translation error. ATE is RMSE with **no SE(3) alignment** (entrance gauge). Hop count is BFS on the logged UWB graph from entrance id 1000.
 
+## Gauge starvation / overconfidence (post-Run-B)
+
+Instrumentation: `eval_6_1` logs entrance-edge counts to peer 1000, centroid vs shape, NIS by measurement type, and min/max eigenvalues of `P_p`. `cf_*.npz` now includes a `nis` array and is flushed every 5 s so hops/mix survive a `timeout` kill.
+
+Angle wrap: azimuth/elevation innovations are wrapped to [-π, π] at the residual site (`measurements.wrap_measurement_residual`); 1-D angular residuals wrap the same way.
+
+Force-include: UWB `update_scheduled_pairs` always keeps in-range pairs involving `peer_type == "entrance"` even when `max_neighbors_per_drone` would drop them. Drone–drone k-cap is unchanged.
+
+Gauge-age floor: `estimator.gauge_age_q_m2_per_s: 0.05` is common-mode process noise. Relative updates cannot reduce a position variance below `min(P_i, P_j)` on that axis. Gate: `disable_entrance` → absolute σ grows (`stress.py` 3d, `ekf.py` 17e). `max_cov_p_m: 2` still trips diverge; that is the abort, not a plateau at centimetre σ.
+
 ## P2-8 — stress + ablations are offline; live knobs are files
 
 Blocking gate: `python3 perception/swarm_loc/stress.py --selftest` and `python3 eval_scripts/run_ablations.py --selftest`.

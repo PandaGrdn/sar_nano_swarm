@@ -383,6 +383,15 @@ def run_selftest() -> int:
         f"noent={noent['mean_sigma']:.3f} base={base['mean_sigma']:.3f}",
     )
     check("3c not overconfident", noent["overconfident"] == [], str(noent["overconfident"]))
+    noent_long = run_line_mesh(cfg_noent, entrance=False, n_steps=80, seed=21)
+    h = noent_long["hist"][0]
+    sig_early = float(np.mean([s for _, _, s in h[:8]]))
+    sig_late = float(np.mean([s for _, _, s in h[-8:]]))
+    check(
+        "3d no-anchor σ grows with time",
+        sig_late > 1.25 * sig_early,
+        f"early={sig_early:.3f} late={sig_late:.3f}",
+    )
 
     print("[selftest] NLOS wall between 1–2 …")
     wall = [{"name": "wall", "x_min": 2.2, "x_max": 2.4, "y_min": -5.0, "y_max": 5.0, "z_min": 0.0, "z_max": 3.0}]

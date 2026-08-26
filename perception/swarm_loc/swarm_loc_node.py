@@ -140,6 +140,7 @@ class SwarmLocNode:
         self._n_tx_bytes = 0
         self._sum_nis = 0.0
         self._n_nis_samples = 0
+        self._nis_by = defaultdict(lambda: {"n": 0, "sum": 0.0, "rej": 0})
         self._t0_wall = time.time()
         self._last_metric_wall = self._t0_wall
         self._log = None
@@ -200,9 +201,22 @@ class SwarmLocNode:
         if info.get("reason") == "nis_gate":
             self._n_nis += 1
         nis = info.get("nis", float("nan"))
+        name = getattr(meas, "name", "unknown")
+        rec = self._nis_by[name]
+        rec["n"] += 1
         if isinstance(nis, (int, float)) and math.isfinite(float(nis)):
             self._sum_nis += float(nis)
             self._n_nis_samples += 1
+            rec["sum"] += float(nis)
+        if info.get("reason") == "nis_gate":
+            rec["rej"] += 1
+        if self._log is not None:
+            self._log.add_nis(
+                float(self.st.stamp),
+                name,
+                float(nis) if isinstance(nis, (int, float)) else float("nan"),
+                bool(info.get("accepted")),
+            )
         return info
 
     def _on_rio(self, msg) -> None:
@@ -518,6 +532,8 @@ class SwarmLocNode:
                 flush=True,
             )
             self._last_metric_wall = now_wall
+            if self._log is not None:
+                self.flush_log(quiet=True)
 
     def _log_uwb_edge(self, edge, peer: int) -> None:
         use_bearing = bool(self.cfg["measurements"].get("use_bearing", True))
@@ -548,12 +564,18 @@ class SwarmLocNode:
             z,
         )
 
-    def flush_log(self) -> None:
+    def flush_log(self, quiet: bool = False) -> None:
         if self._log is None:
             return
         elapsed = max(time.time() - self._t0_wall, 1e-6)
         n_upd = max(self._n_update, 1)
         n_prop = max(self._n_prop, 1)
+        extra = {}
+        for name, rec in self._nis_by.items():
+            key = "".join(c if c.isalnum() else "_" for c in name)
+            extra[f"nis_n_{key}"] = rec["n"]
+            extra[f"nis_mean_{key}"] = rec["sum"] / max(rec["n"], 1)
+            extra[f"nis_rej_{key}"] = rec["rej"]
         self._log.set_stats(
             n_nis_reject=self._n_nis,
             n_update=self._n_update,
@@ -572,9 +594,11 @@ class SwarmLocNode:
             comms_bytes_per_s=self._n_tx_bytes / elapsed,
             wall_s=elapsed,
             n_diverged=1.0 if self.st.status == STATUS_DIVERGED else 0.0,
+            **extra,
         )
         path = self._log.save()
-        print(f"[swarm_loc cf={self.cf_id}] wrote measurements {path}", flush=True)
+        if not quiet:
+            print(f"[swarm_loc cf={self.cf_id}] wrote measurements {path}", flush=True)
 
 
 def _run_node(args) -> int:

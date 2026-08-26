@@ -311,6 +311,12 @@ class UwbModel:
             if b in a_nei and a in b_nei:
                 kept.add(pair_key(a, b))
 
+        # Surveyed (entrance) peers are the mesh gauge: keep them even if the
+        # k-nearest cap would drop a far drone's only absolute reference.
+        for a, b in candidates:
+            if active[a].peer_type == "entrance" or active[b].peer_type == "entrance":
+                kept.add(pair_key(a, b))
+
         self.scheduled_pairs = kept
         self.n_pairs = len(kept)
         ranging_rate = float(self.cfg["ranging_rate_hz"])
@@ -825,6 +831,30 @@ def run_selftest() -> int:
             ok = False
             print(f"[selftest] FAIL 13 cap: pair ({a},{b}) distance {abs(a-b)} > 2")
     check("13 neighbour cap", all(abs(a - b) <= 2 for a, b in m13.scheduled_pairs))
+
+    # 13b force-include surveyed entrance despite k_cap
+    cfg13b = dict(cfg)
+    cfg13b["max_neighbors_per_drone"] = 2
+    cfg13b["p_dropout_at_max_range"] = 0.0
+    cfg13b["_num_drones"] = 10
+    m13b = UwbModel.from_config(cfg13b, seed=13)
+    devices13b = {
+        i: DeviceState(i, np.array([float(i), 0.0, 0.0]), R0, False, "drone")
+        for i in range(10)
+    }
+    devices13b[1000] = DeviceState(
+        1000, np.array([-2.0, 0.0, 0.30]), R0, True, "entrance"
+    )
+    m13b.update_scheduled_pairs(devices13b)
+    drone_drone_far = any(
+        a < 1000 and b < 1000 and abs(int(a) - int(b)) > 2 for a, b in m13b.scheduled_pairs
+    )
+    check(
+        "13b force-include entrance to far drone",
+        any({int(a), int(b)} == {9, 1000} for a, b in m13b.scheduled_pairs),
+        str(sorted(m13b.scheduled_pairs)),
+    )
+    check("13c drone-drone cap still holds", not drone_drone_far)
 
     # 14 link budget dropout
     cfg14 = dict(cfg)
