@@ -27,7 +27,7 @@ for _p in ("perception/swarm_loc", "perception/uwb_sim"):
     if str(_REPO_ROOT / _p) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT / _p))
 
-from ekf import propagate, update  # noqa: E402
+from ekf import YawModeGuard, propagate, update  # noqa: E402
 from meas_log import (  # noqa: E402
     KIND_ENTRANCE_RELPOS,
     KIND_RELPOS,
@@ -37,6 +37,7 @@ from meas_log import (  # noqa: E402
 )
 from measurements import (  # noqa: E402
     cartesian_cov_from_spherical,
+    entrance_observed_from_edge,
     from_edge,
     mutual_yaw,
     range_rate,
@@ -65,6 +66,29 @@ from uwb_edges import (  # noqa: E402
 )
 
 
+def entrance_device_id(cfg: dict) -> int:
+    """Surveyed observer id from the ESTIMATOR'S config (never uwb_pdoa.yaml)."""
+    return int(cfg.get("entrance", {}).get("device_id", 1000))
+
+
+def classify_uwb_row(observer_id: int, peer_id: int, cf_id: int, entrance_id: int) -> str:
+    """Route one UWB edge row (R1 fix — observer check comes FIRST).
+
+    'own'               — this drone observed the edge; may cache its own
+                          bearing, rebroadcast it, and update against the peer.
+    'entrance_observed' — the surveyed entrance observed THIS drone (§4.3e).
+    'drop'              — everything else. In particular an entrance-observed
+                          row about another drone must never enter the own-
+                          bearing cache or the rebroadcast queue (the pre-fix
+                          bug behind the hot mutual_yaw / reciprocal_relpos NIS).
+    """
+    if int(observer_id) == int(cf_id):
+        return "own"
+    if int(observer_id) == int(entrance_id) and int(peer_id) == int(cf_id):
+        return "entrance_observed"
+    return "drop"
+
+
 def estimator_subscription_topics(cf_id: int, num_drones: int, cfg: dict) -> List[str]:
     """Topics this node is allowed to subscribe to. Used by --selftest and the gate."""
     n = int(num_drones)
@@ -72,7 +96,7 @@ def estimator_subscription_topics(cf_id: int, num_drones: int, cfg: dict) -> Lis
     topics = [
         f"/cf_{cf_id}/rio/delta",
         f"/cf_{cf_id}/uwb/edges",
-        f"/uwb/peer_1000/edges",
+        f"/uwb/peer_{entrance_device_id(cfg)}/edges",
     ]
     added = 0
     for j in range(n):
@@ -128,7 +152,13 @@ class SwarmLocNode:
         self._pending_rebroadcast: List[dict] = []
         self._own_bearing: Dict[int, dict] = {}
         self._peer_bearing_to_us: Dict[int, dict] = {}
+        self._entrance_id = entrance_device_id(cfg)
+        self._entrance_bearing_to_us: dict | None = None
+        self._yaw_guard = YawModeGuard(cfg)
         self._n_mutual_yaw = 0
+        self._n_entrance_mutual_yaw = 0
+        self._n_entrance_obs = 0
+        self._n_entrance_az_only = 0
         self._n_reciprocal = 0
         self._n_az_only = 0
         self._n_update = 0
@@ -216,6 +246,16 @@ class SwarmLocNode:
                 name,
                 float(nis) if isinstance(nis, (int, float)) else float("nan"),
                 bool(info.get("accepted")),
+            )
+        # R3 π-flip guard: covariance-only recovery when bearing-family
+        # measurements are persistently rejected under a confident yaw.
+        self.st, yaw_trig = self._yaw_guard.observe(
+            name, bool(info.get("accepted")), float(self.st.stamp), self.st
+        )
+        if yaw_trig:
+            self.node.get_logger().warning(
+                f"YAW_MODE_SUSPECT cf={self.cf_id}: bearing accept rate low with "
+                f"confident yaw — inflated yaw sigma (trigger #{self._yaw_guard.n_triggered})"
             )
         return info
 
@@ -306,6 +346,16 @@ class SwarmLocNode:
         for row in rows:
             flags = int(row["flags"])
             peer = int(row["peer_id"])
+            # R1 fix: route on the OBSERVER first. Only rows this drone itself
+            # observed may feed the own-bearing cache, the rebroadcast queue,
+            # or the bearing/az-only counters. Entrance-observed rows about us
+            # go to the §4.3e anchor path; everything else is dropped.
+            route = classify_uwb_row(int(row["observer_id"]), peer, self.cf_id, self._entrance_id)
+            if route == "drop":
+                continue
+            if route == "entrance_observed":
+                self._apply_entrance_observed(row)
+                continue
             if (flags & FLAG_BEARING_VALID) and not math.isfinite(float(row["z"])):
                 self._n_az_only += 1
             if flags & FLAG_BEARING_VALID:
@@ -336,8 +386,6 @@ class SwarmLocNode:
                         "pitch_observer": float(self.st.pitch),
                     }
                 )
-            if int(row["observer_id"]) != self.cf_id:
-                continue
             surveyed = bool(flags & FLAG_PEER_IS_SURVEYED)
             if surveyed and self.abl.get("disable_entrance"):
                 continue
@@ -377,6 +425,105 @@ class SwarmLocNode:
                         P_j=nb["P"],
                         fusion="ci",
                     )
+
+    def _apply_entrance_observed(self, row) -> None:
+        """§4.3e — the surveyed entrance observed THIS drone.
+
+        Full-bearing rows become a direct entrance_obs_relpos update (known
+        landmark, no CI — the entrance broadcasts no state) plus a mutual-yaw
+        attempt against the entrance's surveyed yaw. Azimuth-only rows are
+        counted and skipped. Range-only rows are skipped: the drone's own
+        entrance_range already carries that physical exchange (P2_DEVIATIONS.md).
+        A one-sided entrance bearing never invents a yaw measurement.
+        """
+        if self.abl.get("disable_entrance"):
+            return
+        use_bearing = bool(self.cfg["measurements"].get("use_bearing", True))
+        if self.abl.get("disable_bearing"):
+            use_bearing = False
+        flags = int(row["flags"])
+        if not (flags & FLAG_BEARING_VALID):
+            return  # range-only: own entrance_range covers it
+        if not math.isfinite(float(row["z"])):
+            self._n_entrance_az_only += 1
+            return
+        if not use_bearing:
+            return
+        self._entrance_bearing_to_us = {
+            "stamp": float(self.st.stamp),
+            "range_m": float(row["range_m"]),
+            "azimuth_rad": float(row["azimuth_rad"]),
+            "elevation_rad": float(row["elevation_rad"]),
+            "sigma_range_m": float(row["sigma_range_m"]),
+            "sigma_az_rad": float(row["sigma_az_rad"]),
+            "sigma_el_rad": float(row["sigma_el_rad"]),
+        }
+        info = self._apply_update(entrance_observed_from_edge(self.st, row, self.cfg))
+        if info.get("accepted"):
+            self._n_entrance_obs += 1
+        self._try_entrance_mutual_yaw()
+
+    def _try_entrance_mutual_yaw(self) -> None:
+        """D11 against the fixed-yaw entrance: pins ABSOLUTE yaw (§4.3e).
+
+        Needs our own bearing to the entrance (rare, rear cone) AND an
+        entrance-observed bearing to us within mutual_yaw_max_dt_s. The
+        entrance side has zero attitude uncertainty, so this is a direct EKF
+        update (no P_j / CI).
+        """
+        if not bool(self.cfg["measurements"].get("use_mutual_yaw", True)):
+            return
+        if self.abl.get("disable_bearing") or self.abl.get("disable_entrance"):
+            return
+        own = self._own_bearing.get(self._entrance_id)
+        rec = self._entrance_bearing_to_us
+        if own is None or rec is None:
+            return
+        pair_dt = float(self.cfg["measurements"]["mutual_yaw_max_dt_s"])
+        if abs(float(own["stamp"]) - float(rec["stamp"])) > pair_dt:
+            return
+        z_ij = bearing_xyz(own["range_m"], own["azimuth_rad"], own["elevation_rad"])
+        z_ji = bearing_xyz(rec["range_m"], rec["azimuth_rad"], rec["elevation_rad"])
+        Rij = cartesian_cov_from_spherical(
+            own["range_m"],
+            own["azimuth_rad"],
+            own["elevation_rad"],
+            own["sigma_range_m"],
+            own["sigma_az_rad"],
+            own["sigma_el_rad"],
+        )
+        Rji = cartesian_cov_from_spherical(
+            rec["range_m"],
+            rec["azimuth_rad"],
+            rec["elevation_rad"],
+            rec["sigma_range_m"],
+            rec["sigma_az_rad"],
+            rec["sigma_el_rad"],
+        )
+        psi_ent = math.radians(float(self.cfg["entrance"].get("yaw_deg", 0.0)))
+        meas = mutual_yaw(
+            self.st.psi,
+            self.st.pitch,
+            self.st.roll,
+            z_ij,
+            psi_ent,
+            0.0,
+            0.0,
+            z_ji,
+            Rij,
+            Rji,
+        )
+        if meas is None:
+            return
+        # Partner yaw is a surveyed constant → its Jacobian block carries no
+        # uncertainty; direct update, distinct name for NIS-by-type.
+        meas.H_j = np.zeros_like(meas.H_j)
+        meas.name = "entrance_mutual_yaw"
+        info = self._apply_update(meas)
+        if info.get("accepted"):
+            self._n_entrance_mutual_yaw += 1
+            self._own_bearing.pop(self._entrance_id, None)
+            self._entrance_bearing_to_us = None
 
     def _apply_rebroadcast(self, rows) -> None:
         if self.st.status == STATUS_DIVERGED:
@@ -582,6 +729,10 @@ class SwarmLocNode:
             n_accept=self._n_accept,
             n_az_only=self._n_az_only,
             n_mutual_yaw=self._n_mutual_yaw,
+            n_entrance_mutual_yaw=self._n_entrance_mutual_yaw,
+            n_entrance_obs=self._n_entrance_obs,
+            n_entrance_az_only=self._n_entrance_az_only,
+            n_yaw_mode_triggers=self._yaw_guard.n_triggered,
             n_reciprocal=self._n_reciprocal,
             n_mutual_yaw_pairs_per_s=self._n_mutual_yaw / elapsed,
             nis_reject_rate=self._n_nis / n_upd if self._n_update else 0.0,
@@ -672,6 +823,25 @@ def run_selftest() -> int:
     )
     check("3 log path file", resolve_log_path("run/cf_0.npz", 2).name == "cf_0.npz")
     check("3b log path dir", str(resolve_log_path("run", 2)).replace("\\", "/").endswith("run/cf_2.npz"))
+
+    # R1 regression: observer routing. An entrance-observed row about ANOTHER
+    # drone must be dropped by drone 0 — it must never reach the own-bearing
+    # cache / rebroadcast queue (only the 'own' branch populates those).
+    ent = entrance_device_id(cfg)
+    check("4 entrance id from estimator config", ent == 1000)
+    check(
+        "4b topic uses config device id",
+        f"/uwb/peer_{ent}/edges" in topics,
+    )
+    check("5 entrance row about peer j dropped", classify_uwb_row(ent, 2, 0, ent) == "drop")
+    check("5b entrance row about self routed", classify_uwb_row(ent, 0, 0, ent) == "entrance_observed")
+    check("5c own row is own", classify_uwb_row(0, 2, 0, ent) == "own")
+    check("5d own row to entrance peer is own", classify_uwb_row(0, ent, 0, ent) == "own")
+    check("5e other drone's row dropped", classify_uwb_row(2, 0, 0, ent) == "drop")
+    check(
+        "5f entrance never classifies as own",
+        all(classify_uwb_row(ent, pid, 0, ent) != "own" for pid in (0, 1, 2, ent)),
+    )
     print(f"[selftest] {n_pass} passed, {n_fail} failed")
     print("[selftest] " + ("ALL PASS" if ok else "FAILED"))
     return 0 if ok else 1

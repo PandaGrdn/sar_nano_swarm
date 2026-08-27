@@ -191,6 +191,12 @@ def paired_errors(est: np.ndarray, truth: np.ndarray) -> dict:
         "eig_max": eig_max,
         "est_pose": pos_a.tolist(),
         "gt_pose": gts_a.tolist(),
+        "mean_xyz_m": (
+            [float(np.mean(xyz[:, 0])), float(np.mean(xyz[:, 1])), float(np.mean(xyz[:, 2]))]
+            if xyz.size
+            else [float("nan"), float("nan"), float("nan")]
+        ),
+        "mean_z_m": float(np.mean(xyz[:, 2])) if xyz.size else float("nan"),
         "mean_nees": float(np.mean(finite_nees)) if finite_nees.size else float("nan"),
         "frac_nees_in_95": float(np.mean(finite_nees <= CHI2_95_3)) if finite_nees.size else float("nan"),
         "n_nees": int(finite_nees.size),
@@ -229,6 +235,9 @@ def uwb_mix(run: Dict[int, dict]) -> dict:
     n_reciprocal_kind = 0
     n_az = 0
     n_my = 0
+    n_ent_obs = 0
+    n_ent_my = 0
+    n_ent_az = 0
     n_rec_stat = 0
     n_nis = 0
     n_upd = 0
@@ -250,6 +259,9 @@ def uwb_mix(run: Dict[int, dict]) -> dict:
         st = rec.get("stats") or {}
         n_az += int(st.get("n_az_only", 0))
         n_my += int(st.get("n_mutual_yaw", 0))
+        n_ent_obs += int(st.get("n_entrance_obs", 0))
+        n_ent_my += int(st.get("n_entrance_mutual_yaw", 0))
+        n_ent_az += int(st.get("n_entrance_az_only", 0))
         n_rec_stat += int(st.get("n_reciprocal", 0))
         n_nis += int(st.get("n_nis_reject", 0))
         n_upd += int(st.get("n_update", 0))
@@ -271,6 +283,9 @@ def uwb_mix(run: Dict[int, dict]) -> dict:
         "n_az_only": n_az,
         "frac_az_only": n_az / den,
         "n_mutual_yaw": n_my,
+        "n_entrance_obs": n_ent_obs,
+        "n_entrance_mutual_yaw": n_ent_my,
+        "n_entrance_az_only": n_ent_az,
         "n_mutual_yaw_pairs_per_s": float(np.mean(my_rate)) if my_rate else 0.0,
         "nis_reject_rate": n_nis / max(n_upd, 1),
         "n_update": n_upd,
@@ -537,6 +552,7 @@ def print_report(report: dict) -> None:
             f"  cf_{i}  ATE_rmse={m.get('ate_rmse_m', float('nan')):.3f} m  "
             f"RPE_rmse={m.get('rpe_rmse_m', float('nan')):.3f} m  "
             f"yaw_rmse={m.get('yaw_rmse_deg', float('nan')):.2f} deg  "
+            f"mean_z={m.get('mean_z_m', float('nan')):+.3f} m  "
             f"NEES={m.get('mean_nees', float('nan')):.2f}  "
             f"NEES_in95={m.get('frac_nees_in_95', float('nan')):.3f}  n={m.get('n', 0)}"
         )
@@ -552,6 +568,7 @@ def print_report(report: dict) -> None:
         )
         print(
             f"  n_mutual_yaw_pairs_per_s={mix.get('n_mutual_yaw_pairs_per_s', 0):.4f}  "
+            f"n_entrance_obs={mix.get('n_entrance_obs', 0)}  "
             f"NIS reject={mix.get('nis_reject_rate', float('nan')):.4f}  "
             f"comms_B/s={mix.get('comms_bytes_per_s_mean', float('nan')):.1f}  "
             f"CPU={mix.get('cpu_per_step_us', float('nan')):.1f} us/step  "
@@ -688,6 +705,9 @@ def run_selftest() -> int:
         cs = report.get("diag", {}).get("centroid_shape") or {}
         check("6e centroid vs shape keys", "mean_centroid_m" in cs)
         mix = report["mix"]
+        check("6f n_entrance_obs in mix", mix.get("n_entrance_obs") == 0, str(mix.get("n_entrance_obs")))
+        mz = report["per_drone"]["0"].get("mean_z_m", float("nan"))
+        check("6g mean_z planted", abs(mz - 0.05) < 0.002, f"mean_z={mz}")
         check("7 bearing fraction", mix["frac_bearing"] > 0.2)
         check("7b NIS reject rate", abs(mix["nis_reject_rate"] - 2 / 180) < 1e-9, str(mix["nis_reject_rate"]))
         check("8 CPU under 20 ms (laptop)", mix["cpu_fits_20ms_on_laptop"])

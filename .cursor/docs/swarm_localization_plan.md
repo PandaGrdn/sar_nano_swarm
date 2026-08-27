@@ -500,6 +500,7 @@ Record in `.cursor/docs/P2_DEVIATIONS.md` and in every results write-up:
 7. **Landed peers are not anchors** (D20) — if a future milestone wants surveyed landed anchors, that is a new decision, not an implicit one.
 8. **CI is conservative by construction** — it will underclaim accuracy relative to an optimal correlated fusion. This is intentional; do not "fix" it by switching to naive fusion.
 9. **Altitude aiding is absent.** Baro, `/cf_<id>/tof_down`, and `/cf_<id>/flow` are simulated and gated but deliberately unused (see §1). A coplanar corridor mesh gives the vertical channel almost nothing, so Z error here is a floor, not a final number.
+10. **Post-Run-B honesty patch is the min-floor, not Schmidt-Kalman** — see **§10**. Live NEES is now in-band; cf_2 yaw ~180° and mutual-yaw NIS rejects are remaining, not solved by that patch.
 
 ---
 
@@ -528,3 +529,64 @@ These are already documented in `AGENTS.md §4`; they bite this milestone specif
 - **`mlflow.db` (sqlite) can wedge on the `/mnt/d` DrvFs mount** under concurrent or `kill -9`'d access. With one estimator per drone all logging to MLflow, this is a live risk: **only the gate script logs to MLflow — the per-drone nodes must not.** If a script hangs at `start_run()`, look for orphaned processes holding the DB before debugging anything else.
 - **Sim time ≠ ROS wall time.** Compare receive wall time for staleness, use header stamps for `dt` and ordering. Mixing them is what made the optical-flow node report every sample stale.
 - **The dev shell is PowerShell.** When invoking through `wsl -e bash -lc '...'`, single-quote the outer argument or PowerShell interpolates `$?`/`$var` before bash sees them.
+- **`wsl -e bash -lc` from Cursor often cannot open cflib SITL links** (90–180 s timeout, hung UDP thread). Run `swarm_loc_gate.py` in an interactive WSL shell with `setup_env.sh` sourced. Kill `swarm_loc_gate.py` after a timeout before retrying — the daemon `open_links` thread keeps 19850+.
+
+---
+
+## 10. Post-Run-B honesty patch (implemented)
+
+First live fly (Run B) was meter-class and overconfident: ATE ~1.3–1.6 m, mean NEES ~200–290, claimed σ ~0.05–0.25 m, all three drones blowing up together near t≈85 s, Z sinking, cf_2 yaw ~180°. Offline MC had been consistent (~cm, NEES~3). Diagnosis and the **minimum** (not Schmidt-Kalman) fix are below. Details also in `.cursor/docs/P2_DEVIATIONS.md`.
+
+### 10.1 What was wrong
+
+1. **Gauge starvation.** Entrance behind the ±45° cone → range-only (or dropped by `max_neighbors_per_drone`). Relative UWB holds *shape*; the whole formation drifts as a rigid body. Z is almost unconstrained once elevation to the entrance is gone.
+2. **Overconfidence loop.** Relative updates cannot observe a common-mode translation. Neighbors were shrinking each other's absolute `P` down to measurement noise. CI on the pairwise update does not block that. Offline MC hid it because the entrance stayed in every graph.
+3. **Yaw wrap.** An unwrapped az/ψ residual near ±π is ~2π and one huge update. NIS reject count 0 on Run B was a symptom.
+
+### 10.2 What was implemented (files)
+
+| Item | Where | Behavior |
+|---|---|---|
+| Entrance-edge series, centroid vs shape, NIS-by-type, `P_p` eigenvalues | `eval_scripts/eval_6_1.py`, `eval_6_1_plots.py` (plots 11–14) | Confirms #1/#2 on every `--eval-dir` run |
+| `nis` array + 5 s `flush_log` | `meas_log.py`, `swarm_loc_node.py` | Hops/mix survive `timeout`; per-type NIS is on disk |
+| Angular wrap | `measurements.wrap_measurement_residual`, used in `ekf.update` | 1-D az/el/ψ residuals wrap to (−π, π]. Cartesian relpos stays `z−h` unless the spherical az/el difference actually wraps. `mutual_yaw` wraps `ψ_i`, `ψ_j` before `R` |
+| Force-include entrance | `uwb_model.update_scheduled_pairs` | Any in-range pair with `peer_type == "entrance"` is kept even if k-cap would drop it. Drone–drone k-cap **unchanged** (selftest 13 / 13b–c) |
+| Gauge-age Q | `estimator.gauge_age_q_m2_per_s: 0.05` in `swarm_loc.yaml`, added in `process_Q` | Common-mode position random walk (m²/s). Relative UWB must not cancel it |
+| Relative absolute floor | `ekf.apply_relative_abs_floor` after CI Joseph | On a **CI** neighbor update, each position variance is at least `min(P_i[k,k], P_j[k,k])`. Naive fusion is **not** floored (P2-4 regression: naive must stay overconfident) |
+| PSD hygiene | `state.clamp_position_cov` eig-clips the 3×3; `project_psd` after propagate/update | Diagonal-only clamp at `max_cov_p_m: 2` was making `P` indefinite |
+
+Gates: `measurements.py --selftest` (wrap 15), `ekf.py --selftest` (17c–e no-anchor σ grows), `uwb_model.py --selftest` (13b), `stress.py --selftest` (3d), `eval_6_1.py --selftest`.
+
+### 10.3 Deviations from the diagnosis note / locked plan
+
+- **Not implemented:** Schmidt-Kalman / considered-state neighbor pose, or a proper common-mode vs relative-mode covariance split. The note called those “correct”; the floor is the minimum version. Do not “fix” remaining conservatism by switching CI to naive fusion (D6, §7.8).
+- **`max_cov_p_m` stays 2 m**, not the plan’s 50 m. Unbounded no-anchor growth trips diverge at 2 m; that is the abort, not a cm-σ plateau.
+- **Force-include is entrance-only** (`peer_type == "entrance"`), not landed peers (D20).
+- **Did not widen `aoa_fov_deg`**, add ToF/baro, or subscribe to odom in `perception/swarm_loc/`.
+- **Cartesian relpos residual is still `z−h`** in the usual (non-wrapping) case so P2-2 Jacobians and the NIS-outlier selftest stay honest. Wrap is applied when the implied az/el difference crosses ±π, and always for 1-D angular names.
+- **`t_last_gauge` is not on the wire** (`STATE_DTYPE` itemsize 88 unchanged). Gauge age is process noise + the min-prior floor, not a broadcast timestamp.
+- **P2-3 NEES check** allows mean NEES ≤ 1.03× the χ² band upper edge (finite-MC / Wilson–Hilferty slack). Overconfidence is still a fail if it is persistent.
+
+### 10.4 Live re-run (post-patch) — `out/swarm_loc_eval/metrics_6_1.json`
+
+3-drone tunnel, hop count 1 for all (entrance force-included). No diverged rows.
+
+| drone | ATE RMSE | RPE 1 s | yaw RMSE | mean NEES | NEES in χ²95 |
+|---|---|---|---|---|---|
+| cf_0 | 0.32 m | 0.24 m | 7.8° | 1.64 | 0.993 |
+| cf_1 | 0.29 m | 0.16 m | 9.2° | 1.09 | 0.999 |
+| cf_2 | 0.38 m | 0.17 m | **173°** | 2.76 | 0.960 |
+
+Vs Run B (~1.3–1.6 m ATE, NEES ~200, σ dishonest): position and honesty are in the intended regime. **σ growing down-tunnel is success**, not a failure.
+
+**Still true on this run (do not paper over):**
+
+- **Entrance bearing count is 0** for all three; only range-only to peer 1000 (~15–30 edges/s). The cone is doing what §7.6 said. Force-include keeps the *range* gauge; it does not create elevation.
+- **Centroid vs shape:** mean centroid error 0.26 m, shape 0.16 m, `centroid_explains_ate: false`. Not a pure rigid-body drift anymore.
+- **cf_2 yaw ~180° is not fixed.** Wrap stopped the 2π innovation blow-up; a π flip can still sit in a consistent local minimum under relpos. D11 is not carrying live yaw: `nis_by_type.mutual_yaw` mean NIS ~4.6e4, **63520 / 87119 rejected**. Reciprocal relpos is also hot (14267 / 23977 rejected). Aggregate NIS reject rate **0.327** is almost entirely those two, not range/relpos/entrance_range (those means are O(1)).
+- Logged `n_mutual_yaw_pairs_per_s ≈ 7.5` is **pair attempts**, not accepted D11 updates. The `aoa_fov_note` in eval still says live mutual-yaw is often ~0 in the *accepted* sense; do not cite 7.5 as D11 working in the corridor.
+- Mix: frac_bearing 0.33, frac_range_only 0.67 (peer–peer bearing still exists; entrance is range-only).
+
+### 10.5 What to do next (not this patch)
+
+Z honesty is the floor + entrance range; Z *accuracy* still needs in-cone elevation or scoped-out altitude aiding. cf_2 yaw needs a separate investigation (sign of D8/D11, init, or a π mode), not another common-mode floor. Schmidt-Kalman remains the structural upgrade if the min-floor is too conservative for a paper claim.

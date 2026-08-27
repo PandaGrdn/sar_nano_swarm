@@ -51,6 +51,8 @@ MEAS_NAME_ID = {
     "entrance_relpos": 5,
     "mutual_yaw": 6,
     "az_only": 7,
+    "entrance_obs_relpos": 8,   # anchor-observed relpos (entrance is observer, §4.3e)
+    "entrance_mutual_yaw": 9,   # D11 pair against the fixed-yaw entrance observer
 }
 ID_MEAS_NAME = {v: k for k, v in MEAS_NAME_ID.items()}
 

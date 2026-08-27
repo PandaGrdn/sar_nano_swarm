@@ -148,7 +148,7 @@ def wrap_measurement_residual(meas: Measurement) -> np.ndarray:
         if any(k in name for k in ("az", "el", "psi", "yaw")):
             r[0] = wrap_psi(float(r[0]))
             return r
-    if name in ("relpos", "entrance_relpos", "reciprocal_relpos"):
+    if name in ("relpos", "entrance_relpos", "reciprocal_relpos", "entrance_obs_relpos"):
         z = np.asarray(meas.z, dtype=np.float64).reshape(-1)
         h = np.asarray(meas.h, dtype=np.float64).reshape(-1)
         if z.size == 3 and h.size == 3 and np.allclose(r, z - h, atol=1e-9, equal_nan=True):
@@ -442,6 +442,69 @@ def mutual_yaw(
     Rm = Pu_ij + Pu_ji
     Rm = 0.5 * (Rm + Rm.T)
     return Measurement("mutual_yaw", z, h, residual, H_i, H_j, Rm)
+
+
+# ---------------------------------------------------------------------------
+# (e2) anchor-observed relative position (plan §4.3e, entrance as OBSERVER)
+# ---------------------------------------------------------------------------
+
+def anchor_observed_relpos(
+    p_i,
+    p_anchor,
+    psi_anchor: float,
+    z_body_ai,
+    sigma_d: float,
+    sigma_az: float,
+    sigma_el: float,
+    d: Optional[float] = None,
+    az: Optional[float] = None,
+    el: Optional[float] = None,
+) -> Measurement:
+    """Known-pose anchor observed the drone: h = R_aᵀ (p_i − p_a).
+
+    Direct EKF update against a surveyed landmark (NOT a CI neighbor
+    update — the anchor broadcasts no state). Jacobian wrt drone state:
+    ∂h/∂p_i = +R_aᵀ (opposite sign to model (a) where self observes),
+    zero wrt ψ_i (the anchor's attitude is known, roll = pitch = 0).
+    The anchor position uncertainty entrance.sigma_m²·I is folded into R
+    by ekf._measurement_R (name starts with "entrance").
+    """
+    m = relpos(
+        p_anchor, p_i, psi_anchor, 0.0, 0.0, z_body_ai, sigma_d, sigma_az, sigma_el, d, az, el
+    )
+    # relpos built with observer=anchor, target=drone: its H_j block is the
+    # drone-position Jacobian (+R_aᵀ). The anchor state is known → drop its block.
+    m.H_i = m.H_j
+    m.H_j = np.zeros((3, N_STATE), dtype=np.float64)
+    m.name = "entrance_obs_relpos"
+    return m
+
+
+def entrance_observed_from_edge(st: SwarmState, edge, cfg: dict) -> Optional[Measurement]:
+    """Anchor-observed bearing row (observer = entrance, peer = self).
+
+    Requires full bearing (az + el). Azimuth-only and range-only rows return
+    None — the drone's own entrance_range already carries the range constraint
+    for that physical exchange (see P2_DEVIATIONS.md).
+    """
+    flags = int(_edge_get(edge, "flags", 0))
+    if not (flags & FLAG_BEARING_VALID) or not math.isfinite(float(_edge_get(edge, "z", float("nan")))):
+        return None
+    ent = cfg["entrance"]
+    p_a = np.array(ent["position_xyz_m"], dtype=np.float64)
+    psi_a = math.radians(float(ent.get("yaw_deg", 0.0)))
+    return anchor_observed_relpos(
+        st.p,
+        p_a,
+        psi_a,
+        z_body_from_edge(edge),
+        float(_edge_get(edge, "sigma_range_m")),
+        float(_edge_get(edge, "sigma_az_rad")),
+        float(_edge_get(edge, "sigma_el_rad")),
+        d=float(_edge_get(edge, "range_m")),
+        az=float(_edge_get(edge, "azimuth_rad")),
+        el=float(_edge_get(edge, "elevation_rad")),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -947,6 +1010,80 @@ def run_selftest() -> int:
     )
     rw = wrap_measurement_residual(m_wrap)
     check("15c 1D wrap of ~2pi residual", abs(float(rw[0]) + 0.02) < 1e-6, f"r={float(rw[0]):.6f}")
+
+    # --- (e2) anchor-observed relpos: hand case, anchor at origin yaw 0 ---
+    p_drone = np.array([1.0, 0.0, 0.0])
+    m_ao = anchor_observed_relpos(p_drone, np.zeros(3), 0.0, np.array([1.0, 0.0, 0.0]), 0.09, 0.08, 0.08)
+    check("16 anchor-obs hand h=[1,0,0]", np.allclose(m_ao.h, [1.0, 0.0, 0.0], atol=1e-12))
+    check("16b anchor-obs residual zero", float(np.linalg.norm(m_ao.residual)) < 1e-12)
+    check(
+        "16c anchor-obs dh/dp_i = +I (yaw 0)",
+        np.allclose(m_ao.H_i[:, IDX_P], np.eye(3), atol=1e-12),
+    )
+    check("16d anchor-obs no psi_i dependence", np.allclose(m_ao.H_i[:, IDX_PSI], 0.0))
+    check("16e anchor-obs H_j zero (anchor known)", np.allclose(m_ao.H_j, 0.0))
+    check("16f anchor-obs name", m_ao.name == "entrance_obs_relpos")
+
+    # --- (e2) 100 randomized Jacobian checks vs numerical differentiation ---
+    rng = np.random.default_rng(23)
+    max_ao = 0.0
+    n_ao_fail = 0
+    for k in range(100):
+        g = _rand_geom(rng)
+        p_a = g["p_j"]  # anchor at what was the peer position
+        psi_a = g["psi_j"]  # general surveyed yaw, not just 0
+        Ra = rpy_to_R(psi_a, 0.0, 0.0)
+        z_ai = Ra.T @ (g["p_i"] - p_a)
+        m = anchor_observed_relpos(g["p_i"], p_a, psi_a, z_ai, 0.09, 0.03, 0.03)
+        x_i = np.zeros(N_STATE)
+        x_i[IDX_P] = g["p_i"]
+        x_i[IDX_PSI] = g["psi_i"]
+
+        def h_ao(x, p_a=p_a, psi_a=psi_a, z_ai=z_ai):
+            return anchor_observed_relpos(x[IDX_P], p_a, psi_a, z_ai, 0.09, 0.03, 0.03).h
+
+        H_num = _numdiff_h(h_ao, x_i)
+        e = float(np.max(np.abs(m.H_i - H_num)))
+        max_ao = max(max_ao, e)
+        if e >= 1e-6:
+            n_ao_fail += 1
+    check(
+        "16g anchor-obs Jac 100 geom <1e-6",
+        max_ao < 1e-6 and n_ao_fail == 0,
+        f"max={max_ao:.3e} nfail={n_ao_fail}",
+    )
+
+    # --- (e2) edge wrapper: gating on bearing/elevation, config yaw ---
+    edge_ao = dict(edge_brg)
+    edge_ao["flags"] = FLAG_BEARING_VALID  # observer=entrance rows carry no SURVEYED flag
+    cfg_ao = dict(cfg)
+    cfg_ao["entrance"] = dict(cfg["entrance"])
+    cfg_ao["entrance"]["yaw_deg"] = 0.0
+    # build an entrance→drone observation consistent with geometry
+    z_ai_true = rpy_to_R(0.0, 0.0, 0.0).T @ (st.p - p_ent)
+    d_ai = float(np.linalg.norm(z_ai_true))
+    edge_ao.update(
+        {
+            "x": float(z_ai_true[0]),
+            "y": float(z_ai_true[1]),
+            "z": float(z_ai_true[2]),
+            "range_m": d_ai,
+            "azimuth_rad": math.atan2(float(z_ai_true[1]), float(z_ai_true[0])),
+            "elevation_rad": math.atan2(float(z_ai_true[2]), math.hypot(float(z_ai_true[0]), float(z_ai_true[1]))),
+        }
+    )
+    m_edge = entrance_observed_from_edge(st, edge_ao, cfg_ao)
+    check("16h entrance-observed edge builds", m_edge is not None and m_edge.name == "entrance_obs_relpos")
+    check(
+        "16i entrance-observed residual ~0",
+        m_edge is not None and float(np.linalg.norm(m_edge.residual)) < 1e-6,
+    )
+    edge_ao_naz = dict(edge_ao)
+    edge_ao_naz["z"] = float("nan")
+    check("16j az-only entrance-observed skipped", entrance_observed_from_edge(st, edge_ao_naz, cfg_ao) is None)
+    edge_ao_rng = dict(edge_ao)
+    edge_ao_rng["flags"] = 0
+    check("16k range-only entrance-observed skipped", entrance_observed_from_edge(st, edge_ao_rng, cfg_ao) is None)
 
     print(f"[selftest] {n_pass} passed, {n_fail} failed")
     print("[selftest] " + ("ALL PASS" if ok else "FAILED"))

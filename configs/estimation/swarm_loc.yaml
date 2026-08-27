@@ -17,6 +17,18 @@ estimator:
   # only an entrance/surveyed update may shrink absolute P. disable_entrance
   # must then show growing σ (resolve-issues plan #2).
   gauge_age_q_m2_per_s: 0.05
+  # π-flip guard (R3): windowed acceptance of bearing-family measurements
+  # (relpos / reciprocal_relpos / mutual_yaw / entrance_relpos / entrance_obs_relpos /
+  # entrance_mutual_yaw). If ≥ min_attempts in the window are seen and fewer than
+  # accept_frac are accepted while yaw σ is below yaw_mode_sigma_deg, the filter
+  # is likely in a π yaw mode: inflate yaw σ to yaw_mode_reset_sigma_deg (never a
+  # hard reset, never a truth read) so accepted bearings can pull it out.
+  yaw_mode_window_s: 10.0
+  yaw_mode_min_attempts: 20
+  yaw_mode_accept_frac: 0.2
+  yaw_mode_sigma_deg: 10.0
+  yaw_mode_reset_sigma_deg: 60.0
+  yaw_mode_cooldown_s: 30.0        # anti-thrash: min time between inflations
 
 # ── launch geometry (D13) ─────────────────────────────────────────────────────
 # MUST mirror phase0_gate.sh -x / -y / --spacing. Surveyed deployment geometry,
@@ -32,6 +44,9 @@ launch:
 entrance:
   position_xyz_m: [-2.0, 0.0, 0.30]   # surveyed constant; matches the M4 entrance peer
   sigma_m: 0.01
+  yaw_deg: 0.0                        # surveyed heading of the entrance observer (§4.3e)
+  device_id: 1000                     # /uwb/peer_<id>/edges topic id — estimator-side
+                                      # constant, NOT read from uwb_pdoa.yaml (see P2_DEVIATIONS.md)
 
 measurements:
   use_bearing: true

@@ -380,6 +380,78 @@ def update(
     return out, info
 
 
+class YawModeGuard:
+    """R3 π-flip guard — truth-free detector + covariance-only recovery.
+
+    A yaw estimate stuck ~π away from truth can sit in a locally consistent
+    mode: bearing-family measurements are persistently NIS-rejected while the
+    yaw variance stays small, so nothing can pull the state out. Track a
+    windowed acceptance rate of bearing-family measurements; when attempts ≥
+    yaw_mode_min_attempts and the accepted fraction is below
+    yaw_mode_accept_frac while yaw σ < yaw_mode_sigma_deg, inflate the yaw
+    variance to yaw_mode_reset_sigma_deg² (P stays PSD: raising a diagonal
+    entry adds a PSD rank-1 term; project_psd for hygiene). Never hard-reset
+    yaw to a value, never read truth. A cooldown prevents thrash.
+    All tunables from configs/estimation/swarm_loc.yaml (estimator.yaw_mode_*).
+    """
+
+    BEARING_FAMILY = frozenset(
+        {
+            "relpos",
+            "reciprocal_relpos",
+            "mutual_yaw",
+            "entrance_relpos",
+            "entrance_obs_relpos",
+            "entrance_mutual_yaw",
+        }
+    )
+
+    def __init__(self, cfg: dict):
+        est = cfg.get("estimator", {})
+        self.window_s = float(est.get("yaw_mode_window_s", 10.0))
+        self.min_attempts = int(est.get("yaw_mode_min_attempts", 20))
+        self.accept_frac = float(est.get("yaw_mode_accept_frac", 0.2))
+        self.sigma_rad = math.radians(float(est.get("yaw_mode_sigma_deg", 10.0)))
+        self.reset_sigma_rad = math.radians(float(est.get("yaw_mode_reset_sigma_deg", 60.0)))
+        self.cooldown_s = float(est.get("yaw_mode_cooldown_s", 30.0))
+        self.t_window: float | None = None
+        self.n_attempt = 0
+        self.n_accept = 0
+        self.t_last_reset = -float("inf")
+        self.n_triggered = 0
+
+    def _reset_window(self, stamp: float) -> None:
+        self.t_window = float(stamp)
+        self.n_attempt = 0
+        self.n_accept = 0
+
+    def observe(self, name: str, accepted: bool, stamp: float, st: SwarmState):
+        """Record one measurement attempt. Returns (state, triggered)."""
+        if name not in self.BEARING_FAMILY:
+            return st, False
+        stamp = float(stamp)
+        if self.t_window is None or stamp - self.t_window > self.window_s:
+            self._reset_window(stamp)
+        self.n_attempt += 1
+        if accepted:
+            self.n_accept += 1
+        if self.n_attempt < self.min_attempts:
+            return st, False
+        if self.n_accept >= self.accept_frac * self.n_attempt:
+            return st, False
+        if stamp - self.t_last_reset < self.cooldown_s:
+            return st, False
+        if float(st.P[IDX_PSI, IDX_PSI]) >= self.sigma_rad**2:
+            return st, False
+        out = st.copy()
+        out.P[IDX_PSI, IDX_PSI] = max(float(out.P[IDX_PSI, IDX_PSI]), self.reset_sigma_rad**2)
+        out.P = project_psd(symmetrize(out.P))
+        self.t_last_reset = stamp
+        self._reset_window(stamp)
+        self.n_triggered += 1
+        return out, True
+
+
 def _synth_entrance_edge(p, psi, pitch, roll, p_ent, rng, sigma_d, sigma_az, sigma_el) -> dict:
     R = rpy_to_R(float(psi), float(pitch), float(roll))
     z_true = R.T @ (np.asarray(p_ent, dtype=np.float64) - np.asarray(p, dtype=np.float64))
@@ -931,6 +1003,88 @@ def run_selftest() -> int:
         "24b NEES in/near 95% band",
         mc["mean_nees"] >= 0.5 * mc["nees_lo"] and mc["frac_in_95"] >= 0.80,
         f"mean={mc['mean_nees']:.3f} frac={mc['frac_in_95']:.3f}",
+    )
+
+    # ----- R3: π-flip guard — detect, inflate, recover (deterministic) -----
+    from measurements import relpos as _relpos
+
+    rng_pi = np.random.default_rng(42)
+    st_pi = SwarmState.from_launch(cfg, 0)
+    p_true = st_pi.p.copy()
+    psi_true = 0.0
+    st_pi.x[IDX_PSI] = wrap_psi(0.97 * math.pi)  # stuck π mode
+    st_pi.P[IDX_PSI, IDX_PSI] = math.radians(2.0) ** 2  # confidently wrong
+    guard = YawModeGuard(cfg)
+    # two fixed neighbors with exactly-known positions; bearings from truth
+    peers = [p_true + np.array([2.0, 0.5, 0.1]), p_true + np.array([0.5, -2.0, -0.2])]
+    sig_d, sig_ang = 0.05, 0.02
+    n_rej_pre = 0
+    n_pre = 0
+    triggered_at = None
+    n_acc_post = 0
+    n_steps_pi = 260
+    for k in range(n_steps_pi):
+        t_k = 0.1 * (k + 1)
+        st_pi.stamp = t_k
+        p_j = peers[k % 2]
+        z_true = rpy_to_R(psi_true, 0.0, 0.0).T @ (p_j - p_true)
+        d_t, az_t, el_t = float(np.linalg.norm(z_true)), math.atan2(z_true[1], z_true[0]), math.asin(
+            float(np.clip(z_true[2] / max(float(np.linalg.norm(z_true)), EPS), -1.0, 1.0))
+        )
+        z_meas = np.array(
+            bearing_xyz(
+                d_t + float(rng_pi.normal(0.0, sig_d)),
+                az_t + float(rng_pi.normal(0.0, sig_ang)),
+                el_t + float(rng_pi.normal(0.0, sig_ang)),
+            )
+        )
+        meas = _relpos(st_pi.p, p_j, st_pi.psi, 0.0, 0.0, z_meas, sig_d, sig_ang, sig_ang)
+        st_pi, info = update(st_pi, meas, cfg)
+        acc = bool(info.get("accepted"))
+        if triggered_at is None:
+            n_pre += 1
+            if info.get("reason") == "nis_gate":
+                n_rej_pre += 1
+        else:
+            if acc:
+                n_acc_post += 1
+        st_pi, trig = guard.observe(meas.name, acc, t_k, st_pi)
+        if trig and triggered_at is None:
+            triggered_at = k
+            check(
+                "25c inflation raises yaw sigma",
+                float(st_pi.P[IDX_PSI, IDX_PSI]) >= 0.9 * math.radians(float(cfg["estimator"]["yaw_mode_reset_sigma_deg"])) ** 2,
+                f"P_psi={st_pi.P[IDX_PSI, IDX_PSI]:.4f}",
+            )
+            check("25d P still SPD after inflation", _is_spd(st_pi.P))
+    check(
+        "25 pi-mode measurements NIS-rejected pre-trigger",
+        n_pre > 0 and n_rej_pre >= 0.8 * n_pre,
+        f"rej={n_rej_pre}/{n_pre}",
+    )
+    check(
+        "25b guard triggers within window",
+        triggered_at is not None and triggered_at < 2 * int(cfg["estimator"]["yaw_mode_min_attempts"]),
+        f"triggered_at={triggered_at}",
+    )
+    check("25e measurements accepted post-inflation", n_acc_post >= 10, f"n_acc_post={n_acc_post}")
+    yaw_err = abs(wrap_psi(st_pi.psi - psi_true))
+    check(
+        "25f yaw converges after recovery (<20 deg)",
+        yaw_err < math.radians(20.0),
+        f"yaw_err={math.degrees(yaw_err):.1f} deg",
+    )
+    # guard hygiene: non-bearing names ignored; cooldown blocks a re-trigger
+    g2 = YawModeGuard(cfg)
+    st_ok2 = SwarmState.from_launch(cfg, 0)
+    for k in range(100):
+        st_ok2, trig = g2.observe("range", False, 0.05 * k, st_ok2)
+        assert not trig
+    check("26 non-bearing names never trigger", g2.n_triggered == 0)
+    check(
+        "26b cooldown blocks immediate re-trigger",
+        guard.n_triggered == 1,
+        f"n_triggered={guard.n_triggered}",
     )
 
     print(f"[selftest] {n_pass} passed, {n_fail} failed (need >=15 passing)")

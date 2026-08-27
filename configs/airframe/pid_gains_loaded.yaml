@@ -1,3 +1,14 @@
+# Phase 1 M2 Optuna output for the loaded-mass model (payload.yaml).
+# Pushed at runtime via eval_scripts/pid_gains.py / push_pid_gains.py.
+#
+# pid_rate Kp in the hundreds is correct Crazyflie firmware scale
+# (stock 250/250/120), not a typo. The ~20s values are velCtlPid.*Kp.
+# Stage-1 search was 0.5–2.0× stock on roll/pitch rate+attitude Kp/Kd;
+# yaw and all Ki/Kff were held at stock (see pid_tune.yaml).
+# zKp was later hand-capped at 2.75 (Optuna best was ~3.60).
+#
+# Do not scale pid_rate down toward 20 without a new tune_pid.py run + hover_gate.py.
+
 pid_rate:
   roll_kp: 462.2880519548251
   roll_ki: 500.0
