@@ -82,7 +82,7 @@ import json
 from pathlib import Path
 p = Path("out/swarm_loc_eval/metrics_6_1.json")
 r = json.loads(p.read_text())
-print("=== R4 gates vs baseline ===")
+print("=== live metrics (max_cov_p_m from yaml at node start) ===")
 for i, m in r["per_drone"].items():
     print(
         f"  cf_{i}: ATE={m.get('ate_rmse_m'):.3f}  yaw={m.get('yaw_rmse_deg'):.2f} deg  "

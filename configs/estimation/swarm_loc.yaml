@@ -12,7 +12,7 @@ estimator:
   scale_init: 1.0
   scale_init_sigma: 0.02
   cov_floor_p_m: 0.01              # prevents over-confidence collapse
-  max_cov_p_m: 2.0                 # σ_p abort — tunnel-scale; plan default was 50 m (see P2_DEVIATIONS.md)
+  max_cov_p_m: 2.0            # σ_p abort — tunnel-scale; plan default was 50 m (see P2_DEVIATIONS.md)
   # Common-mode position random walk (m²/s). Relative UWB cannot cancel this;
   # only an entrance/surveyed update may shrink absolute P. disable_entrance
   # must then show growing σ (resolve-issues plan #2).

@@ -33,6 +33,7 @@ from rio_stub import (  # noqa: E402
     load_config,
     make_engine,
     resolve_config_path,
+    rio_velocity_from_increment,
     rio_measurement_cov,
 )
 from state import (  # noqa: E402
@@ -65,18 +66,16 @@ def _process_G(st: SwarmState, delta: RioDelta) -> np.ndarray:
     """G (9x5): maps [n_dp(3), n_dpsi, n_s] into the state."""
     R = rpy_to_R(st.psi, delta.pitch, delta.roll)
     s = st.s
-    dt = max(float(delta.dt), EPS)
+    dt = float(delta.dt)
     dp = np.asarray(delta.delta_p_body, dtype=np.float64)
     G = np.zeros((N_STATE, 5), dtype=np.float64)
     G[IDX_P, 0:3] = s * R
     G[IDX_PSI, 3] = 1.0
     G[IDX_S, 4] = 1.0
-    if delta.valid:
+    G[IDX_P, 4] = R @ dp
+    if delta.valid and rio_velocity_from_increment(dt):
         G[IDX_V, 0:3] = s * R / dt
-        G[IDX_P, 4] = R @ dp
         G[IDX_V, 4] = (R @ dp) / dt
-    else:
-        G[IDX_P, 4] = R @ dp
     return G
 
 
@@ -113,7 +112,7 @@ def transition_F(st: SwarmState, delta: RioDelta) -> np.ndarray:
     F[IDX_P, IDX_S] = R @ dp
     # ψ⁺ = ψ + dψ - b_ψ dt
     F[IDX_PSI, IDX_BPSI] = -dt
-    if delta.valid and dt > EPS:
+    if delta.valid and rio_velocity_from_increment(dt):
         # v⁺ = s R dp / dt  (does not depend on previous v)
         F[IDX_V, IDX_V] = 0.0
         F[IDX_V, IDX_PSI] = s * (dR @ dp) / dt
@@ -133,7 +132,7 @@ def propagate(st: SwarmState, delta: RioDelta, cfg: dict) -> SwarmState:
 
     out.x[IDX_P] = st.x[IDX_P] + disp
     out.x[IDX_PSI] = wrap_psi(st.psi + float(delta.delta_psi) - st.b_psi * dt)
-    if delta.valid and dt > EPS:
+    if delta.valid and rio_velocity_from_increment(dt):
         out.x[IDX_V] = disp / dt
     # else hold velocity
     out.x[IDX_S] = s
@@ -684,6 +683,44 @@ def run_selftest() -> int:
     check("10 P symmetric 10k", np.allclose(st.P, st.P.T, atol=1e-10))
     check("11 P SPD 10k", _is_spd(st.P), f"min_eig={min_eig:.3e}")
     check("11b P finite 10k", np.all(np.isfinite(st.P)) and np.all(np.isfinite(st.x)))
+
+    tiny = RioDelta(
+        stamp=38.877,
+        dt=1e-12,
+        delta_p_body=np.array([0.001, 0.0, 0.001]),
+        delta_psi=0.0,
+        roll=0.0,
+        pitch=0.0,
+        cov=rio_measurement_cov(cfg),
+        valid=True,
+    )
+    after_tiny = propagate(SwarmState.from_launch(cfg, 0), tiny, cfg)
+    check("11c zero-dt RIO does not diverge", after_tiny.status == STATUS_OK)
+    check(
+        "11d zero-dt RIO P_p stays finite and < 1 m σ",
+        bool(np.all(np.isfinite(after_tiny.P)))
+        and float(np.max(np.diag(after_tiny.P)[0:3])) < 1.0,
+        f"P_p_diag={np.diag(after_tiny.P)[0:3]}",
+    )
+    fast = RioDelta(
+        stamp=0.0002,
+        dt=2e-4,
+        delta_p_body=np.array([0.001, 0.0, 0.0]),
+        delta_psi=0.0,
+        roll=0.0,
+        pitch=0.0,
+        cov=rio_measurement_cov(cfg),
+        valid=True,
+    )
+    launched = SwarmState.from_launch(cfg, 0)
+    after_fast = propagate(launched, fast, cfg)
+    check(
+        "11e 0.2 ms RIO still applies Δp and v",
+        after_fast.status == STATUS_OK
+        and abs(float(after_fast.p[0] - launched.p[0]) - 0.001) < 1e-9
+        and abs(float(after_fast.v[0]) - 5.0) < 1e-6,
+        f"p={after_fast.p} v={after_fast.v}",
+    )
 
     # 12–14 zero-noise trajectory matches truth
     silent = dict(cfg)

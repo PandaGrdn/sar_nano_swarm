@@ -37,6 +37,20 @@ for _p in ("perception/swarm_loc", "perception/uwb_sim"):
 from state import rpy_to_R, rot_to_rpy, wrap_psi  # noqa: E402
 
 EPS = 1e-12
+# v = dp/dt is undefined at dt=0 (duplicate stamps). Position increment is
+# still applied whenever dt > 0. This floor is only the velocity map, not a
+# publish gate — a 0.2–0.5 ms RIO step still updates p and v.
+MIN_RIO_VEL_DT_S = 1e-4
+
+
+def rio_has_increment(dt: float) -> bool:
+    """True if there is a nonzero time interval (a real pose change may exist)."""
+    return float(dt) > EPS
+
+
+def rio_velocity_from_increment(dt: float) -> bool:
+    """True if dt is large enough that G_v = R/dt stays finite."""
+    return float(dt) >= MIN_RIO_VEL_DT_S
 
 
 def load_config(path: str) -> dict:
@@ -210,6 +224,10 @@ def run_selftest() -> int:
     check("zero-noise identity psi", abs(d.delta_psi - dpsi) < 1e-15)
     check("zero-noise valid", d.valid is True)
     check("cov 5x5", d.cov.shape == (5, 5) and np.all(np.isfinite(d.cov)))
+    check("zero dt has no increment", rio_has_increment(0.0) is False)
+    check("0.2 ms still has increment", rio_has_increment(2e-4) is True)
+    check("zero dt no velocity", rio_velocity_from_increment(0.0) is False)
+    check("0.2 ms forms velocity", rio_velocity_from_increment(2e-4) is True)
 
     eng_a = make_engine(cfg, 0)
     eng_b = make_engine(cfg, 0)
@@ -289,7 +307,7 @@ def _run_node(args) -> int:
                 return
             dt = stamp - self._prev_t
             stale_s = float(cfg.get("measurements", {}).get("max_measurement_age_s", 0.5))
-            if wall - self._prev_wall > stale_s:
+            if wall - self._prev_wall > stale_s or not rio_has_increment(dt):
                 self._prev_p, self._prev_R, self._prev_t = p, R, stamp
                 self._prev_wall = wall
                 return
