@@ -1,0 +1,134 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+      Splitter Ratio: 0.5
+    Tree Height: 600
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Enabled: true
+      Name: Grid
+      Plane Cell Count: 20
+      Cell Size: 1
+      Color: 160; 160; 164
+      Plane: XY
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Class: rviz_default_plugins/Pose
+      Enabled: true
+      Name: Est cf0
+      Color: 0; 255; 80
+      Shape: Axes
+      Axes Length: 0.35
+      Axes Radius: 0.03
+      Topic:
+        Value: /cf_0/swarm_loc/pose
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 5
+      Value: true
+    - Class: rviz_default_plugins/Pose
+      Enabled: true
+      Name: Est cf1
+      Color: 80; 160; 255
+      Shape: Axes
+      Axes Length: 0.35
+      Axes Radius: 0.03
+      Topic:
+        Value: /cf_1/swarm_loc/pose
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 5
+      Value: true
+    - Class: rviz_default_plugins/Pose
+      Enabled: true
+      Name: Est cf2
+      Color: 255; 200; 0
+      Shape: Axes
+      Axes Length: 0.35
+      Axes Radius: 0.03
+      Topic:
+        Value: /cf_2/swarm_loc/pose
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 5
+      Value: true
+    - Class: rviz_default_plugins/Odometry
+      Enabled: true
+      Name: Truth cf0
+      Color: 255; 80; 80
+      Topic:
+        Value: /cf_0/odom
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 5
+      Keep: 1
+      Shape:
+        Value: Axes
+      Value: true
+    - Class: rviz_default_plugins/Odometry
+      Enabled: true
+      Name: Truth cf1
+      Color: 255; 80; 80
+      Topic:
+        Value: /cf_1/odom
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 5
+      Keep: 1
+      Shape:
+        Value: Axes
+      Value: true
+    - Class: rviz_default_plugins/Odometry
+      Enabled: true
+      Name: Truth cf2
+      Color: 255; 80; 80
+      Topic:
+        Value: /cf_2/odom
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 5
+      Keep: 1
+      Shape:
+        Value: Axes
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 20; 20; 20
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/Select
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 10
+      Focal Point:
+        X: 1.5
+        Y: 0
+        Z: 0.4
+      Name: Current View
+      Pitch: 0.6
+      Target Frame: world
+      Value: Orbit (rviz)
+      Yaw: 0.8
+    Saved: ~
+Window Geometry:
+  Height: 900
+  Width: 1400
+  X: 50
+  Y: 50

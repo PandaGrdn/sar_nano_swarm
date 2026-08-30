@@ -37,6 +37,11 @@
 #       --no-uwb         Skip inter-drone UWB PDoA node (perception/uwb_sim/uwb_node.py).
 #       --uwb-config PATH
 #                         Path to uwb_pdoa.yaml [default: configs/sensors/uwb_pdoa.yaml]
+#       --no-swarm-loc   Skip per-drone swarm-loc estimator + RIO stub (P2-5).
+#       --swarm-loc-config PATH
+#                         Path to swarm_loc.yaml [default: configs/estimation/swarm_loc.yaml]
+#       --swarm-loc-log-dir PATH
+#                         Per-drone measurement .npz for central_reference.py (P2-7).
 #       --no-rviz        Skip RViz launch.
 #       --headless       Skip Gazebo GUI (server + SITL only, useful for CI).
 #       --check          Gate-check mode: start headless, wait 15 s, verify
@@ -82,6 +87,9 @@ Usage: ./eval_scripts/phase0_gate.sh [OPTIONS]
       --flow-config PATH  optical_flow.yaml [default: configs/sensors/optical_flow.yaml]
       --no-uwb         Skip UWB PDoA node
       --uwb-config PATH  uwb_pdoa.yaml [default: configs/sensors/uwb_pdoa.yaml]
+      --no-swarm-loc   Skip swarm-loc estimator + RIO stub
+      --swarm-loc-config PATH  swarm_loc.yaml [default: configs/estimation/swarm_loc.yaml]
+      --swarm-loc-log-dir PATH  write cf_<i>.npz measurement logs (P2-7)
       --no-rviz        Skip RViz
       --headless       Skip Gazebo GUI
       --check          Headless gate-check (prints PASS/FAIL)
@@ -106,6 +114,9 @@ USE_FLOW=true
 FLOW_CONFIG=""
 USE_UWB=true
 UWB_CONFIG=""
+USE_SWARM_LOC=true
+SWARM_LOC_CONFIG=""
+SWARM_LOC_LOG_DIR=""
 USE_RVIZ=true
 USE_GUI=true
 GATE_CHECK=false
@@ -128,6 +139,9 @@ while [[ $# -gt 0 ]]; do
     --flow-config) FLOW_CONFIG="$2"; shift 2 ;;
     --no-uwb)     USE_UWB=false;   shift   ;;
     --uwb-config) UWB_CONFIG="$2"; shift 2 ;;
+    --no-swarm-loc) USE_SWARM_LOC=false; shift ;;
+    --swarm-loc-config) SWARM_LOC_CONFIG="$2"; shift 2 ;;
+    --swarm-loc-log-dir) SWARM_LOC_LOG_DIR="$2"; shift 2 ;;
     --no-rviz)    USE_RVIZ=false;   shift   ;;
     --headless)   USE_GUI=false;    shift   ;;
     --check)      GATE_CHECK=true; USE_RVIZ=false; USE_GUI=false; shift ;;
@@ -251,10 +265,12 @@ cleanup() {
 trap cleanup SIGINT SIGTERM EXIT
 
 # ── kill stale instances ──────────────────────────────────────────────────────
-info "Stopping any running cf2 / UWB nodes …"
+info "Stopping any running cf2 / UWB / swarm-loc nodes …"
 pkill -x cf2 2>/dev/null || true
 pkill -f "uwb_node.py" 2>/dev/null || true
 pkill -f "uwb_sim" 2>/dev/null || true
+pkill -f "swarm_loc_node.py" 2>/dev/null || true
+pkill -f "rio_stub.py" 2>/dev/null || true
 sleep 1
 
 # ── start Gazebo server ───────────────────────────────────────────────────────
@@ -405,20 +421,20 @@ info "SITL settle (3 s for CfFirm handshake) …"
 sleep 3
 
 # ── bridge gz topics to ROS 2 ────────────────────────────────────────────────
-if [[ "$USE_TOF" == true || "$USE_FLOW" == true || "$USE_UWB" == true ]] && command -v ros2 &>/dev/null && ros2 pkg prefix ros_gz_bridge &>/dev/null; then
+if [[ "$USE_TOF" == true || "$USE_FLOW" == true || "$USE_UWB" == true || "$USE_SWARM_LOC" == true ]] && command -v ros2 &>/dev/null && ros2 pkg prefix ros_gz_bridge &>/dev/null; then
   _bridge_args=()
   for i in $(seq 0 $((NUM_DRONES - 1))); do
     if [[ "$USE_TOF" == true ]]; then
       _bridge_args+=("/cf_${i}/tof_down@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan")
     fi
-    if [[ "$USE_FLOW" == true || "$USE_UWB" == true ]]; then
+    if [[ "$USE_FLOW" == true || "$USE_UWB" == true || "$USE_SWARM_LOC" == true ]]; then
       _bridge_args+=("/cf_${i}/odom@nav_msgs/msg/Odometry[gz.msgs.Odometry")
     fi
   done
   info "Bridging gz topics to ROS 2 (${#_bridge_args[@]} mappings) …"
   ros2 run ros_gz_bridge parameter_bridge "${_bridge_args[@]}" &
   _PIDS+=($!)
-elif [[ "$USE_TOF" == true || "$USE_FLOW" == true || "$USE_UWB" == true ]]; then
+elif [[ "$USE_TOF" == true || "$USE_FLOW" == true || "$USE_UWB" == true || "$USE_SWARM_LOC" == true ]]; then
   warn "ros_gz_bridge not installed — gz-native topics not bridged to ROS."
   warn "Install with: sudo apt install ros-humble-ros-gz-bridge (or source setup_env.sh)."
 fi
@@ -455,8 +471,46 @@ if [[ "$USE_UWB" == true ]]; then
   fi
 fi
 
+# ── launch RIO stub + swarm-loc estimator (Phase 2 P2-5) — one pair per drone ─
+if [[ "$USE_SWARM_LOC" == true ]]; then
+  _cfg="${SWARM_LOC_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/estimation/swarm_loc.yaml}"
+  [[ "$_cfg" != /* ]] && _cfg="$SAR_NANO_SWARM_ROOT/$_cfg"
+  if [[ ! -f "$_cfg" ]]; then
+    warn "swarm-loc config not found: $_cfg — skipping estimator."
+  elif ! command -v ros2 &>/dev/null; then
+    warn "ros2 not on PATH — skipping swarm-loc (source setup_env.sh)."
+  else
+    info "Starting RIO stub + swarm-loc ($_cfg, ${NUM_DRONES} drones) …"
+    _log_dir=""
+    if [[ -n "$SWARM_LOC_LOG_DIR" ]]; then
+      _log_dir="$SWARM_LOC_LOG_DIR"
+      [[ "$_log_dir" != /* ]] && _log_dir="$SAR_NANO_SWARM_ROOT/$_log_dir"
+      mkdir -p "$_log_dir"
+      info "swarm-loc measurement logs → $_log_dir"
+    fi
+    for i in $(seq 0 $((NUM_DRONES - 1))); do
+      python3 -u "$SAR_NANO_SWARM_ROOT/perception/swarm_loc/rio_stub.py" \
+        --cf-id "$i" --config "$_cfg" &
+      _PIDS+=($!)
+      if [[ -n "$_log_dir" ]]; then
+        python3 -u "$SAR_NANO_SWARM_ROOT/perception/swarm_loc/swarm_loc_node.py" \
+          --cf-id "$i" --num-drones "$NUM_DRONES" --config "$_cfg" \
+          --log-measurements "$_log_dir" &
+      else
+        python3 -u "$SAR_NANO_SWARM_ROOT/perception/swarm_loc/swarm_loc_node.py" \
+          --cf-id "$i" --num-drones "$NUM_DRONES" --config "$_cfg" &
+      fi
+      _PIDS+=($!)
+    done
+  fi
+fi
+
 # ── launch RViz ───────────────────────────────────────────────────────────────
-RVIZ_CFG="$SAR_NANO_SWARM_ROOT/configs/rviz/radar.rviz"
+if [[ "$USE_SWARM_LOC" == true ]]; then
+  RVIZ_CFG="$SAR_NANO_SWARM_ROOT/configs/rviz/swarm_loc.rviz"
+else
+  RVIZ_CFG="$SAR_NANO_SWARM_ROOT/configs/rviz/radar.rviz"
+fi
 
 if [[ "$USE_RVIZ" == true ]]; then
   if ! command -v rviz2 &>/dev/null; then
@@ -505,6 +559,7 @@ echo "  ║  Payload model: ${USE_PAYLOAD}"
 echo "  ║  ToF sensor   : ${USE_TOF}"
 echo "  ║  Optical flow : ${USE_FLOW}"
 echo "  ║  UWB          : ${USE_UWB}"
+echo "  ║  Swarm-loc    : ${USE_SWARM_LOC}"
 echo "  ║  Radar topic  : /radar/points  (~10 Hz)"
 echo "  ║  ToF topic    : /cf_<id>/tof_down  (gz-native, ~30 Hz)"
 echo "  ║  Flow topic   : /cf_0/flow  (ROS, ~100 Hz)"

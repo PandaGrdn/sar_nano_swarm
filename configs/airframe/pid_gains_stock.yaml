@@ -8,6 +8,12 @@
 #   - src/modules/src/controller/attitude_pid_controller.c  (pid_rate, pid_attitude)
 #   - src/modules/src/controller/position_controller_pid.c  (velCtlPid, posCtlPid)
 #
+# Scale (do not treat these like PX4/Betaflight ~20 rate-P numbers):
+#   pid_rate      inner loop, deg/s error -> mixer units. Stock roll/pitch Kp=250, yaw Kp=120.
+#   pid_attitude  angle loop, deg error -> deg/s. Stock Kp=6.
+#   velCtlPid     m/s error. Stock Kp=25  <-- this is the loop that lives near the 20s.
+#   posCtlPid     m error. Stock Kp=2.
+#
 # Do NOT hand-edit this file's values — it's a fixed reference point.
 # Tuning output goes to pid_gains_loaded.yaml instead.
 
