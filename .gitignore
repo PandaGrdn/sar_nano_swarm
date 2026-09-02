@@ -7,6 +7,10 @@ __pycache__/
 mlruns/
 mlflow.db
 
+# UTIL CSVs / 7z (GitHub repo is parsers only; data from the UTIL site)
+perception/uwb_sim/uwb_noise_model/dataset/util-uwb-dataset/
+perception/uwb_sim/uwb_noise_model/util-uwb-dataset/
+
 # Submodule build artifacts (sources live in submodules)
 perception/rmagine/build/
 firmware_mods/CrazySim/**/build/

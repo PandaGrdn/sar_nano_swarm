@@ -1,5 +1,5 @@
 # Inter-drone UWB ranging + PDoA bearing — Phase 1 M4.
-# See .cursor/docs/M4_UWB_Relative_Positioning_Implementation_Plan.md
+# See docs/uwb_noise_provenance.md and .cursor/docs/M4_UWB_Relative_Positioning_Implementation_Plan.md
 #
 # Simulated analytically by perception/uwb_sim/uwb_node.py. There is no native
 # Gazebo UWB sensor; analytic modelling is the correct and standard approach.
@@ -15,8 +15,10 @@
 # file. A `landed` peer's position is a STATE VARIABLE: it landed at a drifted
 # estimated pose. Only `type: entrance` is a surveyed constant.
 #
-# FIDELITY (AGENTS.md §5): range/angle noise from ETH-PBL rotation dataset (fit_uwb_noise.py).
-# Angle fidelity follows fitted piecewise_linear model until Phase 11 bench data exists.
+# FIDELITY (AGENTS.md §5): angle from ETH-PBL DualAntenna AoA (static LOS only —
+# not flight-validated). Range LOS/NLOS from UTIAS UTIL TDOA (Zhao et al. 2024):
+# flight-LOS TWR-proxy 0.1087 m (robust; raw flight std discarded). See
+# docs/uwb_noise_provenance.md.
 # UNMODELLED: TWR clock drift / carrier frequency offset; inter-radio chirp
 # interference (Phase 7); material-specific attenuation.
 
@@ -31,8 +33,8 @@ boresight_axis: [1.0, 0.0, 0.0]   # body FLU. Forward-facing => REAR BLIND SPOT 
 aoa_fov_deg: 90.0
 
 # ── range noise (Tier B) ──────────────────────────────────────────────────────
-sigma_range_los_m: 0.0873
-range_bias_m: 0.0053
+sigma_range_los_m: 0.1087
+range_bias_m: -0.0008
 antenna_delay_bias_sigma_m: 0.05   # PER-DEVICE CONSTANT offset, sampled once at startup.
                               # Pair bias = bias_i + bias_j. NOT included in the reported
                               # sigma — the estimator is meant to have to deal with it
@@ -42,14 +44,14 @@ p_dropout_at_max_range: 0.5   # link-budget dropout, scales as (r/max_range)^2
 
 # ── bearing noise (Tier B — ETH-PBL fitted, STATIC/LOS lab data) ───────────────
 angle_error_model: piecewise_linear
-sigma_boresight_deg: 4.795    # fitted boresight sigma (paper reports ~2.4 deg in +/-45 deg)
+sigma_boresight_deg: 4.795
 angle_sigma_slope_deg_per_deg: 0.1649
 
 # ── NLOS / multipath ──────────────────────────────────────────────────────────
-nlos_bias_mean_m: 0.35        # always POSITIVE (abs of the draw) — a blocked path is longer
-nlos_bias_sigma_m: 0.25
-nlos_sigma_mult: 3.0          # sigma_range inflation under NLOS
-p_dropout_nlos: 0.35
+nlos_bias_mean_m: 0.0870
+nlos_bias_sigma_m: 0.1273
+nlos_sigma_mult: 1.683
+p_dropout_nlos: 0.0883
 nlos_invalidates_bearing: true  # plan §2.5 — a multipath AoA points at the REFLECTOR
 
 # ── occlusion / LOS test (plan §5) ────────────────────────────────────────────
