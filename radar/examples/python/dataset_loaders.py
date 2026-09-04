@@ -441,8 +441,6 @@ def get_single_chip_params(calib_dir):
   pc_params = {'sensor_type': 'single_chip', 'data_type': 'pointcloud'}
 
   tf_filename = calib_dir + '/transforms/base_to_single_chip.txt'
-  print("HELLO")
-  print("name:", tf_filename)
 
   t, r = read_tf_file(tf_filename)
 

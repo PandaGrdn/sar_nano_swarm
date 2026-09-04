@@ -6,7 +6,7 @@ import math
 # param[in] i: sample index
 # param[in] n: size of the window
 # return: value of sample i of a blackman window of size n
-def blackman(i, n)
+def blackman(i, n):
   a0 = 0.42
   a1 = 0.5
   a2 = 0.08

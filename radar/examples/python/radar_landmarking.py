@@ -1,44 +1,24 @@
 from filtering import *
 from collections import defaultdict
-from velocity import VelocityEKF  # or paste the class directly into this file
+from ekf import VelocityEKF  # or paste the class directly into this file
 import numpy as np
 
 # thresholds
 radar_num_threshold = 7
+ekf = VelocityEKF(measurement_noise=0.3)
 
 # match timestamps to radar points
 radar_map = build_radar_frame_map()
 radar_dict = {frame: pts for frame, pts in radar_map}
 
-# load IMU data once, sorted by timestamp
-imu_data = get_IMU_data()
-imu_data.sort(key=lambda r: r['timestamp'])
-imu_idx = 0  # pointer into imu_data, advances monotonically alongside radar frames
-
-# initialize EKF
-ekf = VelocityEKF(measurement_noise=0.3)
-prev_imu_ts = None
-
 prev_cluster_centers = []
 prev_cluster_num_points = []
 prev_timestamp = -1
-print(list(radar_dict))
+
 for frame_idx in list(radar_dict):
     print("frame #: ", frame_idx, "    points: ", len(radar_dict[frame_idx]))
     radar_points = radar_dict[frame_idx]
     timestamp = radar_points[0][5]
-
-    # --- NEW: run EKF prediction using all IMU samples up to this radar timestamp ---
-    while imu_idx < len(imu_data) and imu_data[imu_idx]['timestamp'] <= timestamp:
-        reading = imu_data[imu_idx]
-        accel = np.array(reading['accel'])
-        ts = reading['timestamp']
-        if prev_imu_ts is not None:
-            dt = ts - prev_imu_ts
-            if dt > 0:
-                ekf.predict(accel, dt)
-        prev_imu_ts = ts
-        imu_idx += 1
 
     # cluster the radar points per each frame to determine potential landmarks
     clusters = np.array(clustering(radar_points))
@@ -58,28 +38,49 @@ for frame_idx in list(radar_dict):
         cluster_num_points.append(len(points))
 
     if frame_idx != 0:
-        # compare with previous frame's cluster centers to determine if any are new
+        matched_prev, matched_curr, match_weights = [], [], []
         new_clusters = []
-        vel_approx = []
+
         for i, center in enumerate(cluster_centers):
-            for j, prev_center in enumerate(prev_cluster_centers):
-                cov = np.diag([0.5, 0.05, 0.05])  # larger variance = less penalty for being off in that axis
-                dist_weighted = log_likelihood_distance(prev_center, center, covariance=cov)
-                if dist_weighted < 1.0:  # threshold distance to consider same cluster
-                    vel_approx.append(estimate_velocity(prev_center, center, prev_timestamp, timestamp))
-                    break
+            j, dist = best_match(center, prev_cluster_centers)
             new_clusters.append((center, cluster_num_points[i]))
+            if j is not None:
+                matched_prev.append(prev_cluster_centers[j])
+                matched_curr.append(center)
+                # weight: more points in cluster = better centroid, closer range = less noise
+                r = np.linalg.norm(prev_cluster_centers[j])
+                match_weights.append(cluster_num_points[i] / (r**2 + 1e-3))
 
         print("new clusters detected: ", len(new_clusters))
         for center, num_points in new_clusters:
             print(f"  new cluster at {center} with {num_points} points")
-        for vel_vector, speed in vel_approx:
-            print(f"  estimated velocity: {vel_vector} with speed {speed:.2f} m/s")
-            # --- NEW: feed each landmark-derived velocity into the EKF as a measurement ---
-            ekf.update(vel_vector)
 
-        # --- NEW: report the EKF's fused velocity estimate for this frame ---
-        print(f"  EKF fused velocity: {ekf.get_velocity()}, bias: {ekf.get_bias()}")
+        if len(matched_prev) >= 1:
+            dt = timestamp - prev_timestamp
+            vels = []
+            omegas = []
+            for p, c in zip(matched_prev, matched_curr):
+                v, omega = estimate_ego_motion(p, c, dt)
+                vels.append(v)
+                omegas.append(omega)
+        
+            weights = np.array(match_weights)
+            weights /= weights.sum()
+
+            # single fused velocity measurement, weighted by confidence
+            fused_landmark_vel = np.average(vels, axis=0, weights=weights)
+
+            # optional: residual spread as a proxy for measurement confidence this frame
+            residuals = np.array(vels) - fused_landmark_vel
+            measurement_var = np.average(np.sum(residuals**2, axis=1), weights=weights)
+            
+            for i in range(len(vels)):
+                print("cluster #", i, "| v: ", vels[i], "| omega: ", omegas[i])
+            print(f"  fused landmark velocity: {fused_landmark_vel}, "
+                f"residual var: {measurement_var:.4f}")
+            ekf.update(fused_landmark_vel)  # one update, not N
+
+        print(f"  EKF fused velocity: {ekf.get_velocity()}, bias: {ekf.get_bias()}")      
 
     prev_timestamp = timestamp
     prev_cluster_centers = cluster_centers

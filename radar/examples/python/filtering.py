@@ -10,6 +10,7 @@ import argparse
 from time import time
 from scipy.spatial import cKDTree
 from sklearn.cluster import DBSCAN
+from collections import defaultdict
 
 def interpolate_poses(src_poses, src_stamps, tgt_stamps):
 
@@ -200,7 +201,7 @@ def build_radar_frame_map(seq_dir='/Users/monika/Downloads/radar/data/coloradar/
 
    return radar_frame_map
  
-def clustering(radar_points, eps=0.5, min_samples=5):
+def clustering(radar_points, eps=0.5, min_samples=5, radar_num_threshold=7):
     """
     Clusters radar points using DBSCAN.
 
@@ -211,7 +212,22 @@ def clustering(radar_points, eps=0.5, min_samples=5):
     Returns: labels for each point (-1 = noise)
     """
     clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(radar_points[:, :3])
-    return clustering.labels_
+    clusters = np.array(clustering.labels_)
+    
+    cluster_dict = defaultdict(list)
+    for idx in range(len(clusters)):
+        cluster_dict[int(clusters[idx])].append(radar_points[idx])
+    
+    cluster_centers = []
+    cluster_num_points = []
+    for label, points in cluster_dict.items():
+        if label == -1 or len(points) < radar_num_threshold:
+            continue  # skip noise points (DBSCAN convention: -1 = noise)
+        pts_arr = np.array(points)
+        centroid = pts_arr[:, :3].mean(axis=0)  # mean of x, y, z only
+        cluster_centers.append(centroid)
+        cluster_num_points.append(len(points))
+    return cluster_centers, cluster_num_points
   
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
@@ -250,8 +266,6 @@ def plot_clusters(cluster_dict, cluster_centers, title="Radar Clusters"):
     ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1), fontsize=8)
     plt.tight_layout()
     plt.show()
-
-import numpy as np
 
 def log_likelihood_distance(point1, point2, covariance=None):
     """
@@ -300,48 +314,56 @@ def log_likelihood_distance(point1, point2, covariance=None):
     # negative log-likelihood as a "distance" (lower = closer/more likely)
     return -log_likelihood
 
+def best_match(center, prev_centers, base_cov=np.diag([0.5, 0.05, 0.05])):
+    """Return (index, dist) of best-matching previous cluster, scaling
+    covariance by range to account for angular-noise growth with distance."""
+    range_c = np.linalg.norm(center)
+    scale = max(range_c / 3.0, 1.0)  # tune divisor to your radar's angular resolution
+    cov = base_cov * scale
+    best_j, best_dist = None, np.inf
+    for j, prev_center in enumerate(prev_centers):
+        d = log_likelihood_distance(prev_center, center, covariance=cov)
+        if d < best_dist:
+            best_dist, best_j = d, j
+    if best_dist < 1.0:
+        return best_j, best_dist
+    return None, None
 
-import numpy as np
-
-def estimate_velocity(point1, point2, timestamp1, timestamp2):
+def estimate_ego_motion(prev_centers, curr_centers, dt, weights=None):
     """
-    Estimates velocity between two 3D points given their timestamps.
-
-    Parameters
-    ----------
-    point1 : array-like, shape (3,)
-        Position at timestamp1 (e.g. a cluster centroid at frame i).
-    point2 : array-like, shape (3,)
-        Position at timestamp2 (e.g. the same landmark's centroid at frame i+1).
-    timestamp1 : float
-        Time (seconds) corresponding to point1.
-    timestamp2 : float
-        Time (seconds) corresponding to point2.
-
-    Returns
-    -------
-    velocity_vector : np.ndarray, shape (3,)
-        Velocity components [vx, vy, vz] in units/second.
-    speed : float
-        Scalar speed (magnitude of the velocity vector).
-
-    Raises
-    ------
-    ValueError
-        If timestamps are equal or out of order (zero/negative time delta).
+    prev_centers, curr_centers: lists of matched Nx3 landmark positions
+    Solves v_apparent_i = -v_ego - omega x r_i  for v_ego (3,) and omega (3,)
+    
+    weights = [1.0 / (np.linalg.norm(p)**2) for p in matched_prev]
     """
-    p1 = np.asarray(point1, dtype=float)
-    p2 = np.asarray(point2, dtype=float)
+    prev = np.array(prev_centers)
+    curr = np.array(curr_centers)
+    apparent_vel = (curr - prev) / dt          # observed per-landmark velocity
+    r = prev                                    # use previous position as r_i
+    print(r)
+    n = len(prev)
+    A = np.zeros((3 * n, 6))
+    b = np.zeros(3 * n)
+    for i in range(n):
+        rx, ry, rz = r
+        # -v_ego term
+        A[3*i:3*i+3, 0:3] = -np.eye(3)
+        # -(omega x r_i) term, as linear function of omega
+        A[3*i:3*i+3, 3:6] = -np.array([
+            [0, rz, -ry],
+            [-rz, 0, rx],
+            [ry, -rx, 0]
+        ])
+        b[3*i:3*i+3] = apparent_vel[i]
 
-    dt = timestamp2 - timestamp1
-    if dt <= 0:
-        raise ValueError(f"Invalid time delta ({dt}); timestamp2 must be greater than timestamp1.")
+    if weights is not None:
+        w = np.repeat(weights, 3)
+        W = np.diag(w)
+        A, b = W @ A, W @ b
 
-    displacement = p2 - p1
-    velocity_vector = displacement / dt
-    speed = np.linalg.norm(velocity_vector)
-
-    return velocity_vector, speed
+    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    v_ego, omega = sol[:3], sol[3:]
+    return v_ego, omega
 
 def get_IMU_data(seq_dir='/Users/monika/Downloads/radar/data/coloradar/kitti/2_23_2021_edgar_classroom_run4',
                  calib_dir='/Users/monika/Downloads/radar/data/coloradar/calib'):
@@ -373,3 +395,65 @@ def get_IMU_data(seq_dir='/Users/monika/Downloads/radar/data/coloradar/kitti/2_2
         })
 
     return imu_data
+
+
+def radar_landmarking(ekf, prev_cluster_centers, prev_timestamp, cur_timestamp, cur_radar_points, radar_num_threshold=7):
+    radar_points = cur_radar_points
+    timestamp = cur_timestamp
+    
+    cluster_centers, cluster_num_points = clustering(radar_points)
+    
+    matched_prev, matched_curr, match_weights = [], [], []
+    new_clusters = []
+    
+    for i, center in enumerate(cluster_centers):
+        j, dist = best_match(center, prev_cluster_centers)
+        new_clusters.append((center, cluster_num_points[i]))
+        if j is not None:
+            matched_prev.append(prev_cluster_centers[j])
+            matched_curr.append(center)
+            # weight: more points in cluster = better centroid, closer range = less noise
+            r = np.linalg.norm(prev_cluster_centers[j])
+            match_weights.append(cluster_num_points[i] / (r**2 + 1e-3))
+    
+    print("new clusters detected: ", len(new_clusters))
+    for center, num_points in new_clusters:
+        print(f"  new cluster at {center} with {num_points} points")
+    
+    if len(matched_prev) >= 1:
+        dt = timestamp - prev_timestamp
+        vels = []
+        omegas = []
+        for p, c in zip(matched_prev, matched_curr):
+            v, omega = estimate_ego_motion(p, c, dt)
+            vels.append(v)
+            omegas.append(omega)
+    
+        weights = np.array(match_weights)
+        weights /= weights.sum()
+    
+        # single fused velocity measurement, weighted by confidence
+        fused_landmark_vel = np.average(vels, axis=0, weights=weights)
+    
+        # optional: residual spread as a proxy for measurement confidence this frame
+        residuals = np.array(vels) - fused_landmark_vel
+        measurement_var = np.average(np.sum(residuals**2, axis=1), weights=weights)
+    
+        for i in range(len(vels)):
+            print("cluster #", i, "| v: ", vels[i], "| omega: ", omegas[i])
+        print(f"  fused landmark velocity: {fused_landmark_vel}, "
+            f"residual var: {measurement_var:.4f}")
+        ekf.update(fused_landmark_vel)  # one update, not N
+    
+    print(f"  EKF fused velocity: {ekf.get_velocity()}, bias: {ekf.get_bias()}")      
+    
+    # print({k: len(v) for k, v in cluster_dict.items()})
+    # print("cluster centers (x, y, z):")
+    # for i, center in enumerate(cluster_centers):
+    #     print(f"  cluster {i}: {center}")
+    
+    # x = input("_________________")
+    return ekf.get_velocity(), ekf.get_bias(), 0, 0, cluster_centers, cluster_num_points
+        
+    # return ekf.get_velocity(), ekf.get_bias(), ekf.get_omega(), ekf.get_gyro_bias(), cluster_centers, cluster_num_points
+        
