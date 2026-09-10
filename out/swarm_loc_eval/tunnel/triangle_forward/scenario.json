@@ -1,0 +1,16 @@
+{
+  "env": "tunnel",
+  "situation": "triangle_forward",
+  "world": "phase0_tunnel_gate",
+  "num_drones": 3,
+  "spacing": 0.9,
+  "layout": "triangle",
+  "motion": "formation_forward",
+  "n_legs": 4,
+  "leg_m": 0.5,
+  "pause_s": 2.0,
+  "hover_end_s": 5.0,
+  "duration": 45.0,
+  "why": "Non-collinear mesh: equilateral triangle, all translate +x together, 5 s hover then land.",
+  "key": "tunnel/triangle_forward"
+}

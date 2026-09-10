@@ -32,14 +32,14 @@ echo "[r4] leftover matching processes:"
 pgrep -af 'gz sim|cf2|swarm_loc|uwb_node|rio_stub' || echo "  (none)"
 
 rm -rf out/swarm_loc_logs
-mkdir -p out/swarm_loc_logs out/swarm_loc_eval
+mkdir -p out/swarm_loc_logs/tunnel/collinear_hover out/swarm_loc_eval/tunnel/collinear_hover
 LOG=/tmp/r4_phase0.log
 rm -f "$LOG"
 echo "[r4] starting headless phase0 (server only, no GUI, no RViz) …"
 nohup ./eval_scripts/phase0_gate.sh \
   -w phase0_tunnel_gate -n 3 --spacing 1.5 \
   --headless --no-rviz --no-radar \
-  --swarm-loc-log-dir out/swarm_loc_logs \
+  --swarm-loc-log-dir out/swarm_loc_logs/tunnel/collinear_hover \
   > "$LOG" 2>&1 &
 echo $! > /tmp/r4_phase0.pid
 
@@ -62,8 +62,9 @@ GATE_LOG=/tmp/r4_gate.log
 rm -f "$GATE_LOG"
 set +e
 python3 -u eval_scripts/swarm_loc_gate.py \
-  --num-drones 3 --duration 90 --connect-timeout 90 \
-  --eval-dir out/swarm_loc_eval --logs out/swarm_loc_logs \
+  --scenario tunnel/collinear_hover --duration 90 --connect-timeout 90 \
+  --eval-dir out/swarm_loc_eval/tunnel/collinear_hover \
+  --logs out/swarm_loc_logs/tunnel/collinear_hover \
   | tee "$GATE_LOG"
 rc=${PIPESTATUS[0]}
 set -e
@@ -80,7 +81,7 @@ echo "[r4] gate finished OK"
 python3 - <<'PY'
 import json
 from pathlib import Path
-p = Path("out/swarm_loc_eval/metrics_6_1.json")
+p = Path("out/swarm_loc_eval/tunnel/collinear_hover/metrics_6_1.json")
 r = json.loads(p.read_text())
 print("=== live metrics (max_cov_p_m from yaml at node start) ===")
 for i, m in r["per_drone"].items():

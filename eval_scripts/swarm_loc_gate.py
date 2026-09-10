@@ -7,12 +7,14 @@ Prereq: sim from phase0_gate.sh, e.g.
 
 Usage (setup_env.sh sourced):
     python3 -u eval_scripts/swarm_loc_gate.py --num-drones 3 --duration 300
-    python3 -u eval_scripts/swarm_loc_gate.py --num-drones 3 --eval-dir /tmp/swarm_loc_eval
+    python3 -u eval_scripts/swarm_loc_gate.py --scenario tunnel/triangle_forward
+    python3 eval_scripts/swarm_loc_gate.py --list-scenarios
     python3 eval_scripts/swarm_loc_gate.py --selftest
 """
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import signal
@@ -35,6 +37,13 @@ if os.path.join(_REPO_ROOT, "eval_scripts") not in sys.path:
 
 from swarm_loc_node import topics_contain_truth  # noqa: E402
 from swarm_msgs import STATE_DTYPE, unpack_state  # noqa: E402
+from swarm_loc_scenarios import (  # noqa: E402
+    apply_motion,
+    eval_dir_for,
+    get_scenario,
+    log_dir_for,
+    spawn_xy,
+)
 
 _RESTART_MSG = (
     "[swarm_loc_gate] Restart sim before retrying:\n"
@@ -441,10 +450,14 @@ def run_flight(args, scfs: list) -> bool:
             cf = _as_cf(scf)
             apply_gains(cf, gains)
             try:
+                xy = args._spawn_xy[i] if getattr(args, "_spawn_xy", None) else (
+                    float(i * args.spacing),
+                    0.0,
+                )
                 reset_pose(
                     args.world,
                     f"{args.model_prefix}_{i}",
-                    xyz=(float(i * args.spacing), 0.0, args.hover_height),
+                    xyz=(float(xy[0]), float(xy[1]), args.hover_height),
                 )
             except Exception as e:
                 print(f"[swarm_loc_gate] reset_pose {i} skipped: {e}", file=sys.stderr)
@@ -467,20 +480,16 @@ def run_flight(args, scfs: list) -> bool:
             print("[swarm_loc_gate] takeoff/settle 4 s …")
             time.sleep(4.0)
             t_end = time.time() + float(args.duration)
-            print(f"[swarm_loc_gate] scripted path for {args.duration:.0f} s …")
-            # Slow corridor shuttle, then hold the remainder.
+            spec = getattr(args, "_scenario", None)
+            label = spec["key"] if spec else "tunnel/collinear_hover (default motion)"
+            print(f"[swarm_loc_gate] scripted path {label} for {args.duration:.0f} s …")
             try:
-                for mc in mcs:
-                    mc.forward(0.4)
-                time.sleep(3.0)
-                for mc in mcs:
-                    mc.back(0.4)
-                time.sleep(3.0)
+                if spec is not None:
+                    apply_motion(mcs, t_end, spec)
+                else:
+                    apply_motion(mcs, t_end, get_scenario("tunnel/collinear_hover"))
             except Exception as e:
                 print(f"[swarm_loc_gate] motion warning: {e}", file=sys.stderr)
-            remain = t_end - time.time()
-            if remain > 0:
-                time.sleep(remain)
             for mc in mcs:
                 try:
                     mc.stop()
@@ -535,6 +544,9 @@ def run_selftest() -> int:
     check("1c alt format", "/cf_0/rio/delta" in alt)
     check("2 truth catch odom", bool(topics_contain_truth(["/cf_0/odom"])))
     check("2b estimate not truth", not topics_contain_truth(["/cf_0/swarm_loc/estimate"]))
+    spec = get_scenario("tunnel/triangle_forward")
+    check("3 scenario key", spec["world"] == "phase0_tunnel_gate")
+    check("3b eval subdir", eval_dir_for(spec) == "out/swarm_loc_eval/tunnel/triangle_forward")
     print("[selftest] " + ("ALL PASS" if ok else "FAILED"))
     return 0 if ok else 1
 
@@ -542,6 +554,17 @@ def run_selftest() -> int:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--selftest", action="store_true")
+    parser.add_argument(
+        "--list-scenarios",
+        action="store_true",
+        help="Print env/situation catalog and exit.",
+    )
+    parser.add_argument(
+        "--scenario",
+        default="",
+        help="env/situation (e.g. tunnel/triangle_forward). Sets world, n, "
+        "spacing, motion, and default eval/log dirs under out/swarm_loc_eval/.",
+    )
     parser.add_argument("--config", default="configs/estimation/swarm_loc.yaml")
     parser.add_argument("--gains", default="configs/airframe/pid_gains_loaded.yaml")
     parser.add_argument("--world", default="phase0_tunnel_gate")
@@ -549,7 +572,12 @@ def main():
     parser.add_argument("--num-drones", type=int, default=3)
     parser.add_argument("--spacing", type=float, default=1.5)
     parser.add_argument("--hover-height", type=float, default=0.5)
-    parser.add_argument("--duration", type=float, default=300.0)
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="Flight/record seconds. Default 300, or the scenario's duration if --scenario is set.",
+    )
     parser.add_argument("--connect-wait", type=float, default=90.0)
     parser.add_argument("--connect-timeout", type=float, default=90.0)
     parser.add_argument(
@@ -561,7 +589,8 @@ def main():
     parser.add_argument(
         "--eval-dir",
         default="",
-        help="Write truth.npz + estimates.npz (odom subscribed here only) and run §6.1 metrics.",
+        help="Write truth.npz + estimates.npz (odom subscribed here only) and run §6.1 metrics. "
+        "Default with --scenario: out/swarm_loc_eval/<env>/<situation>/",
     )
     parser.add_argument(
         "--logs",
@@ -571,6 +600,47 @@ def main():
     args = parser.parse_args()
     if args.selftest:
         sys.exit(run_selftest())
+    if args.list_scenarios:
+        from swarm_loc_scenarios import SCENARIOS, eval_dir_for
+
+        print("env/situation                  world                 n  layout    motion")
+        for key, spec in SCENARIOS.items():
+            print(
+                f"  {key:<30} {spec['world']:<20} {spec['num_drones']}  "
+                f"{spec['layout']:<9} {spec['motion']}"
+            )
+            print(f"      {spec['why']}")
+            print(f"      eval → {eval_dir_for(spec)}")
+        sys.exit(0)
+
+    spec = None
+    if args.scenario.strip():
+        try:
+            spec = get_scenario(args.scenario)
+        except KeyError as e:
+            print(f"[swarm_loc_gate] {e}", file=sys.stderr)
+            sys.exit(2)
+        args._scenario = spec
+        args._spawn_xy = spawn_xy(spec)
+        args.world = spec["world"]
+        args.num_drones = int(spec["num_drones"])
+        args.spacing = float(spec["spacing"])
+        if args.duration is None:
+            args.duration = float(spec["duration"])
+        if not args.eval_dir.strip():
+            args.eval_dir = eval_dir_for(spec)
+        if not args.logs.strip():
+            args.logs = log_dir_for(spec)
+        print(
+            f"[swarm_loc_gate] scenario {spec['key']}  world={args.world}  "
+            f"n={args.num_drones}  eval-dir={args.eval_dir}",
+            flush=True,
+        )
+    else:
+        args._scenario = None
+        args._spawn_xy = None
+        if args.duration is None:
+            args.duration = 300.0
 
     cfg_path = args.config
     if not os.path.isabs(cfg_path):
@@ -648,6 +718,12 @@ def main():
         out = Path(eval_dir)
         recorder.dump_eval(out)
         n_truth = sum(len(recorder.truth[i]) for i in range(n))
+        spec = getattr(args, "_scenario", None)
+        if spec is not None:
+            meta = {k: spec[k] for k in spec if k != "key"}
+            meta["key"] = spec["key"]
+            with (out / "scenario.json").open("w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
         print(f"[swarm_loc_gate] wrote {out / 'truth.npz'} and estimates.npz (odom samples={n_truth})")
         logs = args.logs.strip() or (str(out) if list(out.glob("cf_*.npz")) else "")
         try:

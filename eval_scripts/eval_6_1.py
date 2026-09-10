@@ -46,6 +46,11 @@ from eval_6_1_plots import SERIES_KEYS, write_plots  # noqa: E402
 
 ENTRANCE_ID = 1000
 RPE_DT_S = 1.0
+# Window for the time-resolved hop assignment (same 1 s binning as
+# entrance_edges_vs_time). A hop is the BFS distance in the graph of UWB
+# edges active within the sample's window, so a drone can be hop 1 early
+# and hop 2+ deep in the corridor (plan §5 P2-8, §6.1 headline plot).
+HOP_WINDOW_S = 1.0
 # AGENTS.md §6.8 / plan §6.1: ~150 int-GOp/s. At 50 Hz the step budget is 20 ms.
 # Numbers here are laptop `perf_counter` times, not GAP9 measurements.
 GAP9_BUDGET_S = 0.020
@@ -217,15 +222,83 @@ def hops_from_uwb(run: Dict[int, dict]) -> Dict[int, int]:
             b = int(row["peer_id"])
             adj[a].add(b)
             adj[b].add(a)
+    hop = _bfs_hops(adj)
+    return {i: int(hop.get(i, -1)) for i in ids}
+
+
+def _bfs_hops(adj: Dict[int, set]) -> Dict[int, int]:
     hop = {ENTRANCE_ID: 0}
     q = deque([ENTRANCE_ID])
     while q:
         u = q.popleft()
-        for v in adj[u]:
+        for v in adj.get(u, ()):
             if v not in hop:
                 hop[v] = hop[u] + 1
                 q.append(v)
-    return {i: int(hop.get(i, -1)) for i in ids}
+    return hop
+
+
+def hops_vs_time(
+    run: Dict[int, dict], window_s: float = HOP_WINDOW_S
+) -> Dict[int, Dict[int, int]]:
+    """Per-window BFS hop count from the entrance (id 1000).
+
+    Returns {window_index: {drone_id: hop}} where a window covers
+    [w*window_s, (w+1)*window_s). A drone with no path to the entrance in a
+    window is absent from that window's dict (hop unknown, not hop -1: with
+    5 s log flushes a silent window means no data, not disconnection proof).
+    """
+    edges_by_win: Dict[int, set] = defaultdict(set)
+    for rec in run.values():
+        uwb = rec.get("uwb")
+        if uwb is None or getattr(uwb, "size", 0) == 0:
+            continue
+        wins = np.floor(np.asarray(uwb["stamp"], dtype=np.float64) / window_s).astype(int)
+        for w, a, b in zip(wins, uwb["observer_id"], uwb["peer_id"]):
+            edges_by_win[int(w)].add((int(a), int(b)))
+    out: Dict[int, Dict[int, int]] = {}
+    for w, edges in edges_by_win.items():
+        adj: Dict[int, set] = defaultdict(set)
+        for a, b in edges:
+            adj[a].add(b)
+            adj[b].add(a)
+        hop = _bfs_hops(adj)
+        out[w] = {i: h for i, h in hop.items() if i != ENTRANCE_ID}
+    return out
+
+
+def error_vs_hops_time(
+    per_drone: Dict[int, dict],
+    hops_t: Dict[int, Dict[int, int]],
+    window_s: float = HOP_WINDOW_S,
+) -> dict:
+    """Bucket per-sample position errors by their instantaneous hop count.
+
+    Each (t, |err|) sample of each drone is assigned the BFS hop of that
+    drone in the UWB graph of its window. Samples in windows where the drone
+    has no path to the entrance are counted as unassigned, not bucketed.
+    """
+    buckets: Dict[int, List[float]] = defaultdict(list)
+    n_unassigned = 0
+    for i, m in per_drone.items():
+        ts = m.get("err_t") or []
+        es = m.get("err_m") or []
+        for t, e in zip(ts, es):
+            h = hops_t.get(int(math.floor(float(t) / window_s)), {}).get(i, -1)
+            if h > 0 and math.isfinite(e):
+                buckets[h].append(float(e))
+            else:
+                n_unassigned += 1
+    out = {}
+    for h in sorted(buckets):
+        a = np.asarray(buckets[h], dtype=np.float64)
+        out[str(h)] = {
+            "rmse_m": float(np.sqrt(np.mean(a**2))),
+            "p50_m": float(np.median(a)),
+            "p95_m": float(np.percentile(a, 95)),
+            "n": int(a.size),
+        }
+    return {"window_s": float(window_s), "buckets": out, "n_unassigned": int(n_unassigned)}
 
 
 def uwb_mix(run: Dict[int, dict]) -> dict:
@@ -488,11 +561,14 @@ def evaluate(
         )
     hops = hops_from_uwb(logs) if logs else {i: -1 for i in ids}
     hops_ate = error_vs_hops(per, hops)
+    hops_t = hops_vs_time(logs) if logs else {}
+    hops_ate_time = error_vs_hops_time(per, hops_t)
     mix = uwb_mix(logs) if logs else {}
     if n_div_est:
         mix["n_diverged_estimate_rows"] = n_div_est
     nis_raw = nis_by_type(logs) if logs else {}
     diag = {
+        "ate_vs_hops_time": hops_ate_time,
         "entrance_edges": entrance_edges_vs_time(logs) if logs else {},
         "centroid_shape": centroid_vs_shape(estimates, truth),
         "nis_by_type": {
@@ -507,6 +583,9 @@ def evaluate(
         },
         "hops": {str(i): hops.get(i, -1) for i in ids},
         "ate_vs_hops_m": {str(h): hops_ate[h] for h in hops_ate},
+        # Time-resolved headline metric: samples bucketed by instantaneous
+        # BFS hop in each HOP_WINDOW_S window (run-aggregate kept above).
+        "ate_vs_hops_time": hops_ate_time,
         "mix": mix,
         "rpe_dt_s": RPE_DT_S,
         "aoa_fov_note": "bearing cone ±45° (aoa_fov_deg 90); live mutual-yaw often ~0",
@@ -529,10 +608,15 @@ def evaluate(
         yaw_series = {str(i): {"t": per[i].get("err_t", []), "yaw_err_rad": per[i].get("yaw_rad", [])} for i in per}
         with (out_dir / "metrics_6_1.json").open("w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
+        tb = hops_ate_time["buckets"]
         np.savez(
             out_dir / "metrics_6_1.npz",
             hops=np.array(list(hops_ate.keys()), dtype=np.int32),
             ate_vs_hops=np.array(list(hops_ate.values()), dtype=np.float64),
+            hops_time=np.array([int(h) for h in tb], dtype=np.int32),
+            ate_vs_hops_time_rmse=np.array([tb[h]["rmse_m"] for h in tb], dtype=np.float64),
+            ate_vs_hops_time_n=np.array([tb[h]["n"] for h in tb], dtype=np.int64),
+            hop_window_s=np.float64(hops_ate_time["window_s"]),
         )
         with (out_dir / "yaw_error.json").open("w", encoding="utf-8") as f:
             json.dump(yaw_series, f)
@@ -558,6 +642,15 @@ def print_report(report: dict) -> None:
         )
     print(f"  hops={report['hops']}")
     print(f"  ATE vs hops (m)={report['ate_vs_hops_m']}")
+    ht = report.get("ate_vs_hops_time") or {}
+    hb = ht.get("buckets") or {}
+    if hb:
+        bits = [f"hop {h}: rmse={v['rmse_m']:.3f} m (n={v['n']})" for h, v in sorted(hb.items(), key=lambda kv: int(kv[0]))]
+        print(
+            f"  err vs hops (time-resolved, {ht.get('window_s', HOP_WINDOW_S):.0f} s windows): "
+            + "; ".join(bits)
+            + f"; unassigned={ht.get('n_unassigned', 0)}"
+        )
     mix = report.get("mix") or {}
     if mix:
         print(
@@ -712,7 +805,45 @@ def run_selftest() -> int:
         check("7b NIS reject rate", abs(mix["nis_reject_rate"] - 2 / 180) < 1e-9, str(mix["nis_reject_rate"]))
         check("8 CPU under 20 ms (laptop)", mix["cpu_fits_20ms_on_laptop"])
         check("9 ATE vs hops has hop 1 and 2", set(report["ate_vs_hops_m"]) >= {"1", "2"})
+        ht = report.get("ate_vs_hops_time") or {}
+        check(
+            "9b time-resolved buckets 1 and 2 in report",
+            set(ht.get("buckets", {})) >= {"1", "2"},
+            str(ht),
+        )
         check("10 no SE3 needed: hop-1 ATE == offset", abs(float(report["ate_vs_hops_m"]["1"]) - expect) < 0.002)
+
+    # Time-resolved hops: one drone that is hop 1 early and hop 2 late.
+    # Direct entrance edge only at t=1; at t=6 drone 0 reaches the entrance
+    # only through drone 1 (relay), so its hop changes from 1 to 2.
+    log_a = MeasurementLogger(0)
+    log_b = MeasurementLogger(1)
+    nanv = float("nan")
+    log_a.add_uwb(1.0, KIND_ENTRANCE_RANGE, 0, ENTRANCE_ID, 2.0, nanv, nanv, 0.08, nanv, nanv, 0.0, 0.0, 0.0)
+    log_b.add_uwb(6.0, KIND_ENTRANCE_RANGE, 1, ENTRANCE_ID, 2.0, nanv, nanv, 0.08, nanv, nanv, 0.0, 0.0, 0.0)
+    log_a.add_uwb(6.0, KIND_RANGE, 0, 1, 1.5, nanv, nanv, 0.08, nanv, nanv, 0.0, 0.0, 0.0)
+    with tempfile.TemporaryDirectory() as td2:
+        td2 = Path(td2)
+        log_a.save(td2 / "cf_0.npz")
+        log_b.save(td2 / "cf_1.npz")
+        run2 = load_run(td2)
+        check("11 aggregate hop still 1", hops_from_uwb(run2).get(0) == 1)
+        ht2 = hops_vs_time(run2)
+        check("11b hop 1 early", ht2.get(1, {}).get(0) == 1, str(ht2))
+        check("11c hop 2 late", ht2.get(6, {}).get(0) == 2, str(ht2))
+        per2 = {0: {"err_t": [1.5, 3.5, 6.5], "err_m": [0.1, 0.2, 0.3]}}
+        evh = error_vs_hops_time(per2, ht2)
+        b = evh["buckets"]
+        check("11d both hop buckets populated", set(b) == {"1", "2"}, str(evh))
+        check(
+            "11e bucketed by instantaneous hop",
+            b.get("1", {}).get("n") == 1
+            and abs(b.get("1", {}).get("rmse_m", 0.0) - 0.1) < 1e-9
+            and b.get("2", {}).get("n") == 1
+            and abs(b.get("2", {}).get("rmse_m", 0.0) - 0.3) < 1e-9,
+            str(b),
+        )
+        check("11f no-graph window unassigned", evh["n_unassigned"] == 1, str(evh))
 
     print(f"[selftest] {n_pass} passed, {n_fail} failed")
     print("[selftest] " + ("ALL PASS" if ok else "FAILED"))

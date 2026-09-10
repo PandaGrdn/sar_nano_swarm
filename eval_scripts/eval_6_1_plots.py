@@ -230,14 +230,44 @@ def _write_plots_impl(
         if not show:
             plt.close(fig)
 
+    diag = diag or {}
+    hops_time = diag.get("ate_vs_hops_time") or {}
+    hb = {int(h): v for h, v in (hops_time.get("buckets") or {}).items()}
+
     fig, ax = plt.subplots(figsize=(6.4, 4.0))
+    ticks = set()
+    if hb:
+        hs = sorted(hb)
+        rmse = [hb[h]["rmse_m"] for h in hs]
+        ax.plot(hs, rmse, marker="o", lw=2, label=f"time-resolved ({hops_time.get('window_s', 1.0):.0f} s windows)")
+        for h in hs:
+            ax.annotate(
+                f"n={hb[h]['n']}",
+                (h, hb[h]["rmse_m"]),
+                textcoords="offset points",
+                xytext=(0, 8),
+                ha="center",
+                fontsize=8,
+            )
+        ticks.update(hs)
     if hops_ate:
-        hs = list(hops_ate)
-        ax.plot(hs, [hops_ate[h] for h in hs], marker="o", lw=2)
-        ax.set_xticks(hs)
+        hs = sorted(hops_ate)
+        ax.plot(
+            hs,
+            [hops_ate[h] for h in hs],
+            marker="s",
+            ls="--",
+            lw=1.2,
+            color="0.5",
+            label="run-aggregate ATE RMSE",
+        )
+        ticks.update(hs)
+    if ticks:
+        ax.set_xticks(sorted(ticks))
     ax.set_xlabel("hops from entrance")
-    ax.set_ylabel("ATE RMSE (m)")
+    ax.set_ylabel("position error RMSE (m)")
     ax.set_title("Error vs hops from entrance")
+    _maybe_legend(ax, fontsize=8)
     save(fig, "01_error_vs_hops.png")
 
     fig, ax = plt.subplots(figsize=(7.4, 4.2))
@@ -294,12 +324,15 @@ def _write_plots_impl(
 
     fig, ax = plt.subplots(figsize=(6.6, 6.2))
     for i in ids:
-        tru = truth.get(i)
         est = estimates.get(i)
-        if tru is not None and getattr(tru, "size", 0):
-            ax.plot(tru["p_x"], tru["p_y"], ls="--", lw=1.2, label=f"cf_{i} truth")
         if est is not None and getattr(est, "size", 0):
-            ax.plot(est["p_x"], est["p_y"], lw=1.2, label=f"cf_{i} est")
+            ax.plot(
+                est["p_x"], est["p_y"], ls="--", lw=1.0, alpha=0.7, label=f"cf_{i} est"
+            )
+    for i in ids:
+        tru = truth.get(i)
+        if tru is not None and getattr(tru, "size", 0):
+            ax.plot(tru["p_x"], tru["p_y"], ls="-", lw=2.0, label=f"cf_{i} truth")
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
     ax.set_title("Top-down trajectory (no SE(3) align)")
@@ -425,8 +458,11 @@ def _write_plots_impl(
 
     fig, axes = plt.subplots(2, 2, figsize=(10.8, 7.8))
     ax = axes[0, 0]
-    if hops_ate:
-        hs = list(hops_ate)
+    if hb:
+        hs = sorted(hb)
+        ax.plot(hs, [hb[h]["rmse_m"] for h in hs], marker="o", lw=2)
+    elif hops_ate:
+        hs = sorted(hops_ate)
         ax.plot(hs, [hops_ate[h] for h in hs], marker="o", lw=2)
     ax.set_title("ATE vs hops")
     ax.set_xlabel("hops")
