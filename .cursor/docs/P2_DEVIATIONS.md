@@ -122,3 +122,78 @@ error < 20°; trigger count stays 1 under cooldown).
 Note: entrance-observed rows are logged to the NIS log (per-type stats) but
 not to the `uwb` array of the measurement `.npz` — `central_reference.py`'s
 schema assumes drone-observed rows; extending it is out of this patch's scope.
+
+## 2026-09-09 — cf_2 yaw excursions: lead-drone yaw is bearing-starved; RIO stub white noise was publish-rate-dependent (fixed)
+
+Post-R1/R2/R3 run (`out/swarm_loc_eval/`, ATE 0.13–0.17 m): cf_2 yaw RMSE
+30.5° with excursions to ~60° (t≈58, t≈79–84). Diagnosis from
+`out/swarm_loc_logs/cf_*.npz`:
+
+- **Not the guard, not bad acceptances.** `n_yaw_mode_triggers = 0` on all
+  three drones; NIS reject rate 0.3% overall; no π mode.
+- **cf_2 is the LEAD drone** (spawn x = 3.0 m, flies furthest in). Truth
+  geometry puts both peers at az ≈ ±180° in its body frame for the whole run
+  — outside the ±45° AoA cone — so cf_2 logs **zero** own-bearing rows
+  (`relpos` counts: cf_0 3185, cf_1 1470, cf_2 0) and therefore zero
+  `mutual_yaw` pairs. Its 3042 `reciprocal_relpos` rows (peers' bearings TO
+  it) and 1620 `entrance_obs_relpos` rows have ∂h/∂ψ_i = 0: no direct yaw
+  information at all. `entrance_mutual_yaw = 0` is legitimate, not a pairing
+  bug: every own entrance edge in every log is range-only (the entrance is
+  astern of all drones for the whole run), so the §4.3e "own bearing to the
+  entrance" precondition never holds. cf_2's only yaw feedback is the p–ψ
+  cross-covariance built by body-frame odometry while translating; it does
+  work (t=66→69 the estimate recovers −30°→−2.5° while integrated RIO yaw
+  stays at −48°) but is weak. This is fundamental observability of the
+  scenario, not an estimator bug.
+- **Magnitude driver (fixed): `RioStubEngine.corrupt` injected `sigma_p` /
+  `sigma_psi_deg` white noise once per odom message with no √dt scaling.**
+  Gazebo odom runs at ~182 Hz (nominal filter rate is 50), so the integrated
+  yaw walk was 0.5°·√182 ≈ 45 deg²/s — matching the observed σ_ψ growth
+  (5.2°→12.1° over t=48–51 ⇒ ~40 deg²/s) and cf_2's error (est −43.3° at
+  t=57 vs RIO-integrated −45.2°). Integrated RIO yaw drifts −45…−77° for ALL
+  drones; cf_0/cf_1 correct it through their own bearings, cf_2 cannot. The
+  filter itself was honest (Q matched the injection; cf_2 mean NEES 3.34,
+  |err|/σ_ψ ≈ 2 at the peaks).
+
+Fix: `rio.noise_ref_rate_hz: 50.0` (new key in
+`configs/estimation/swarm_loc.yaml`); `corrupt()` scales each sample's white
+p/ψ noise by √(dt·ref_rate) and the advertised per-delta cov axes 0–3 by
+dt·ref_rate, so the walk per unit time is publish-rate independent. At
+dt = 1/ref_rate behavior is bit-identical to before (all offline selftests use
+dt = 0.02), and the cov travels inside the RIO message so estimator Q stays
+matched. At 182 Hz this cuts the injected yaw-walk variance 3.64× (45 →
+12.5 deg²/s, i.e. the configured 0.5°-per-50 Hz-frame spec); expected cf_2
+yaw excursions shrink ~1.9×. New checks in `rio_stub.py --selftest`
+(cov-at-ref-rate, cov scaling, 50-vs-200 Hz walk equality).
+
+Residual: even at 12.5 deg²/s the white per-frame jitter dominates
+`yaw_walk_deg_per_min: 3.0` (0.0025 deg²/s) as the yaw drift driver, and the
+lead drone's yaw remains unobservable through the bearing family. In-scope
+remedy candidates (not implemented — scenario/hardware changes): a rear-facing
+AoA antenna or wider cone (explicitly out of bounds per D11 note), periodic
+yaw glances by the lead drone, or a formation where the leader occasionally
+sees a peer. Estimator-side there is nothing left to correct: the filter's
+reported σ_ψ tracks the truth error honestly.
+
+### 2026-09-09 — Time-resolved error-vs-hops (`eval_scripts/eval_6_1.py`)
+
+The §6.1 headline metric was run-aggregate: one BFS over every UWB edge in
+the whole run (`hops_from_uwb`), so a drone that ranged the entrance even
+once was hop 1 for the entire run. On the 3-drone tunnel run this was not a
+bug — every drone held a direct entrance link at ~28 edges/s for the whole
+flight (entrance range 1.5–6.0 m vs `max_range_m: 30`, only a 2.5 s gap at
+t≈46–48 s with no estimate samples), so hop ≥ 2 was physically impossible —
+but the aggregate would hide the interesting regime on P2-8 corridor runs.
+
+Added, keeping the old aggregate keys unchanged (`hops`, `ate_vs_hops_m`):
+`hops_vs_time` (per-1 s-window BFS over the edges active in that window;
+window matches the existing `entrance_edges_vs_time` binning) and
+`error_vs_hops_time` (each error sample bucketed by its instantaneous hop;
+RMSE/p50/p95/n per bucket, unassigned counted). Report key
+`ate_vs_hops_time`, npz keys `hops_time` / `ate_vs_hops_time_rmse` /
+`ate_vs_hops_time_n` / `hop_window_s`. Plot `01_error_vs_hops.png` (and the
+dashboard panel) now draws the time-resolved curve with n per bucket and the
+aggregate as a dashed overlay. Selftest checks 9b and 11–11f cover a drone
+that is hop 1 early and hop 2 late. Exercising hop ≥ 2 for real needs a
+longer corridor / more drones / smaller entrance range (scenario change —
+not made here).

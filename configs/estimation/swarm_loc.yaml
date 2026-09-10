@@ -78,6 +78,11 @@ rio:
   scale_error: 1.02
   sigma_p: 0.02
   sigma_psi_deg: 0.5
+  # sigma_p / sigma_psi_deg are per-sample white noise AT this reference rate.
+  # The stub scales each sample by sqrt(dt * noise_ref_rate_hz) so the
+  # integrated random walk does not depend on the odom publish rate (Gazebo
+  # publishes ~180 Hz; without this the injected yaw walk tripled in variance).
+  noise_ref_rate_hz: 50.0
   dropout_rate: 0.02
   dropout_duration_s: 0.5
   dropout_q_scale: 25.0            # §4.2 — Q inflation while valid == False

@@ -126,6 +126,11 @@ class RioStubEngine:
         self.sigma_psi = math.radians(float(rio["sigma_psi_deg"]))
         self.dropout_rate = float(rio["dropout_rate"])
         self.dropout_duration_s = float(rio["dropout_duration_s"])
+        # sigma_p / sigma_psi_deg are per-sample white noise AT THIS RATE.
+        # corrupt() scales each sample by sqrt(dt * noise_ref_rate_hz) so the
+        # integrated random walk does not depend on the odom publish rate
+        # (Gazebo publishes ~180 Hz; the spec rate is the 50 Hz filter rate).
+        self.noise_ref_rate_hz = float(rio.get("noise_ref_rate_hz", 50.0))
         self.cov = rio_measurement_cov(cfg)
 
     def corrupt(
@@ -146,10 +151,16 @@ class RioStubEngine:
         yaw_rw_std = math.radians(self.yaw_walk_deg_per_min) / math.sqrt(60.0)
         dpsi_rw = float(self.rng.normal(0.0, yaw_rw_std * sqrt_dt))
 
+        # Rate-normalized white increment noise: one sample at dt = 1/ref rate
+        # carries exactly sigma; any other publish rate integrates to the same
+        # walk per unit time (variance scales with dt * ref_rate).
+        f2 = dt * self.noise_ref_rate_hz if dt > EPS else 0.0
+        f = math.sqrt(f2)
+
         dp = np.asarray(delta_p_body_true, dtype=np.float64).copy()
         dp = self.scale_error * dp + self.vel_bias * dt
-        dp = dp + self.rng.normal(0.0, self.sigma_p, size=3)
-        dpsi = float(delta_psi_true) + dpsi_rw + float(self.rng.normal(0.0, self.sigma_psi))
+        dp = dp + self.rng.normal(0.0, self.sigma_p * f, size=3)
+        dpsi = float(delta_psi_true) + dpsi_rw + float(self.rng.normal(0.0, self.sigma_psi * f))
 
         valid = True
         if stamp < self.dropout_until:
@@ -158,6 +169,10 @@ class RioStubEngine:
             self.dropout_until = stamp + self.dropout_duration_s
             valid = False
 
+        # The advertised cov must match the injected noise: scale the white
+        # p/psi axes by the same factor (scale axis is a constant bias term).
+        cov = self.cov.copy()
+        cov[0:4, 0:4] *= f2
         return RioDelta(
             stamp=float(stamp),
             dt=dt,
@@ -165,7 +180,7 @@ class RioStubEngine:
             delta_psi=dpsi,
             roll=float(roll),
             pitch=float(pitch),
-            cov=self.cov.copy(),
+            cov=cov,
             valid=valid,
         )
 
@@ -228,6 +243,42 @@ def run_selftest() -> int:
     check("0.2 ms still has increment", rio_has_increment(2e-4) is True)
     check("zero dt no velocity", rio_velocity_from_increment(0.0) is False)
     check("0.2 ms forms velocity", rio_velocity_from_increment(2e-4) is True)
+
+    # rate-normalized white noise: cov matches the injection at any rate
+    eng_r = make_engine(cfg, 0)
+    spsi_ref = rio_measurement_cov(cfg)[3, 3]
+    d_50 = eng_r.corrupt(0.02, 0.02, np.zeros(3), 0.0, 0.0, 0.0)
+    check(
+        "cov at ref rate unscaled",
+        abs(d_50.cov[3, 3] - spsi_ref) < 1e-15 and abs(d_50.cov[0, 0] - rio_measurement_cov(cfg)[0, 0]) < 1e-15,
+    )
+    d_200 = eng_r.corrupt(0.025, 0.005, np.zeros(3), 0.0, 0.0, 0.0)
+    check(
+        "cov scales with dt*ref_rate",
+        abs(d_200.cov[3, 3] - 0.25 * spsi_ref) < 1e-15
+        and abs(d_200.cov[4, 4] - d_50.cov[4, 4]) < 1e-15,
+        f"cov33={d_200.cov[3, 3]:.3e} expect={0.25 * spsi_ref:.3e}",
+    )
+
+    # walk per unit time is publish-rate independent (statistical, seeded)
+    def yaw_walk_var_per_s(rate_hz: int, n_s: float = 200.0) -> float:
+        c = dict(cfg)
+        c["rio"] = dict(cfg["rio"])
+        c["rio"].update({"vel_bias_walk": 0.0, "yaw_walk_deg_per_min": 0.0, "dropout_rate": 0.0})
+        e = RioStubEngine(c, np.random.default_rng(7))
+        dt_s = 1.0 / rate_hz
+        n = int(n_s * rate_hz)
+        acc = 0.0
+        for k in range(n):
+            acc += e.corrupt((k + 1) * dt_s, dt_s, np.zeros(3), 0.0, 0.0, 0.0).delta_psi ** 2
+        return acc / n_s
+    v50 = yaw_walk_var_per_s(50)
+    v200 = yaw_walk_var_per_s(200)
+    check(
+        "yaw walk rate-independent (50 vs 200 Hz)",
+        0.85 < v200 / v50 < 1.15,
+        f"v50={v50:.3e} v200={v200:.3e} ratio={v200 / v50:.3f}",
+    )
 
     eng_a = make_engine(cfg, 0)
     eng_b = make_engine(cfg, 0)
