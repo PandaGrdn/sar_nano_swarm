@@ -324,12 +324,15 @@ def _write_plots_impl(
 
     fig, ax = plt.subplots(figsize=(6.6, 6.2))
     for i in ids:
-        tru = truth.get(i)
         est = estimates.get(i)
-        if tru is not None and getattr(tru, "size", 0):
-            ax.plot(tru["p_x"], tru["p_y"], ls="--", lw=1.2, label=f"cf_{i} truth")
         if est is not None and getattr(est, "size", 0):
-            ax.plot(est["p_x"], est["p_y"], lw=1.2, label=f"cf_{i} est")
+            ax.plot(
+                est["p_x"], est["p_y"], ls="--", lw=1.0, alpha=0.7, label=f"cf_{i} est"
+            )
+    for i in ids:
+        tru = truth.get(i)
+        if tru is not None and getattr(tru, "size", 0):
+            ax.plot(tru["p_x"], tru["p_y"], ls="-", lw=2.0, label=f"cf_{i} truth")
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
     ax.set_title("Top-down trajectory (no SE(3) align)")
