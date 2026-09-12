@@ -74,6 +74,45 @@ TRUTH_DTYPE = np.dtype(
 # neither sorted nor uniformly stamped. See P2_DEVIATIONS BUG B4.
 TRUTH_SIM_STAMP_MIN_S = 1e-3
 
+# Metrics are scored over [t0, t1] (sim seconds). The gate sets t0 to the start
+# of the scripted path: before it, reset_pose teleports every drone to its layout
+# slot and hover height, a truth discontinuity no estimator can follow. The
+# window is saved beside the bundle so offline re-evaluation reproduces the score.
+SCORE_WINDOW_FILE = "score_window.json"
+
+
+def clip_to_window(
+    est: Optional[np.ndarray], t0: Optional[float], t1: Optional[float]
+) -> Optional[np.ndarray]:
+    """Estimate rows with t0 <= stamp <= t1; a None bound is open."""
+    if est is None or getattr(est, "size", 0) == 0:
+        return est
+    stamps = np.asarray(est["stamp"], dtype=np.float64)
+    keep = np.ones(stamps.size, dtype=bool)
+    if t0 is not None:
+        keep &= stamps >= float(t0)
+    if t1 is not None:
+        keep &= stamps <= float(t1)
+    return est[keep]
+
+
+def write_score_window(
+    out_dir: Path, t0: Optional[float], t1: Optional[float], source: str
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with (out_dir / SCORE_WINDOW_FILE).open("w", encoding="utf-8") as f:
+        json.dump({"t0": t0, "t1": t1, "source": source}, f, indent=2)
+
+
+def load_score_window(
+    eval_dir: Optional[Path],
+) -> Tuple[Optional[float], Optional[float], str]:
+    if eval_dir is None or not (eval_dir / SCORE_WINDOW_FILE).is_file():
+        return None, None, ""
+    with (eval_dir / SCORE_WINDOW_FILE).open("r", encoding="utf-8") as f:
+        w = json.load(f)
+    return w.get("t0"), w.get("t1"), str(w.get("source", ""))
+
 
 def sanitize_truth(truth: np.ndarray) -> np.ndarray:
     """Drop unset/non-finite stamps, sort by stamp, drop duplicate stamps.
@@ -591,18 +630,31 @@ def evaluate(
     out_dir: Optional[Path] = None,
     write_png: bool = True,
     show: bool = False,
+    score_t0: Optional[float] = None,
+    score_t1: Optional[float] = None,
+    score_source: str = "",
 ) -> dict:
     ids = sorted(set(estimates) | set(truth) | (set(logs) if logs else set()))
-    per: Dict[int, dict] = {}
+    # Divergence counts the whole recording: a filter that diverged during the
+    # teleport still diverged, even though those rows are not scored.
     n_div_est = 0
+    for est in estimates.values():
+        if hasattr(est, "dtype") and est.size and est.dtype.names and "status" in est.dtype.names:
+            n_div_est += int(np.sum(est["status"] != 0))
+    n_outside: Dict[int, int] = {}
+    if score_t0 is not None or score_t1 is not None:
+        clipped = {}
+        for i, est in estimates.items():
+            clipped[i] = clip_to_window(est, score_t0, score_t1)
+            n_outside[i] = int(est.size) - int(clipped[i].size) if est is not None else 0
+        estimates = clipped
+    per: Dict[int, dict] = {}
     for i in ids:
         est = estimates.get(i)
         tru = truth.get(i)
         if est is None or tru is None or est.size == 0 or tru.size == 0:
             per[i] = {"n": 0, "ate_rmse_m": float("nan")}
             continue
-        if hasattr(est, "dtype") and est.dtype.names and "status" in est.dtype.names:
-            n_div_est += int(np.sum(est["status"] != 0))
         per[i] = paired_errors(est, tru)
         per[i]["yaw_rmse_deg"] = (
             math.degrees(per[i]["yaw_rmse_rad"]) if math.isfinite(per[i]["yaw_rmse_rad"]) else float("nan")
@@ -636,6 +688,12 @@ def evaluate(
         "ate_vs_hops_time": hops_ate_time,
         "mix": mix,
         "rpe_dt_s": RPE_DT_S,
+        "score_window": {
+            "t0": score_t0,
+            "t1": score_t1,
+            "source": score_source,
+            "n_estimates_outside": {str(i): n for i, n in n_outside.items()},
+        },
         "aoa_fov_note": "bearing cone ±45° (aoa_fov_deg 90); live mutual-yaw often ~0",
         "diag": {
             "entrance_edges": diag["entrance_edges"],
@@ -678,6 +736,14 @@ def evaluate(
 
 
 def print_report(report: dict) -> None:
+    sw = report.get("score_window") or {}
+    if sw.get("t0") is not None or sw.get("t1") is not None:
+        print(
+            f"[eval_6_1] scoring window t0={sw.get('t0')} t1={sw.get('t1')} "
+            f"({sw.get('source', '')}); estimate rows outside={sw.get('n_estimates_outside', {})}"
+        )
+    else:
+        print("[eval_6_1] scoring window: full recording (none set)")
     print("[eval_6_1] per drone:")
     for i, m in report["per_drone"].items():
         print(
@@ -971,6 +1037,46 @@ def run_selftest() -> int:
         check("12o written bundle truth is sorted and real-stamped",
               got.size == san.size and bool(np.all(np.diff(got["stamp"]) > 0)))
 
+    # ---- 13: scoring window. The line-spawn -> layout teleport before the
+    # scripted path must not enter the score, and the window must survive an
+    # offline re-evaluation.
+    tt = np.linspace(40.0, 60.0, 1001)
+    tru_w = np.zeros(tt.size, dtype=TRUTH_DTYPE)
+    est_w = np.zeros(tt.size, dtype=STATE_DTYPE)
+    for k, tk in enumerate(tt):
+        p = np.array([1.8, 0.0, 0.015]) if tk < 46.3 else np.array([0.0, 0.0, 0.5])
+        tru_w[k]["stamp"] = tk
+        tru_w[k]["p_x"], tru_w[k]["p_y"], tru_w[k]["p_z"] = p
+        # the estimate lags the teleport, reconverging over 3 s to a 5 cm offset
+        lag = 1.8 * max(0.0, 1.0 - (tk - 46.3) / 3.0) if tk >= 46.3 else 0.0
+        est_w[k] = _synth_state_row(tk, 0, p + np.array([lag + 0.05, 0.0, 0.0]), 0.0)
+    full = evaluate(None, {0: tru_w}, {0: est_w}, out_dir=None, write_png=False)
+    win = evaluate(None, {0: tru_w}, {0: est_w}, out_dir=None, write_png=False,
+                   score_t0=52.9, score_source="flight_sim_t0")
+    ate_full = full["per_drone"]["0"]["ate_rmse_m"]
+    ate_win = win["per_drone"]["0"]["ate_rmse_m"]
+    check("13 teleport transient inflates full-recording ATE", ate_full > 0.2, f"{ate_full:.3f}")
+    check("13a windowed ATE is the steady tracking error", abs(ate_win - 0.05) < 2e-3, f"{ate_win:.4f}")
+    check("13b rows before t0 excluded and counted",
+          win["score_window"]["n_estimates_outside"].get("0") == int(np.sum(tt < 52.9)),
+          str(win["score_window"]))
+    check("13c full recording reports no window",
+          full["score_window"]["t0"] is None and not full["score_window"]["n_estimates_outside"])
+    end = evaluate(None, {0: tru_w}, {0: est_w}, out_dir=None, write_png=False,
+                   score_t0=52.9, score_t1=55.0)
+    check("13d end bound clips too",
+          end["per_drone"]["0"]["n"] == int(np.sum((tt >= 52.9) & (tt <= 55.0))),
+          str(end["per_drone"]["0"]["n"]))
+    past = evaluate(None, {0: tru_w}, {0: est_w}, out_dir=None, write_png=False, score_t0=70.0)
+    check("13e window past the run scores nothing, not a silent full score",
+          past["per_drone"]["0"]["n"] == 0)
+    with tempfile.TemporaryDirectory() as td4:
+        td4 = Path(td4)
+        write_score_window(td4, 52.9, None, "flight_sim_t0")
+        check("13f score window file roundtrip", load_score_window(td4) == (52.9, None, "flight_sim_t0"))
+        check("13g missing score window file -> full recording",
+              load_score_window(td4 / "absent") == (None, None, ""))
+
     print(f"[selftest] {n_pass} passed, {n_fail} failed")
     print("[selftest] " + ("ALL PASS" if ok else "FAILED"))
     return 0 if ok else 1
@@ -996,6 +1102,15 @@ def main():
     parser.add_argument("--out", default="", help="write metrics_6_1.json and plots/")
     parser.add_argument("--show", action="store_true", help="open matplotlib windows (needs a display)")
     parser.add_argument("--no-png", action="store_true", help="skip PNG files")
+    parser.add_argument(
+        "--score-start",
+        type=float,
+        default=None,
+        help=f"sim time to score from (default: {SCORE_WINDOW_FILE} in --eval-dir, else full recording)",
+    )
+    parser.add_argument(
+        "--score-end", type=float, default=None, help="sim time to score until (default: end of recording)"
+    )
     args = parser.parse_args()
     if args.selftest:
         sys.exit(run_selftest())
@@ -1017,6 +1132,11 @@ def main():
         print("[eval_6_1] no estimates.npz — NEES skipped (meas_log has no covariance)", flush=True)
     if not truth:
         print("[eval_6_1] no truth.npz — ATE/RPE/NEES skipped (estimator must not subscribe to odom)", flush=True)
+    score_t0, score_t1, score_source = load_score_window(eval_dir)
+    if args.score_start is not None:
+        score_t0, score_source = args.score_start, "--score-start"
+    if args.score_end is not None:
+        score_t1 = args.score_end
     report = evaluate(
         logs,
         truth,
@@ -1024,6 +1144,9 @@ def main():
         out_dir=out_dir,
         write_png=not args.no_png,
         show=args.show,
+        score_t0=score_t0,
+        score_t1=score_t1,
+        score_source=score_source,
     )
     print_report(report)
     if out_dir is not None:

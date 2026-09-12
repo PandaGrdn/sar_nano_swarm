@@ -853,6 +853,18 @@ class EstimateRecorder:
                 arr[k]["psi"] = psi
             truth[i] = arr
         write_eval_bundle(Path(out_dir), estimates, truth)
+        from eval_6_1 import write_score_window
+
+        write_score_window(
+            Path(out_dir), self.score_start(), None, "flight_sim_t0 (start of scripted path)"
+        )
+
+    def score_start(self) -> Optional[float]:
+        """Sim time scoring starts at, or None if the scripted path was never marked."""
+        t0 = self.flight_sim_t0
+        if t0 is None or not math.isfinite(t0) or t0 <= ODOM_SIM_STAMP_MIN_S:
+            return None
+        return float(t0)
 
     def shutdown(self) -> None:
         try:
@@ -1591,6 +1603,34 @@ def run_selftest() -> int:
         pairing_clock_check(list(np.linspace(-2.0, 25.0, 600)), list(est_sim["stamp"]))[0],
     )
 
+    # Scoring window: drive the real recorder and dump_eval, so the marker ->
+    # score_window.json plumbing itself is exercised, not a hand-passed value.
+    import tempfile
+
+    from eval_6_1 import load_score_window
+
+    rec = _fresh_recorder(1)
+    check("13 score_start None before the path is marked", rec.score_start() is None)
+    for t in np.linspace(0.0, 52.9, 50):
+        rec._on_odom(0, _FakeOdom(float(t)))
+    rec.mark_flight_start()
+    s0 = rec.score_start()
+    check("13a score_start is the flight-start marker", s0 is not None and abs(s0 - 52.9) < 0.5, str(s0))
+    with tempfile.TemporaryDirectory() as td:
+        rec.dump_eval(td)
+        t0, t1, src = load_score_window(Path(td))
+        check("13b dump_eval persists the score window start", t0 is not None and abs(t0 - s0) < 1e-9, f"t0={t0}")
+        check("13c score window end left open (landing stays scored)", t1 is None, f"t1={t1}")
+        check("13d score window records its source", "flight_sim_t0" in src, src)
+
+    rec = _fresh_recorder(1)
+    rec._on_odom(0, _FakeOdom(0.0))
+    rec.mark_flight_start()
+    with tempfile.TemporaryDirectory() as td:
+        rec.dump_eval(td)
+        t0, _, _ = load_score_window(Path(td))
+        check("13e unset marker persists no start, never a 0.0 window", t0 is None, f"t0={t0}")
+
     print(f"[selftest] {n_pass} passed, {n_fail} failed")
     print("[selftest] " + ("ALL PASS" if ok else "FAILED"))
     return 0 if ok else 1
@@ -1830,7 +1870,14 @@ def main():
             run = load_run(logs) if logs and Path(logs).exists() else None
             truth = load_structured_npz(out / "truth.npz", TRUTH_DTYPE)
             estimates = load_structured_npz(out / "estimates.npz")
-            report = evaluate(run, truth, estimates, out_dir=out)
+            report = evaluate(
+                run,
+                truth,
+                estimates,
+                out_dir=out,
+                score_t0=recorder.score_start(),
+                score_source="flight_sim_t0 (start of scripted path)",
+            )
             print_report(report)
         except Exception as e:
             import traceback

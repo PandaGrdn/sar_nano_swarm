@@ -739,3 +739,75 @@ unsanitized — check `truth.npz` for stamp 0.0 rows first. Scope:
 `eval_scripts/eval_6_1.py` and `perception/radar_processing/rio_bridge.py` only;
 `eval_scripts/swarm_loc_gate.py` untouched; nothing under `out/` written; not
 committed.
+
+## 2026-09-12 — Scoring window: metrics start at the scripted path (`eval_scripts/eval_6_1.py`, `eval_scripts/swarm_loc_gate.py`)
+
+**Why.** `run_flight` calls `reset_pose` on every drone before arming. That is a
+Gazebo set-pose — a teleport in truth. On the 2026-09-11 scored run each drone
+jumped in a single 5 ms odom step from its line spawn (`x = i * spacing`) to its
+layout slot and `hover_height`: 0.66 m (cf_0), 0.50 m (cf_1), **1.92 m (cf_2)**,
+and every drone 0.015 -> 0.500 m in z, so line layouts teleport too. No
+estimator can follow a discontinuity in truth: cf_2 took ~3 s to reconverge,
+peaking at 2.006 m error (dx +1.901), which inflated its ATE (0.218 -> 0.387 m
+with vs without the transient) and its NEES to 13.0. Spawning in formation would
+remove the xy jump but not the z jump, so a scoring window is the general fix.
+
+**What.** `evaluate()` takes `score_t0` / `score_t1` (sim seconds, `None` =
+open) and clips estimate rows to the window before every pose-error metric (ATE,
+RPE, yaw, NEES, error-vs-hops, centroid/shape, plots). Truth is not clipped. The
+gate sets `score_t0 = flight_sim_t0` — the BUG B3 marker at the start of the
+scripted path, after `reset_pose`, arming and the 4 s takeoff/settle — and leaves
+`score_t1` open, so **landing error stays in the score**: it is a real limitation
+(2D RIO has no vertical odometry), not an artifact. `dump_eval` persists
+`score_window.json` beside the bundle; `eval_6_1.py` reloads it for offline
+re-evaluation, and `--score-start` / `--score-end` override it. Divergence rows
+are still counted over the whole recording. The report carries `score_window`
+(t0, t1, source, estimate rows excluded per drone) and `print_report` states it.
+An unmarked path persists `t0 = null` (full recording), never a 0.0 window — and
+the liveness checks already FAIL such a run.
+
+**Effect on the 2026-09-11 scored run** (offline re-score, `--score-start 52.876`):
+
+| drone | full recording (ATE m / NEES) | from path start (ATE m / NEES) |
+|---|---|---|
+| cf_0 | 0.185 / 3.67 | 0.211 / 4.39 |
+| cf_1 | 0.216 / 3.80 | 0.252 / 4.52 |
+| cf_2 | 0.387 / 13.00 | 0.240 / 4.29 |
+
+cf_0 and cf_1 rise because their excluded pre-path segment was a low-error hover
+while the landing is kept; cf_2 falls because its excluded segment was the
+teleport. The three drones are now consistent with one another.
+
+**Selftest.** `eval_6_1.py` 41 -> **49** (`13`-`13g`: teleport transient
+excluded, excluded rows counted, end bound, a window past the run scores n=0
+rather than the full run, file roundtrip). `swarm_loc_gate.py` 99 -> **105**
+(`13`-`13e` drive the real recorder and `dump_eval`: `score_start` is the flight
+marker, t0 persisted, t1 open, an unset marker persists `null`). Not committed.
+
+## 2026-09-12 — `out/_kill_sim_stack.sh` leaked `gz_pose_to_odom` (memory starvation)
+
+The kill script had no pattern for `gz_pose_to_odom.py` (started by
+`phase0_gate.sh` for UWB/swarm-loc) or `wait_ros_odom.py`, and its leftover
+report did not list them, so it printed `(none)` while the republishers piled
+up: `ps` showed six alive, one per launch, the oldest 46,045 s old. Each held
+only 24-59 MB, but `gz sim` holds ~5.9 GB with the shared Embree map on a 7.9 GB
+host, so the leak removed the last margin. One launch hit 0 MB available:
+physics publishing stalled (`NodeShared::Publish() Error: Interrupted system
+call`), UWB dropped all three drones as odom went stale, no odom reached the gate
+recorder, and cflib's parallel open timed out.
+
+Every leaked process also subscribed to the pose bridge, so each `/cf_i/odom`
+carried several publishers republishing identical header stamps — duplicate
+rows, which `sanitize_truth` already dedups. They did **not** cause the
+zero-stamped rows of BUG B3/B4: `gz_pose_to_odom` copies each transform header
+verbatim and has no clock of its own.
+
+**Fix.** Kill both scripts and include them in the leftover report. After the
+fix a clean launch shows exactly one `gz_pose_to_odom` and ~2.4 GB available
+with the full stack up.
+
+**Scripting this stack through `wsl -e bash -lc`.** A `pgrep -f "<name>"` check
+matches the invoking shell's own command line, so it reports a process that is
+not running — use a bracket pattern (`"[p]hase0_gate.sh"`) or `pgrep -x`.
+Background only the detached launch (`setsid nohup ... < /dev/null &`), never a
+whole `&&` setup chain, which dies when the WSL shell exits.
