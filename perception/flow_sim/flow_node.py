@@ -460,6 +460,11 @@ def main():
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
     from sensor_msgs.msg import LaserScan
 
+    _eval = str(Path(__file__).resolve().parents[2] / "eval_scripts")
+    if _eval not in sys.path:
+        sys.path.insert(0, _eval)
+    from ros_gz_qos import subscribe_gz  # noqa: E402
+
     class FlowNode(Node):
         def __init__(self):
             super().__init__("flow_sim")
@@ -477,8 +482,12 @@ def main():
                 depth=10,
             )
             prefix = f"/cf_{self.cf_id}"
-            self.sub_odom = self.create_subscription(Odometry, f"{prefix}/odom", self._on_odom, qos)
-            self.sub_tof = self.create_subscription(LaserScan, f"{prefix}/tof_down", self._on_tof, qos)
+            self.sub_odom = subscribe_gz(
+                self, Odometry, f"{prefix}/odom", self._on_odom
+            )
+            self.sub_tof = subscribe_gz(
+                self, LaserScan, f"{prefix}/tof_down", self._on_tof
+            )
 
             self.pub_flow = self.create_publisher(TwistWithCovarianceStamped, f"{prefix}/flow", qos)
             self.pub_pixels = self.create_publisher(Vector3Stamped, f"{prefix}/flow/pixels", qos)

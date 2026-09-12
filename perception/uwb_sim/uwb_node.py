@@ -109,6 +109,11 @@ def main():
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
 
+    _eval = str(_REPO_ROOT / "eval_scripts")
+    if _eval not in sys.path:
+        sys.path.insert(0, _eval)
+    from ros_gz_qos import subscribe_gz  # noqa: E402
+
     class UwbNode(Node):
         def __init__(self):
             super().__init__("uwb_sim")
@@ -137,11 +142,11 @@ def main():
 
             qos = qos_profile_sensor_data
             for i in range(self.num_drones):
-                self.create_subscription(
+                subscribe_gz(
+                    self,
                     Odometry,
                     f"/cf_{i}/odom",
                     lambda msg, cf_id=i: self._on_odom(cf_id, msg),
-                    qos,
                 )
 
             self.pubs: Dict[int, object] = {}

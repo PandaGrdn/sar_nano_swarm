@@ -29,7 +29,7 @@ for p in 19850 19851 19852 19853 11311; do
 done
 sleep 2
 echo "[r4] leftover matching processes:"
-pgrep -af 'gz sim|cf2|swarm_loc|uwb_node|rio_stub' || echo "  (none)"
+pgrep -af 'gz sim|cf2|swarm_loc|uwb_node|rio_stub|rio_bridge' || echo "  (none)"
 
 rm -rf out/swarm_loc_logs
 mkdir -p out/swarm_loc_logs/tunnel/collinear_hover out/swarm_loc_eval/tunnel/collinear_hover
@@ -38,7 +38,7 @@ rm -f "$LOG"
 echo "[r4] starting headless phase0 (server only, no GUI, no RViz) …"
 nohup ./eval_scripts/phase0_gate.sh \
   -w phase0_tunnel_gate -n 3 --spacing 1.5 \
-  --headless --no-rviz --no-radar \
+  --headless --no-rviz \
   --swarm-loc-log-dir out/swarm_loc_logs/tunnel/collinear_hover \
   > "$LOG" 2>&1 &
 echo $! > /tmp/r4_phase0.pid

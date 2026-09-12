@@ -64,7 +64,24 @@ def rot_to_rpy(R: np.ndarray) -> tuple:
 
 
 def launch_position(cfg: dict, drone_id: int) -> np.ndarray:
+    """Surveyed launch position of drone `drone_id` (D13 — not a truth read).
+
+    If the launch block carries an explicit per-drone `positions_xyz_m` list
+    (written by the scenario runner for non-line layouts, e.g. the
+    triangle_forward reset_pose geometry), that wins. Otherwise the original
+    line model `spawn_x0_m + i*spacing_m` applies (backward compatible).
+    """
     launch = cfg["launch"]
+    positions = launch.get("positions_xyz_m")
+    if positions is not None:
+        i = int(drone_id)
+        if i >= len(positions):
+            raise IndexError(
+                f"launch.positions_xyz_m has {len(positions)} entries; "
+                f"no position for drone {i}"
+            )
+        p = positions[i]
+        return np.array([float(p[0]), float(p[1]), float(p[2])], dtype=np.float64)
     return np.array(
         [
             float(launch["spawn_x0_m"]) + int(drone_id) * float(launch["spacing_m"]),

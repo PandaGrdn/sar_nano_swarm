@@ -205,7 +205,7 @@ def run_selftest() -> int:
     cfg_path = resolve_config_path("configs/estimation/swarm_loc.yaml")
     cfg = load_config(cfg_path)
     check("config loads", isinstance(cfg, dict) and "rio" in cfg)
-    check("rio.source is stub", cfg["rio"]["source"] == "stub")
+    check("rio.source set", cfg["rio"]["source"] in ("stub", "real"))
 
     R0 = rpy_to_R(0.0, 0.0, 0.0)
     p0 = np.zeros(3)

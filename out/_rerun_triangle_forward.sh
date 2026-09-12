@@ -8,16 +8,24 @@ rm -rf /tmp/cflib_cache
 mkdir -p /tmp/cflib_cache
 mkdir -p out/swarm_loc_logs/tunnel/triangle_forward \
          out/swarm_loc_eval/tunnel/triangle_forward
+# Estimator config with the triangle's actual launch positions (D13).
+DERIVED_CFG=out/swarm_loc_eval/tunnel/triangle_forward/swarm_loc_derived.yaml
+python3 eval_scripts/swarm_loc_scenarios.py \
+  --write-config tunnel/triangle_forward \
+  --base configs/estimation/swarm_loc.yaml \
+  --out "$DERIVED_CFG" >/dev/null
+echo "[retry] derived estimator config → $DERIVED_CFG"
 LOG=/tmp/tri_fwd_phase0.log
 rm -f "$LOG"
 nohup ./eval_scripts/phase0_gate.sh \
   -w phase0_tunnel_gate -n 3 --spacing 0.9 \
-  --headless --no-rviz --no-radar \
+  --headless --no-rviz \
   --swarm-loc-log-dir out/swarm_loc_logs/tunnel/triangle_forward \
+  --swarm-loc-config "$DERIVED_CFG" \
   > "$LOG" 2>&1 &
 echo $! > /tmp/tri_fwd_phase0.pid
 ready=0
-for i in $(seq 1 180); do
+for i in $(seq 1 420); do
   if grep -q "Simulation ready" "$LOG" 2>/dev/null; then
     echo "[retry] Simulation ready after ${i}s"
     ready=1
@@ -55,6 +63,7 @@ fi
 set +e
 python3 -u eval_scripts/swarm_loc_gate.py \
   --scenario tunnel/triangle_forward \
+  --config "$DERIVED_CFG" \
   --connect-timeout 180 \
   --eval-dir out/swarm_loc_eval/tunnel/triangle_forward \
   --logs out/swarm_loc_logs/tunnel/triangle_forward

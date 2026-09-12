@@ -84,7 +84,7 @@ from scipy.spatial import cKDTree
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 
 from sensor_msgs.msg import Imu, PointCloud2
 from sensor_msgs_py import point_cloud2
@@ -297,8 +297,8 @@ def _stamp_to_sec(stamp) -> float:
 
 
 class ImuRadarFusionNode(Node):
-    def __init__(self):
-        super().__init__('imu_radar_fusion_node')
+    def __init__(self, node_name: str = "imu_radar_fusion_node"):
+        super().__init__(node_name)
 
         # ---- topics ----
         self.declare_parameter('imu_topic', '/imu/data')
@@ -338,6 +338,7 @@ class ImuRadarFusionNode(Node):
         self.declare_parameter('imu_gravity_sign', 1.0)
 
         g = lambda name: self.get_parameter(name).value
+        self.intensity_field = g('intensity_field')
         self.doppler_field = g('doppler_field')
         self.R_radar_to_body = Rotation.from_quat(g('radar_extrinsic_quat_xyzw')).as_matrix()
         self.radar_denoise = g('radar_denoise')
@@ -371,15 +372,27 @@ class ImuRadarFusionNode(Node):
         self._last_orientation_R = np.eye(3)
         self._have_orientation = False
         self._last_gt_vel_xy = None  # BENCHMARKING ONLY -- never read by predict()/update()
+        # Set by _radar_callback for subclasses (rio_bridge): did the last
+        # scan's Doppler solve succeed AND come out well-conditioned?
+        self._last_doppler_ok = False
+        self._last_doppler_result = None
 
         # ---- pub/sub ----
         self.fused_pub = self.create_publisher(TwistStamped, '~/fused_velocity', 10)
         self.doppler_pub = self.create_publisher(TwistStamped, '~/doppler_velocity', 10)
 
-        self.create_subscription(Imu, g('imu_topic'), self._imu_callback,
-                                  qos_profile_sensor_data)
-        self.create_subscription(PointCloud2, g('radar_topic'), self._radar_callback,
-                                  qos_profile_sensor_data)
+        # Single BEST_EFFORT (sensor-data) subscription per topic. A
+        # BEST_EFFORT request matches BOTH publisher reliabilities (RELIABLE
+        # ros_gz_bridge IMU, BEST_EFFORT SensorDataQoS radarays cloud), while
+        # a dual best-effort+reliable subscription pair would deliver every
+        # message from a RELIABLE publisher twice — double KF updates.
+        self.create_subscription(
+            Imu, g('imu_topic'), self._imu_callback, qos_profile_sensor_data
+        )
+        self.create_subscription(
+            PointCloud2, g('radar_topic'), self._radar_callback,
+            qos_profile_sensor_data
+        )
 
         odom_topic = g('odom_topic')
         if odom_topic:
@@ -446,9 +459,10 @@ class ImuRadarFusionNode(Node):
         xyz_world = xyz_body @ self._last_orientation_R.T
         radar_pc_2d = np.concatenate([xyz_world[:, :2], pts[:, 3:]], axis=1)  # x,y,intensity,doppler
 
-        radar_pc_2d = denoise_scattered_points(radar_pc_2d,
-                                                    radius=self.radar_denoise_radius,
-                                                    min_neighbors=self.radar_denoise_min_neighbors)
+        if self.radar_denoise:
+            radar_pc_2d = denoise_scattered_points(radar_pc_2d,
+                                                        radius=self.radar_denoise_radius,
+                                                        min_neighbors=self.radar_denoise_min_neighbors)
 
         if radar_pc_2d.shape[0] > 0:
             dists = np.linalg.norm(radar_pc_2d[:, :2], axis=1)
@@ -471,6 +485,14 @@ class ImuRadarFusionNode(Node):
                 max_condition_number=self.doppler_max_condition_number,
             )
             doppler_vel_est = -result.velocity  # static-scene assumption: fit recovers -v_ego
+
+        self._last_doppler_result = result
+        self._last_doppler_ok = bool(
+            doppler_vel_est is not None
+            and result is not None
+            and result.resolved
+            and result.well_conditioned
+        )
 
         if doppler_vel_est is not None:
             self._publish_twist(self.doppler_pub, doppler_vel_est, msg.header.stamp)

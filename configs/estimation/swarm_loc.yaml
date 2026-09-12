@@ -72,7 +72,7 @@ fusion:
   ci_omega_search: fast            # 'fast' = closed-form trace-min; 'grid' = 21-point sweep
 
 rio:
-  source: stub                     # stub | real
+  source: real                     # stub | real  (real = perception/radar_processing RIO.py + rio_bridge)
   vel_bias_walk: 1.0e-3
   yaw_walk_deg_per_min: 3.0
   scale_error: 1.02

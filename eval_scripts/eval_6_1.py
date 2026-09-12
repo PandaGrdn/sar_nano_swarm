@@ -67,8 +67,47 @@ TRUTH_DTYPE = np.dtype(
 )
 
 
+# A truth row whose header stamp is at/below this is UNSET, not "t = 0".
+# Same constant and same reason as swarm_loc_gate.ODOM_SIM_STAMP_MIN_S: the
+# /cf_*/odom stream interleaves zero-stamped (pre-clock / unstamped bridge)
+# messages with properly sim-stamped ones, so the recorded truth array is
+# neither sorted nor uniformly stamped. See P2_DEVIATIONS BUG B4.
+TRUTH_SIM_STAMP_MIN_S = 1e-3
+
+
+def sanitize_truth(truth: np.ndarray) -> np.ndarray:
+    """Drop unset/non-finite stamps, sort by stamp, drop duplicate stamps.
+
+    `interp_pose` below is a binary search (`np.searchsorted`) and its span
+    guard reads `ts[0]` / `ts[-1]` — both are only meaningful on a sorted,
+    real-stamped array. The recorder hands us neither (BUG B4): roughly half
+    the rows carry stamp 0 and they are interleaved with the real ones, so the
+    raw array has thousands of descending steps. Feeding that to interp_pose
+    pairs each estimate with an essentially arbitrary truth pose (ATE and NEES
+    inflated by ~6x and ~90x on the 2026-09-11 triangle_forward run), or — when
+    the LAST row happens to be zero-stamped — makes `t > ts[-1]` reject every
+    estimate and the metrics come out NaN. Sanitizing is not a threshold
+    change: it only removes rows that were never valid truth samples.
+    """
+    if truth is None or getattr(truth, "size", 0) == 0:
+        return truth
+    ts = truth["stamp"].astype(np.float64)
+    keep = np.isfinite(ts) & (ts > TRUTH_SIM_STAMP_MIN_S)
+    out = truth[keep]
+    if out.size == 0:
+        return out
+    order = np.argsort(out["stamp"].astype(np.float64), kind="stable")
+    out = out[order]
+    _, first = np.unique(out["stamp"].astype(np.float64), return_index=True)
+    return out[np.sort(first)]
+
+
 def interp_pose(truth: np.ndarray, t: float) -> Optional[np.ndarray]:
-    """Linear p, wrap-aware yaw. None if t is outside the truth span."""
+    """Linear p, wrap-aware yaw. None if t is outside the truth span.
+
+    Assumes `truth` is already sanitized (sorted, real stamps) — callers go
+    through `sanitize_truth` once per drone rather than per row.
+    """
     if truth.size < 2:
         return None
     ts = truth["stamp"].astype(np.float64)
@@ -111,6 +150,9 @@ def _cov_p(row) -> Optional[np.ndarray]:
 
 def paired_errors(est: np.ndarray, truth: np.ndarray) -> dict:
     """ATE RMSE (no alignment), RPE at 1 s, yaw RMSE, position NEES."""
+    truth = sanitize_truth(truth)
+    if truth is None or truth.size < 2:
+        truth = np.zeros(0, dtype=TRUTH_DTYPE)
     err = []
     err_xyz = []
     yaw = []
@@ -438,6 +480,7 @@ def centroid_vs_shape(
     ids = sorted(set(estimates) & set(truth))
     if len(ids) < 2:
         return {"t": [], "centroid_m": [], "shape_m": [], "mean_ate_m": []}
+    truth = {i: sanitize_truth(truth[i]) for i in ids}  # BUG B4 — see sanitize_truth
     t_ref = None
     for i in ids:
         est = estimates[i]
@@ -511,7 +554,12 @@ def error_vs_hops(per_drone: Dict[int, dict], hops: Dict[int, int]) -> Dict[int,
 def write_eval_bundle(out_dir: Path, estimates: Dict[int, np.ndarray], truth: Dict[int, np.ndarray]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     est_kw = {f"cf_{i}": np.asarray(a) for i, a in estimates.items()}
-    tru_kw = {f"cf_{i}": np.asarray(a, dtype=TRUTH_DTYPE) for i, a in truth.items()}
+    # BUG B4: persist truth already sanitized so the bundle on disk is usable
+    # by any offline consumer that assumes a sorted, real-stamped series.
+    tru_kw = {
+        f"cf_{i}": sanitize_truth(np.asarray(a, dtype=TRUTH_DTYPE))
+        for i, a in truth.items()
+    }
     np.savez(out_dir / "estimates.npz", **est_kw)
     np.savez(out_dir / "truth.npz", **tru_kw)
 
@@ -844,6 +892,84 @@ def run_selftest() -> int:
             str(b),
         )
         check("11f no-graph window unassigned", evh["n_unassigned"] == 1, str(evh))
+
+    # ---- 12: BUG B4 — unsorted / zero-stamped truth (the real recorder shape).
+    # The recorder interleaves zero-stamped odom rows with sim-stamped ones, so
+    # the truth array is ~half junk and thousands of steps descend. Build that
+    # shape from the clean series above and pin both failure modes.
+    tru_c = truth[0]
+    est_c = estimates[0]
+    ref = paired_errors(est_c, tru_c)
+    check("12 clean truth still pairs", ref["n"] > 400 and math.isfinite(ref["ate_rmse_m"]), str(ref["n"]))
+    check("12a clean truth ATE == offset", abs(ref["ate_rmse_m"] - float(np.linalg.norm(offset))) < 2e-3,
+          f"{ref['ate_rmse_m']:.4f}")
+    check("12b clean truth NEES ~ 3", abs(ref["mean_nees"] - 3.0) < 0.3, f"{ref['mean_nees']:.3f}")
+
+    zero = np.zeros(tru_c.size, dtype=TRUTH_DTYPE)  # stamp 0, pose 0 — the intruders
+    inter = np.empty(tru_c.size * 2, dtype=TRUTH_DTYPE)
+    inter[0::2] = tru_c
+    inter[1::2] = zero          # ends on a zero-stamped row, like cf_0/cf_1 live
+    check("12c interleaved truth is unsorted",
+          int(np.sum(np.diff(inter["stamp"]) < 0)) > 100 and inter["stamp"][-1] == 0.0)
+    san = sanitize_truth(inter)
+    check("12d sanitize drops zero stamps", int(np.sum(san["stamp"] <= TRUTH_SIM_STAMP_MIN_S)) == 0)
+    check("12e sanitize sorts", bool(np.all(np.diff(san["stamp"]) > 0)))
+    check("12f sanitize keeps every real row", san.size == int(np.sum(tru_c["stamp"] > TRUTH_SIM_STAMP_MIN_S)),
+          f"{san.size} vs {int(np.sum(tru_c['stamp'] > TRUTH_SIM_STAMP_MIN_S))}")
+    check("12g sanitize preserves poses",
+          bool(np.allclose(san["p_x"], tru_c["p_x"][tru_c["stamp"] > TRUTH_SIM_STAMP_MIN_S])))
+
+    bad = paired_errors(est_c, inter)
+    check("12h interleaved truth now pairs like clean", bad["n"] == ref["n"], f"{bad['n']} vs {ref['n']}")
+    check("12i interleaved truth ATE unchanged", abs(bad["ate_rmse_m"] - ref["ate_rmse_m"]) < 1e-9,
+          f"{bad['ate_rmse_m']:.4f}")
+    check("12j interleaved truth NEES unchanged", abs(bad["mean_nees"] - ref["mean_nees"]) < 1e-9)
+
+    # Pin what the OLD code did, so a regression cannot pass silently: the raw
+    # interleaved array ending on a zero stamp rejects every estimate (NaN
+    # metrics, the 2026-09-11 re-run), and an array ending on a real stamp
+    # pairs garbage (inflated ATE/NEES, the 2026-09-11 scored run).
+    def _old_paired_ate_n(est, tru):
+        n, se = 0, 0.0
+        ts = tru["stamp"].astype(np.float64)
+        for row in est:
+            t = float(row["stamp"])
+            if t < ts[0] or t > ts[-1]:
+                continue
+            k = max(0, min(int(np.searchsorted(ts, t, side="right") - 1), ts.size - 2))
+            e = np.array([row["p_x"] - tru[k]["p_x"], row["p_y"] - tru[k]["p_y"],
+                          row["p_z"] - tru[k]["p_z"]], dtype=np.float64)
+            n += 1
+            se += float(e @ e)
+        return n, (math.sqrt(se / n) if n else float("nan"))
+
+    n_old, ate_old = _old_paired_ate_n(est_c, inter)
+    # (a t == 0.0 estimate can still slip through the degenerate ts[0]==ts[-1]==0
+    # guard; everything else is rejected, which is what NaNs the metrics)
+    check("12k old pairing rejected ~everything (NaN metrics)",
+          n_old < 0.01 * ref["n"], f"n={n_old} of {ref['n']}")
+    inter2 = inter[:-1]  # now ends on a real stamp, like cf_2 live
+    n_old2, ate_old2 = _old_paired_ate_n(est_c, inter2)
+    check("12l old pairing inflated ATE", n_old2 > 0 and ate_old2 > 5.0 * ref["ate_rmse_m"],
+          f"n={n_old2} ate_old={ate_old2:.3f} vs {ref['ate_rmse_m']:.3f}")
+    check("12m fixed pairing unaffected by trailing row",
+          abs(paired_errors(est_c, inter2)["ate_rmse_m"] - ref["ate_rmse_m"]) < 1e-9)
+
+    # centroid/shape goes through the same guard
+    cs_ref = centroid_vs_shape(estimates, truth)
+    cs_bad = centroid_vs_shape(estimates, {i: np.concatenate([truth[i], np.zeros(1, dtype=TRUTH_DTYPE)])
+                                           for i in truth})
+    check("12n centroid_vs_shape survives a trailing zero stamp",
+          len(cs_bad["t"]) == len(cs_ref["t"]) and len(cs_ref["t"]) > 0,
+          f"{len(cs_bad['t'])} vs {len(cs_ref['t'])}")
+
+    # bundle written to disk is sanitized
+    with tempfile.TemporaryDirectory() as td3:
+        td3 = Path(td3)
+        write_eval_bundle(td3, {0: est_c}, {0: inter})
+        got = np.load(td3 / "truth.npz")["cf_0"]
+        check("12o written bundle truth is sorted and real-stamped",
+              got.size == san.size and bool(np.all(np.diff(got["stamp"]) > 0)))
 
     print(f"[selftest] {n_pass} passed, {n_fail} failed")
     print("[selftest] " + ("ALL PASS" if ok else "FAILED"))

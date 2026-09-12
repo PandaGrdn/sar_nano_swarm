@@ -594,6 +594,28 @@ def run_selftest() -> int:
     check("3b init scale 1", abs(st0.s - 1.0) < 1e-15)
     check("3c init yaw 0", abs(st0.psi) < 1e-15)
 
+    # 3d–3f explicit per-drone launch positions (scenario-derived configs)
+    cfg_tri = dict(cfg)
+    cfg_tri["launch"] = dict(cfg["launch"])
+    cfg_tri["launch"]["positions_xyz_m"] = [
+        [0.0, 0.45, 0.5],
+        [0.779, 0.0, 0.5],
+        [0.0, -0.45, 0.5],
+    ]
+    check(
+        "3d launch explicit positions",
+        np.allclose(SwarmState.from_launch(cfg_tri, 1).p, [0.779, 0.0, 0.5]),
+    )
+    check(
+        "3e launch explicit overrides line",
+        np.allclose(SwarmState.from_launch(cfg_tri, 2).p, [0.0, -0.45, 0.5]),
+    )
+    try:
+        SwarmState.from_launch(cfg_tri, 3)
+        check("3f launch missing entry raises", False)
+    except IndexError:
+        check("3f launch missing entry raises", True)
+
     # 4–5 rotation convention
     R_I = rpy_to_R(0.0, 0.0, 0.0)
     check("4 R identity", np.allclose(R_I, np.eye(3)))

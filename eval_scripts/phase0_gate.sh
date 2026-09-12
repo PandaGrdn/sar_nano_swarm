@@ -45,7 +45,7 @@
 #       --no-rviz        Skip RViz launch.
 #       --headless       Skip Gazebo GUI (server + SITL only, useful for CI).
 #       --check          Gate-check mode: start headless, wait 15 s, verify
-#                        /radar/points publishes ≥ 8 Hz, then exit 0/1.
+#                        /cf_0/radar/points publishes ≥ 8 Hz, then exit 0/1.
 #                        Implies --no-rviz --headless.
 #   -h, --help           Show this help and exit.
 #
@@ -184,10 +184,15 @@ CF2_BIN="${CRAZYSIM_FW:-$BUILD_DIR/cf2}"
   Build with:  cd $CRAZYSIM_DIR/sitl_make && make
   Or set:      export CRAZYSIM_FW=/path/to/cf2"
 
-# ── optional: override radar plugin dir ──────────────────────────────────────
-if [[ -n "${RADAR_PLUGIN_DIR:-}" ]]; then
-  export GZ_SIM_SYSTEM_PLUGIN_PATH="$RADAR_PLUGIN_DIR:${GZ_SIM_SYSTEM_PLUGIN_PATH:-}"
-  export LD_LIBRARY_PATH="$RADAR_PLUGIN_DIR:${LD_LIBRARY_PATH:-}"
+# ── radar plugin path (repo install wins so Doppler fields load) ─────────────
+_REPO_RADAR="$SAR_NANO_SWARM_ROOT/install/radarays_gz2/lib"
+if [[ -f "$_REPO_RADAR/libradar_sensor_system.so" ]]; then
+  export GZ_SIM_SYSTEM_PLUGIN_PATH="$_REPO_RADAR:${GZ_SIM_SYSTEM_PLUGIN_PATH:-}"
+  export LD_LIBRARY_PATH="$_REPO_RADAR:${LD_LIBRARY_PATH:-}"
+fi
+if [[ -n "${RADAR_PLUGIN_DIR:-}" && -d "$RADAR_PLUGIN_DIR" ]]; then
+  export GZ_SIM_SYSTEM_PLUGIN_PATH="${GZ_SIM_SYSTEM_PLUGIN_PATH:-}:$RADAR_PLUGIN_DIR"
+  export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$RADAR_PLUGIN_DIR"
 fi
 
 # ── resolve world SDF ─────────────────────────────────────────────────────────
@@ -251,6 +256,17 @@ if [[ "$USE_RADAR" == true ]]; then
   fi
 fi
 
+# Real RIO needs radarays Doppler clouds. Stub is the only no-radar odom path.
+if [[ "$USE_SWARM_LOC" == true ]]; then
+  _rio_cfg_early="${SWARM_LOC_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/estimation/swarm_loc.yaml}"
+  [[ "$_rio_cfg_early" != /* ]] && _rio_cfg_early="$SAR_NANO_SWARM_ROOT/$_rio_cfg_early"
+  _rio_src_early="$(python3 -c "import yaml; print(yaml.safe_load(open('$_rio_cfg_early'))['rio']['source'])" 2>/dev/null || echo stub)"
+  if [[ "$_rio_src_early" == "real" && "$USE_RADAR" != true ]]; then
+    die "rio.source=real requires the radar plugin (Doppler on /cf_<i>/radar/points).
+  Drop --no-radar, or set rio.source: stub in configs/estimation/swarm_loc.yaml."
+  fi
+fi
+
 # ── cleanup trap ──────────────────────────────────────────────────────────────
 _PIDS=()
 cleanup() {
@@ -271,6 +287,7 @@ pkill -f "uwb_node.py" 2>/dev/null || true
 pkill -f "uwb_sim" 2>/dev/null || true
 pkill -f "swarm_loc_node.py" 2>/dev/null || true
 pkill -f "rio_stub.py" 2>/dev/null || true
+pkill -f "rio_bridge.py" 2>/dev/null || true
 sleep 1
 
 # ── start Gazebo server ───────────────────────────────────────────────────────
@@ -313,8 +330,8 @@ for CF_ID in $(seq 0 $((NUM_DRONES - 1))); do
     --output-file     "$SDF_TMP"
 
   if [[ "$USE_RADAR" == true ]]; then
-    info "Injecting radarays_gz2 plugin on drone ${CF_ID} (mesh: $MESH_PATH) …"
-    python3 - "$SDF_TMP" "$MESH_PATH" <<'PYEOF'
+    info "Injecting radarays_gz2 plugin on drone ${CF_ID} (mesh: $MESH_PATH, topic: /cf_${CF_ID}/radar/points) …"
+    python3 - "$SDF_TMP" "$MESH_PATH" "$CF_ID" <<'PYEOF'
 import sys, xml.etree.ElementTree as ET
 
 ET.register_namespace('', 'http://sdformat.org/schemas/root.xsd')
@@ -330,6 +347,9 @@ plugin.set('filename', 'radar_sensor_system')
 plugin.set('name', 'radarays_gz2::RadarSensorSystem')
 mesh_elem = ET.SubElement(plugin, 'mesh_path')
 mesh_elem.text = sys.argv[2]
+# Per-drone radar topic so rio_bridge <i> sees only its own Doppler cloud.
+topic_elem = ET.SubElement(plugin, 'topic')
+topic_elem.text = f"/cf_{sys.argv[3]}/radar/points"
 
 tree.write(sys.argv[1], encoding='unicode')
 print(f"[radar-inject] Plugin injected into {sys.argv[1]}")
@@ -379,8 +399,8 @@ PYEOF
 
   info "Waiting for drone ${CF_ID} sensors (/cf_${CF_ID}/odom) to come online …"
   _drone_ready=false
-  for _i in $(seq 1 30); do
-    if timeout 2 gz topic -e -t "/cf_${CF_ID}/odom" -n 1 >/dev/null 2>&1; then
+  for _i in $(seq 1 20); do
+    if timeout 3 gz topic -e -t "/cf_${CF_ID}/odom" -n 1 >/dev/null 2>&1; then
       _drone_ready=true
       break
     fi
@@ -390,7 +410,7 @@ PYEOF
     info "Drone ${CF_ID} sensors publishing. Giving them 2s to stabilise …"
     sleep 2
   else
-    warn "Drone ${CF_ID} odom not detected after 30s — starting firmware anyway."
+    warn "Drone ${CF_ID} gz odom not detected after ~20s — firmware starts; ROS wait is later."
   fi
 
   export CF2_SIM_MODEL="gz_${MODEL}"
@@ -430,10 +450,28 @@ if [[ "$USE_TOF" == true || "$USE_FLOW" == true || "$USE_UWB" == true || "$USE_S
     if [[ "$USE_FLOW" == true || "$USE_UWB" == true || "$USE_SWARM_LOC" == true ]]; then
       _bridge_args+=("/cf_${i}/odom@nav_msgs/msg/Odometry[gz.msgs.Odometry")
     fi
+    if [[ "$USE_SWARM_LOC" == true ]]; then
+      _bridge_args+=("/cf_${i}/imu@sensor_msgs/msg/Imu[gz.msgs.IMU")
+    fi
   done
+  if [[ "$USE_UWB" == true || "$USE_SWARM_LOC" == true ]]; then
+    _bridge_args+=("/world/${WORLD_NAME}/dynamic_pose/info@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V")
+  fi
   info "Bridging gz topics to ROS 2 (${#_bridge_args[@]} mappings) …"
   ros2 run ros_gz_bridge parameter_bridge "${_bridge_args[@]}" &
   _PIDS+=($!)
+  if [[ "$USE_UWB" == true || "$USE_SWARM_LOC" == true ]]; then
+    python3 -u "$SAR_NANO_SWARM_ROOT/eval_scripts/gz_pose_to_odom.py" \
+      --world "$WORLD_NAME" --num-drones "$NUM_DRONES" &
+    _PIDS+=($!)
+  fi
+  if [[ "$USE_UWB" == true || "$USE_SWARM_LOC" == true ]]; then
+    info "Waiting for ROS /cf_*/odom (both QoS profiles) …"
+    if ! python3 -u "$SAR_NANO_SWARM_ROOT/eval_scripts/wait_ros_odom.py" \
+        --num-drones "$NUM_DRONES" --timeout 120; then
+      die "ROS /cf_*/odom never delivered. UWB and ATE would be empty."
+    fi
+  fi
 elif [[ "$USE_TOF" == true || "$USE_FLOW" == true || "$USE_UWB" == true || "$USE_SWARM_LOC" == true ]]; then
   warn "ros_gz_bridge not installed — gz-native topics not bridged to ROS."
   warn "Install with: sudo apt install ros-humble-ros-gz-bridge (or source setup_env.sh)."
@@ -480,7 +518,8 @@ if [[ "$USE_SWARM_LOC" == true ]]; then
   elif ! command -v ros2 &>/dev/null; then
     warn "ros2 not on PATH — skipping swarm-loc (source setup_env.sh)."
   else
-    info "Starting RIO stub + swarm-loc ($_cfg, ${NUM_DRONES} drones) …"
+    info "Starting RIO + swarm-loc ($_cfg, ${NUM_DRONES} drones) …"
+    _rio_src="$(python3 -c "import yaml; print(yaml.safe_load(open('$_cfg'))['rio']['source'])" 2>/dev/null || echo stub)"
     _log_dir=""
     if [[ -n "$SWARM_LOC_LOG_DIR" ]]; then
       _log_dir="$SWARM_LOC_LOG_DIR"
@@ -489,8 +528,15 @@ if [[ "$USE_SWARM_LOC" == true ]]; then
       info "swarm-loc measurement logs → $_log_dir"
     fi
     for i in $(seq 0 $((NUM_DRONES - 1))); do
-      python3 -u "$SAR_NANO_SWARM_ROOT/perception/swarm_loc/rio_stub.py" \
-        --cf-id "$i" --config "$_cfg" &
+      if [[ "$_rio_src" == "real" ]]; then
+        info "RIO source=real (radar_processing/rio_bridge.py) cf_${i}"
+        python3 -u "$SAR_NANO_SWARM_ROOT/perception/radar_processing/rio_bridge.py" \
+          --cf-id "$i" --config "$_cfg" &
+      else
+        info "RIO source=stub (rio_stub.py) cf_${i}"
+        python3 -u "$SAR_NANO_SWARM_ROOT/perception/swarm_loc/rio_stub.py" \
+          --cf-id "$i" --config "$_cfg" &
+      fi
       _PIDS+=($!)
       if [[ -n "$_log_dir" ]]; then
         python3 -u "$SAR_NANO_SWARM_ROOT/perception/swarm_loc/swarm_loc_node.py" \
@@ -560,7 +606,7 @@ echo "  ║  ToF sensor   : ${USE_TOF}"
 echo "  ║  Optical flow : ${USE_FLOW}"
 echo "  ║  UWB          : ${USE_UWB}"
 echo "  ║  Swarm-loc    : ${USE_SWARM_LOC}"
-echo "  ║  Radar topic  : /radar/points  (~10 Hz)"
+echo "  ║  Radar topic  : /cf_<id>/radar/points  (~10 Hz, per drone)"
 echo "  ║  ToF topic    : /cf_<id>/tof_down  (gz-native, ~30 Hz)"
 echo "  ║  Flow topic   : /cf_0/flow  (ROS, ~100 Hz)"
 echo "  ║  UWB topic    : /cf_<id>/uwb/edges  (~scheduler tick Hz)"
@@ -576,15 +622,15 @@ fi
 
 # ── gate-check mode ───────────────────────────────────────────────────────────
 if [[ "$GATE_CHECK" == true ]]; then
-  info "Gate-check mode: waiting 15 s for /radar/points to stabilise …"
+  info "Gate-check mode: waiting 15 s for /cf_0/radar/points to stabilise …"
   sleep 15
 
   if ! command -v ros2 &>/dev/null; then
     die "--check requires ros2 on PATH (source setup_env.sh first)."
   fi
 
-  info "Sampling /radar/points for 5 s …"
-  HZ_OUTPUT=$(ros2 topic hz /radar/points --window 10 2>&1 &
+  info "Sampling /cf_0/radar/points for 5 s …"
+  HZ_OUTPUT=$(ros2 topic hz /cf_0/radar/points --window 10 2>&1 &
               HZ_PID=$!
               sleep 5
               kill $HZ_PID 2>/dev/null || true
@@ -594,18 +640,18 @@ if [[ "$GATE_CHECK" == true ]]; then
 
   if [[ -z "$MEASURED_HZ" ]]; then
     echo ""
-    echo "  [GATE] FAIL — /radar/points not detected (check plugin build and mesh path)"
+    echo "  [GATE] FAIL — /cf_0/radar/points not detected (check plugin build and mesh path)"
     exit 1
   fi
 
   # Pass if measured rate >= 8 Hz (allows some jitter below the 10 Hz target).
   if python3 -c "import sys; sys.exit(0 if float('${MEASURED_HZ}') >= 8.0 else 1)"; then
     echo ""
-    echo "  [GATE] PASS — /radar/points @ ${MEASURED_HZ} Hz  (target ≥ 8 Hz)"
+    echo "  [GATE] PASS — /cf_0/radar/points @ ${MEASURED_HZ} Hz  (target ≥ 8 Hz)"
     exit 0
   else
     echo ""
-    echo "  [GATE] FAIL — /radar/points @ ${MEASURED_HZ} Hz  (target ≥ 8 Hz)"
+    echo "  [GATE] FAIL — /cf_0/radar/points @ ${MEASURED_HZ} Hz  (target ≥ 8 Hz)"
     exit 1
   fi
 fi

@@ -23,12 +23,12 @@ Usage: ./eval_scripts/run_swarm_loc_scenario.sh [--launch-sim] [--gui] SCENARIO
   --launch-sim   start phase0_gate.sh for this scenario's world (blocks until ready)
   --gui          with --launch-sim, keep Gazebo GUI / RViz
   --list         print catalog
-  --no-radar     pass through to phase0 (faster; RIO stub still uses odom)
+  --no-radar     only if rio.source is stub (real RIO needs /radar/points)
 
 Examples:
   ./eval_scripts/run_swarm_loc_scenario.sh --list
   ./eval_scripts/run_swarm_loc_scenario.sh tunnel/collinear_hover
-  ./eval_scripts/run_swarm_loc_scenario.sh tunnel/triangle_forward --launch-sim --no-radar
+  ./eval_scripts/run_swarm_loc_scenario.sh tunnel/triangle_forward --launch-sim
 EOF
 }
 
@@ -60,6 +60,16 @@ read -r WORLD N SPACING LOGDIR EVALDIR <<<"$META"
 
 mkdir -p "$LOGDIR" "$EVALDIR"
 
+# Derived estimator config: launch.positions_xyz_m = this scenario's actual
+# spawn/reset geometry (triangle layouts do NOT match the stock line launch:
+# block). Passed to phase0 (estimators + RIO) and to the gate below.
+DERIVED_CFG="$EVALDIR/swarm_loc_derived.yaml"
+python3 eval_scripts/swarm_loc_scenarios.py \
+  --write-config "$SCENARIO" \
+  --base configs/estimation/swarm_loc.yaml \
+  --out "$DERIVED_CFG" >/dev/null
+echo "[scenario] derived estimator config → $DERIVED_CFG"
+
 if [[ "$LAUNCH" == true ]]; then
   LOG=/tmp/swarm_loc_scenario_phase0.log
   rm -f "$LOG"
@@ -67,6 +77,7 @@ if [[ "$LAUNCH" == true ]]; then
   nohup ./eval_scripts/phase0_gate.sh \
     -w "$WORLD" -n "$N" --spacing "$SPACING" \
     --swarm-loc-log-dir "$LOGDIR" \
+    --swarm-loc-config "$DERIVED_CFG" \
     "${HEADLESS[@]}" "${EXTRA_PHASE0[@]}" \
     > "$LOG" 2>&1 &
   echo $! > /tmp/swarm_loc_scenario_phase0.pid
@@ -87,5 +98,6 @@ if [[ "$LAUNCH" == true ]]; then
 fi
 
 python3 -u eval_scripts/swarm_loc_gate.py --scenario "$SCENARIO" \
+  --config "$DERIVED_CFG" \
   --eval-dir "$EVALDIR" --logs "$LOGDIR"
 echo "[scenario] eval → $EVALDIR"
