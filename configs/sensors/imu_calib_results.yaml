@@ -1,0 +1,57 @@
+sample_rate_hz: 100.00009536752259
+duration_s: 18.279982566833496
+gyro:
+  per_axis:
+    x:
+      random_walk_coeff: 0.0001252857300547368
+      bias_instability: 7.49420402200563e-05
+      bias_instability_tau_s: 4.569995641708374
+      rate_random_walk_coeff: .nan
+    y:
+      random_walk_coeff: 0.00020014134271876565
+      bias_instability: 0.00011867553787064597
+      bias_instability_tau_s: 4.569995641708374
+      rate_random_walk_coeff: .nan
+    z:
+      random_walk_coeff: 7.872876266775067e-05
+      bias_instability: 5.315754437031255e-05
+      bias_instability_tau_s: 4.569995641708374
+      rate_random_walk_coeff: .nan
+  random_walk_coeff_avg: 0.00013471861181375104
+  bias_instability_avg: 8.225837415367161e-05
+  bias_instability_avg_scaled: 16.967007607008235
+  bias_instability_unit: deg/hr
+  rate_random_walk_coeff_avg: .nan
+accel:
+  per_axis:
+    x:
+      random_walk_coeff: 0.0026715320208660666
+      bias_instability: 0.0008332195814372421
+      bias_instability_tau_s: 0.2999997138977051
+      rate_random_walk_coeff: 0.0013813044710147763
+    y:
+      random_walk_coeff: 0.0009037449507521196
+      bias_instability: 0.0004761866652065236
+      bias_instability_tau_s: 1.3099987506866455
+      rate_random_walk_coeff: 0.0004433800045656775
+    z:
+      random_walk_coeff: 0.0003140675786737739
+      bias_instability: 0.00021420868686330215
+      bias_instability_tau_s: 3.0099971294403076
+      rate_random_walk_coeff: 0.00018126766644642098
+  random_walk_coeff_avg: 0.0012964481834306532
+  bias_instability_avg: 0.0005078716445023559
+  bias_instability_avg_scaled: 51.77080983714127
+  bias_instability_unit: ug
+  rate_random_walk_coeff_avg: 0.0006686507140089582
+recommended_rio_params:
+  imu_process_noise_std: 0.0012964481834306532
+  note_imu_process_noise_std: Set from the averaged accelerometer white-noise coefficient
+    (m/s^2 per sqrt(Hz)) since RIO.py's predict() builds Q = (imu_process_noise_std^2)
+    * dt directly on the velocity state.
+  gyro_bias_instability_deg_per_hr: 16.967007607008235
+  accel_bias_instability_ug: 51.77080983714127
+  note_bias: RIO.py does not currently model IMU bias as a filter state -- these bias-instability
+    numbers aren't consumed anywhere yet. If drift is significant relative to your
+    mission duration, add a bias state (e.g. Gauss-Markov) to ImuRadarVelocityKF rather
+    than folding it into process_noise_std.

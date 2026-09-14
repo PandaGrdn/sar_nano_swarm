@@ -1,0 +1,31 @@
+scan_analysis:
+  num_scans_used: 1639
+  residual_rms:
+    mean: 0.05174460513614055
+    median: 0.04039400173950712
+    std: 0.08085783096268834
+    p90: 0.08046556111101416
+    max: 1.5342695194346005
+  condition_number:
+    mean: 1.9485891560040194
+    p90: 2.430279700729226
+  inlier_fraction_mean: 0.7611306626590646
+  velocity_error_vs_groundtruth:
+    bias_vx: 0.9228882610239709
+    bias_vy: -1.057938371474536
+    std_vx: 0.4394743948258054
+    std_vy: 0.5315861279752744
+    rmse_speed: 1.564186016859023
+    p90_speed_err: 1.9084635407296566
+recommended_rio_params:
+  imu_residual_noise_floor: 0.0404
+  note_imu_residual_noise_floor: Set to the median per-scan residual RMS so the dynamic-noise
+    path (imu_use_residual_as_noise) doesn't get more confident than a typical well-conditioned
+    scan actually supports.
+  imu_measurement_noise_std: 0.4877
+  note_imu_measurement_noise_std: Set from the empirical std of (fitted velocity -
+    ground truth velocity), NOT from residual_rms -- residual_rms only reflects internal
+    fit consistency and misses systematic bias/scale error. Note measured bias was
+    (0.9229, -1.0579) m/s; if that's non-trivial relative to sigma_vel, look at doppler_sign,
+    radar extrinsic calibration, or IMU orientation before trusting this noise number
+    in production.
