@@ -86,6 +86,100 @@ rio:
   dropout_rate: 0.02
   dropout_duration_s: 0.5
   dropout_q_scale: 25.0            # §4.2 — Q inflation while valid == False
+  # ros_params: ESTIMATOR-side tuning of the real RIO node (rio.source: real),
+  # i.e. how much RIO.py's 2x2 velocity KF trusts the IMU vs the Doppler fit.
+  # rio_bridge.py passes each key as `-p name:=value` to RIO.ImuRadarFusionNode.
+  # It adds no noise to any sensor. Keys must be names RIO.py declares (the
+  # bridge whitelists them and refuses unknown keys, odom_topic, imu_topic and
+  # radar_topic). Absent/empty block = RIO.py defaults.
+  #
+  # PROVENANCE (values copied by hand; per plan §0/§3.3 the estimator never
+  # reads configs/sensors/* at runtime — those files drive the simulator):
+  #   - configs/sensors/imu_calib_results.yaml and
+  #     configs/sensors/radar_calib_results.yaml, both added in commit bc00044
+  #     by varinik on 2026-09-13. The script that generated them is not in the
+  #     repository on any branch.
+  #   - IMU file: Allan-variance analysis of an 18.3 s, 100 Hz IMU log.
+  #     imu_process_noise_std = averaged accelerometer white-noise density
+  #     (m/s^2/sqrt(Hz)); RIO.py predict() uses q = process_noise_std**2 * dt.
+  #     RIO does not model IMU bias, so the file's bias-instability numbers are
+  #     not consumed anywhere.
+  #   - Radar file: analysis evidently run on the ColoRadar dataset (the
+  #     `landmarking` branch's radar/examples/python/benchmarking.py points at
+  #     coloradar/kitti/2_23_2021_edgar_classroom_run4) — a different radar and
+  #     platform from this simulator. That file records a systematic velocity
+  #     bias of (+0.92, -1.06) m/s vs ground truth and its note warns to check
+  #     doppler_sign, the radar extrinsic, or IMU orientation before trusting
+  #     the noise number. On this simulator's latest real-RIO run the per-drone
+  #     velocity bias was near zero (<= 0.10 m/s mean). Values applied as given.
+  #
+  # INTERACTION (RIO.py radar callback): with imu_use_residual_as_noise: true,
+  # each Doppler update uses
+  #   meas_std = max(residual_rms * imu_residual_noise_scale, imu_residual_noise_floor)
+  # and imu_measurement_noise_std is used ONLY when the flag is false or the
+  # scan's residual_rms is non-finite. With floor 0.0404 and a median residual
+  # ~0.04 (p90 ~0.08), the effective measurement std is ~0.04-0.08 m/s — about
+  # an order of magnitude below the 0.4877 derived from empirical velocity
+  # error. So under the setting below, 0.4877 is effectively a FALLBACK.
+  # Flipping imu_use_residual_as_noise to false makes 0.4877 the constant
+  # measurement std for every update. Left true (RIO.py's default) pending a
+  # decision.
+  ros_params:
+    imu_process_noise_std: 0.0012964481834306532   # imu_calib_results.yaml (RIO default 0.05)
+    imu_residual_noise_floor: 0.0404               # radar_calib_results.yaml (RIO default 0.02)
+    imu_measurement_noise_std: 0.4877              # radar_calib_results.yaml (RIO default 0.2); fallback, see above
+    imu_use_residual_as_noise: true                # explicit; RIO default, unchanged
+  # attitude: where RIO / rio_bridge get body attitude (roll, pitch, yaw).
+  # Gazebo's Imu.orientation is computed from the simulated body pose, i.e.
+  # GROUND TRUTH, and gz-sensors cannot noise it. A Crazyflie has no attitude
+  # sensor, so the estimator must ESTIMATE attitude from the noisy gyro+accel.
+  #   source: estimated     rio_bridge feeds perception/radar_processing/
+  #                         attitude_filter.py ONLY angular_velocity,
+  #                         linear_acceleration and header.stamp, and gives RIO
+  #                         the filter quaternion. Default; the only valid
+  #                         setting for reported results.
+  #   source: gazebo_truth  old behaviour (Imu.orientation passed through).
+  #                         SIM-ORACLE ABLATION ONLY — never for reported results.
+  # The block is REQUIRED: rio_bridge refuses to start without it (no silent
+  # fallback to ground truth) and every key below is required for `estimated`.
+  #
+  # ALGORITHM: Madgwick IMU gradient-descent filter (Madgwick, Harrison,
+  # Vaidyanathan, IEEE ICORR 2011, doi:10.1109/ICORR.2011.5975346). Yaw is
+  # pure gyro integration (no magnetometer) starting at launch.init_yaw_deg (D14).
+  #
+  # PROVENANCE (copied by hand; per plan §0/§3.3 the estimator never reads
+  # configs/sensors/*): gyro random_walk_coeff from
+  # configs/sensors/imu_calib_results.yaml (commit bc00044), times sqrt(1000 Hz)
+  # (the Gazebo IMU update rate) = per-sample white-noise stddev
+  #   x 0.003962, y 0.006329, z 0.002489 rad/s; per-axis RMS 0.0045443 rad/s.
+  # Madgwick eq. 50: beta = sqrt(3/4) * omega_beta, omega_beta = gyro
+  # measurement error per axis -> beta = 0.8660 * 0.0045443 = 0.003935.
+  # beta bounds the quaternion-rate correction, i.e. a tilt error is removed
+  # at ~2*beta = 0.0079 rad/s (0.45 deg/s).
+  # MATCHED-NOISE CAVEAT: the gain is tuned from the same calibration the
+  # simulator injects, which is optimistic versus real hardware (motor
+  # vibration, bias drift, temperature, scale/misalignment are not simulated).
+  attitude:
+    source: estimated                # estimated | gazebo_truth (SIM-ORACLE ablation)
+    algorithm: madgwick_imu
+    madgwick_beta: 0.003935          # sqrt(3/4) * 0.0045443 rad/s, see above
+    # Start-up calibration (EKF-RIO calib_gyro/T_init; Crazyflie startup gyro
+    # calibration): the platform must be still for init_window_s of SIM time.
+    # Mean gyro -> bias; mean accel -> roll/pitch. A sample exceeding either
+    # motion threshold restarts the window. Thresholds sit far above the
+    # per-sample noise (gyro norm ~0.008 rad/s; worst accel axis 0.084 m/s^2).
+    init_window_s: 2.0
+    init_min_samples: 50
+    init_max_gyro_norm_rad_s: 0.05
+    init_max_accel_dev_mps2: 0.5     # | |a| - gravity_mps2 |
+    # Sim-time gap larger than this is NOT integrated across (rotation during
+    # the gap is lost, counted); also treats a backward jump as a time reset.
+    max_dt_gap_s: 0.1
+    gravity_mps2: 9.81               # same magnitude RIO.py uses (imu_gravity_mag default)
+    # Written into the Imu copy handed to RIO (orientation_covariance diagonal).
+    # RIO.py only checks covariance[0] != -1; (1 deg)^2 placeholder, not fitted.
+    orientation_cov_rad2: 3.0e-4
+    log_throttle_s: 5.0              # "attitude initializing" log throttle (wall s)
 
 ablation:
   disable_uwb: false

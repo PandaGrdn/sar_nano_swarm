@@ -13,6 +13,7 @@ kill_pat 'swarm_loc_gate.py'
 kill_pat 'swarm_loc_node.py'
 kill_pat 'swarm_loc_logger'
 kill_pat 'uwb_node.py'
+kill_pat 'radar_noise_node'
 kill_pat 'rio_stub'
 kill_pat 'rio_bridge'
 kill_pat 'flow_node.py'
@@ -42,6 +43,6 @@ for line in out.splitlines():
 PY
 sleep 2
 echo "[kill] leftover:"
-pgrep -af 'gz sim|cf2|swarm_loc|uwb_node|rio_stub|rio_bridge|phase0_gate|flow_node|gz_pose_to_odom|wait_ros_odom' || echo "  (none)"
+pgrep -af 'gz sim|cf2|swarm_loc|uwb_node|radar_noise_node|rio_stub|rio_bridge|phase0_gate|flow_node|gz_pose_to_odom|wait_ros_odom' || echo "  (none)"
 ss -ulnp 2>/dev/null | grep -E ':1985|:1995' || echo "[kill] cflib/CfFirm ports free"
 echo "[kill] done"

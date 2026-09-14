@@ -811,3 +811,233 @@ matches the invoking shell's own command line, so it reports a process that is
 not running — use a bracket pattern (`"[p]hase0_gate.sh"`) or `pgrep -x`.
 Background only the detached launch (`setsid nohup ... < /dev/null &`), never a
 whole `&&` setup chain, which dies when the WSL shell exits.
+
+## 2026-09-14 — IMU sensor noise from calibration; RIO tuned from calibration; radar still noise-free
+
+**Inputs.** `configs/sensors/imu_calib_results.yaml` and
+`configs/sensors/radar_calib_results.yaml` (commit bc00044, varinik). The
+script that generated them is not in the repository on any branch.
+
+* **IMU file** — Allan-variance analysis of an 18.3 s, 100 Hz log of an IMU
+  whose identity is not documented. Magnitudes are the same order as the BMI088
+  datasheet (gyro white noise 0.55x, accel 0.81x). 18 s is far short of the
+  >= 300 s normally needed for bias instability; `apply_imu_noise.py` warns that
+  accel x/y bias-instability values fall below the white-noise floor.
+* **Radar file** — contains **no radar sensor noise model**. It is RIO's
+  Doppler-velocity error against ground truth on the ColoRadar dataset (the
+  `landmarking` branch's `radar/examples/python/benchmarking.py` points at
+  `coloradar/kitti/2_23_2021_edgar_classroom_run4`), and it records a
+  (+0.92, -1.06) m/s velocity bias. On this simulator's own real-RIO run the
+  per-drone velocity bias was <= 0.10 m/s, so that bias is not reproduced here.
+
+**Simulator side — IMU readings are now noisy.** `eval_scripts/apply_imu_noise.py`
+(driven by `configs/sensors/imu_noise.yaml`) injects per-axis gz `<noise>` into
+each drone's generated SDF, called from `phase0_gate.sh` by default
+(`--no-imu-noise` to skip). White noise: stddev = N * sqrt(update_rate) with
+the SDF's 1000 Hz. Bias instability -> gz first-order Gauss-Markov dynamic bias
+(Allan peak ratios 1.8926 / 0.61736 fitted numerically in the selftest;
+`allan_minimum` convention). Not modeled: rate random walk (gz has no term),
+turn-on bias (not in the calibration), orientation (gz-sensors8 cannot noise
+it — RIO still receives perfect attitude). Gyro noise reaches the firmware
+through the CrazySim bridge but not RIO, which reads only orientation and
+linear acceleration. Selftest 35 (WSL, with schema checks) / 31 (Windows);
+`gz sdf -k` on an injected SDF prints `Valid.`
+
+**Estimator side — RIO tuning.** `rio.ros_params` in
+`configs/estimation/swarm_loc.yaml` (values copied by hand; the estimator
+still never reads `configs/sensors/*`): `imu_process_noise_std` 0.0012964,
+`imu_residual_noise_floor` 0.0404, `imu_measurement_noise_std` 0.4877,
+`imu_use_residual_as_noise` true. `rio_bridge.py` whitelists and type-matches
+them to RIO.py's declarations and refuses `odom_topic`. Under the residual
+setting the effective Doppler measurement std is ~0.04-0.08 m/s, so 0.4877 is
+only a fallback; setting the flag false makes it the constant std. Selftest 57.
+
+**Live verification (tunnel/triangle_forward, 3 drones).**
+
+Measured per-sample IMU white noise with drones at rest, first-difference
+estimate vs injected stddev: within ±6% on all 18 drone-axis combinations
+(e.g. cf_0 accel x 0.08479 vs 0.08448, gyro y 0.00629 vs 0.00633).
+
+Scored flight: gate **PASS**, flight stable.
+
+| drone | noise-free IMU (2026-09-12) ATE m / NEES / in95 | noisy IMU + RIO tuning ATE m / NEES / in95 |
+|---|---|---|
+| cf_0 | 0.149 / 2.95 / 0.952 | 0.135 / 2.69 / 0.967 |
+| cf_1 | 0.130 / 2.20 / 0.976 | 0.143 / 2.99 / 0.956 |
+| cf_2 | 0.129 / 2.52 / 0.972 | 0.178 / 4.65 / 0.798 |
+
+n = 1 run per condition, with previously observed run-to-run ATE spread of
+~0.1 m at identical settings, so these differences are not attributable to the
+change. The two changes (sensor noise, RIO tuning) were also applied together.
+Separating them and establishing significance needs repeated seeded runs per
+arm.
+
+**Radar readings remain a noise-free raytrace.** Making them noisy needs
+research-backed parameters for the specific radar (range, angle and Doppler
+noise, detection and false-alarm rates), which neither calibration file
+provides.
+
+## 2026-09-14 — Radar noise layer (IWR6843AOP); live test exposed that the "tunnel" world has no tunnel around the drones
+
+**Radar noise layer (implemented, unit-verified).** `perception/radar_sim/radar_noise_model.py`
+(pure numpy, selftest 28/29) and `radar_noise_node.py` (one process, all drones)
+turn the plugin's ideal cloud on `/cf_<i>/radar/points_ideal` into
+`/cf_<i>/radar/points`, driven by `configs/sensors/radar_noise.yaml`; phase0
+enables it by default (`--no-radar-noise` restores the ideal cloud on
+`/radar/points`). Target sensor per the roadmap: TI IWR6843AOP. Model, with
+sources cited inline in the config:
+
+* FOV ±60° az/el — TI SWRA758, TI IWR6843AOPEVM page. Range 0.25–20 m — reve
+  `min_dist`, Doer ICINS 2021 dataset `d_max_final`.
+* Bearing noise σ_k = 2° + 10°·(1 − |u_k|) per unit-direction component — formula
+  from reve `radar_ego_velocity_estimator.cpp`, values from rio
+  `ekf_rio_default.yaml` (Doer & Trommer, IEEE MFI 2020). A published,
+  dataset-tuned estimator model, not a direct measurement.
+* Range quantized to 0.07 m; Doppler quantized to 0.13 m/s plus a 0.0138 m/s
+  Gaussian residual, total 0.040 m/s (ICINS 2021 `d_res`/`v_res`; residual
+  matched to the ColoRadar Doppler fit residual in `radar_calib_results.yaml`).
+* 24% Doppler outliers, uniform in ±4.0 m/s (ColoRadar inlier fraction 0.761;
+  EKF-RIO `allowed_outlier_percentage` 0.25), wrap at ±4.0 m/s.
+* Not modeled: detection probability/SNR, multipath ghost positions.
+
+Rejected: `radar/radar_noise_calibration.json` (landmarking branch, ColoRadar
+cascade, 117 frames). Its range std (0.15–0.21 m) sits at the 0.5 m
+lidar-match gate ceiling (0.224 m), its azimuth std tracks 0.224 m / r, ~93% of
+top-K points are "clutter", and its Doppler std (0.3–0.9 m/s) is ~10x the
+in-scan fit residual — it measures the association and thresholding procedure,
+not the radar.
+
+**Live test result: the noise node outputs 0 points, correctly.** Node in/out
+logs: 720 in, 0 out per scan. The ideal cloud's finite returns (387 of 6,480
+rays in 9 scans) all lie BEHIND the drone (azimuth 132°–180°, range 6.25–30 m),
+so the ±60° forward FOV keeps nothing. The layer is mechanically correct (stamps
+and frame preserved, fields and layout valid); the geometry it receives is wrong.
+
+**Root cause — environment mismatch (pre-existing, affects all "tunnel" results):**
+
+* `sim_worlds/phase0_tunnel_gate.sdf` contains only a 200x200 m ground plane and
+  `tunnel_segment` = `lava_tube.obj` at pose `0 0 0 1.570796 0 0` (no scale or
+  offset). With that +90° roll the mesh spans world x −152..152, **y −164.7..−50.6**,
+  z −160..153. The drones fly at x −0.63..2.89, y −0.56..0.56, z 0.01..1.28 m (truth,
+  last run): **~50 m outside the tunnel mesh**. Physics has been open-field
+  flight over a ground plane.
+* `phase0_gate.sh` points the radar at a DIFFERENT mesh, `cave_world.obj`, imported
+  WITHOUT the world's +90° roll. After applying that roll it has only 4 vertices
+  within 3 m of the origin. The radar map also never includes the ground plane,
+  so the radar has never seen the floor.
+* `configs/sensors/uwb_pdoa.yaml`: `los_model: boxes` with `occluder_boxes: []`,
+  so every UWB link has been line-of-sight.
+* RIO worked before only because the plugin's unrealistic 360° azimuth caught
+  far cave walls behind the drones; Doppler velocity stayed mathematically
+  consistent, but wall geometry, corridor degeneracy and UWB NLOS were never
+  exercised.
+
+**Status:** with the radar noise layer on (default), RIO receives no radar points
+in this world, so evaluations must use `--no-radar-noise` until the environment
+is fixed. Also re-verified live in this run: IMU per-sample noise within ±5% of the
+injected stddev on all 18 drone-axis combinations.
+
+## 2026-09-14 — Realistic-noise RIO: world radar map, Madgwick attitude, covariance refit, held-out triangle_forward
+
+Supersedes the "0 points out" status above for the **ground-plane** case. The
+tunnel-mismatch (drones ~50 m outside `lava_tube.obj`, UWB `los_model: boxes`
+with empty occluders) is unchanged: every "tunnel" result is still open-field
+until drones spawn inside a tunnel and UWB uses `los_model: mesh`. Mutual-yaw
+pairs were **0.0 /s** again on both flights this day.
+
+**Radar map from the world.** `eval_scripts/build_radar_map.py` builds the
+radarays map from the launched world's collision geometry (ground `<plane>`
+included), cached in `out/radar_maps/<world>_<hash>.obj`. Live
+`tunnel/triangle_forward`: cache hit
+`out/radar_maps/phase0_tunnel_gate_f0f5df3f4e5e.obj` (**2 triangles**, 486 B) —
+the ground plane. One `radar_noise_node`; 720 in / **29 out** pts/scan at ~2.2 Hz
+(FOV now sees the floor). IMU noise injected ×3. Nit: if phase0 disables the
+noise node late, the crop is 22 m while the plugin casts to 30 m.
+
+**Attitude.** RIO attitude is a Madgwick filter on the noisy IMU
+(`perception/radar_processing/attitude_filter.py`, `rio.attitude` in
+`swarm_loc.yaml`). Live: every drone logged `attitude initialized … init
+restarts=0`. `/cf_0/rio/delta` publishing.
+
+**Covariance calibration protocol.** `eval_scripts/calibrate_rio_covariance.py`
+on `out/swarm_loc_logs/tunnel/collinear_shuttle` (score window `[70.828, None]`,
+~18.5 s, RIO ~10 Hz). Rule = **1 s window, max over drones and axes** of
+debiased `sigma_eff`. Report:
+`out/rio_cov_calibration/collinear_shuttle.json`. Default `--min-valid-rows 200`
+refused (183/188/186 valid rows); **`--min-valid-rows 150`** produced the
+recommendation (windows@1s = 20/21/20 ≥ 10). Bias is **not** absorbed:
+
+| drone | body-x bias | body-y bias | body-z seff@1s | notes |
+|---|---|---|---|---|
+| cf_0 | −0.20 m/s | −0.01 | 0.251 | |
+| cf_1 | **+0.46** | **−0.95** | **0.773** | drives xy and z floors |
+| cf_2 | **+0.52** | +0.20 | 0.428 | drives yaw floor |
+
+`sigma_eff` @ 1 s (body): cf_0 x/y/z = 0.228 / 0.795 / 0.251; cf_1 = 0.775 /
+**1.267** / **0.773**; cf_2 = 0.881 / 0.503 / 0.428. Heading seff@1s: 0.00175 /
+0.00308 / **0.00341** rad/√s.
+
+Recommended constants (applied in `perception/radar_processing/rio_bridge.py`;
+`rio_bridge.py --selftest` **75/75**):
+
+* `SIGMA_V_XY_FLOOR_MPS` = **1.267** (cf_1 body y)
+* `SIGMA_VZ_MPS` = **0.773** (cf_1 body z)
+* `SIGMA_DPSI_RAD_PER_SQRT_S` = **0.00341** (0.195°/√s, cf_2 heading)
+
+Calibration-flight gate was **FAIL** on infrastructure, not RIO liveness
+(`rio_alive_*` / `ekf_alive_*` passed). `logs_intact`/`uwb_consumed` raced a
+mid-write `cf_2.npz` ("not a zip file"). Fix: `meas_log.py` writes
+`.cf_N.partial.npz` then `os.replace`; `load_run` only accepts `cf_<digits>.npz`
+(selftest 6–6e2, 28/28). `rate_hz_cf_2` was 39.75 Hz wall vs a 40 Hz bar —
+now measured in **sim time** (`swarm_loc_gate.py` `_sim_rate_ok`, selftests
+9p–9s). Shuttle EKF with the **stale** 0.60 / 0.50 / 0.5°/√s floors (overconfident
+on cf_1/2):
+
+| drone | ATE | mean NEES | in χ²95 | yaw RMSE |
+|---|---|---|---|---|
+| cf_0 | 0.115 m | 3.32 | 0.914 | 2.50° |
+| cf_1 | 0.288 m | 10.61 | 0.610 | 1.01° |
+| cf_2 | 0.199 m | 8.27 | 0.586 | 6.79° |
+
+**Held-out `tunnel/triangle_forward`** (refit live; do not retune). First fly:
+`formation_forward` returned after ~4 legs + `hover_end_s=5` so the sim-time
+flight window was 4.3 s (< 5 s liveness floor); `load_run` also opened
+`cf_1.tmp.npz`. Fixed: motion now consumes remaining wall time until scenario
+`duration` (selftest `formation_forward consumes duration`); temp name no longer
+matches `cf_*.npz`. Second fly: eval and logs produced; gate **FAIL** only on
+`rio_alive` rate **4.2 / 3.9 / 4.1 sim-Hz** (bar 5 Hz) — radar-driven publish
+~2.2 Hz wall, ~4 Hz in sim time. EKF liveness, `logs_intact`, `uwb_consumed`,
+`nees_sane`, `ate_paired` passed. `score_window.json`: `t0=110.22`, `t1=null`
+(start of scripted path). Mutual yaw **0.0 /s**.
+
+| drone | ATE | RPE | yaw RMSE | mean NEES | in χ²95 | n |
+|---|---|---|---|---|---|---|
+| cf_0 | 0.127 m | 0.157 m | 4.03° | 4.10 | 0.826 | 2257 |
+| cf_1 | 0.100 m | 0.152 m | 0.00° | 2.68 | 0.967 | 2056 |
+| cf_2 | 0.132 m | 0.177 m | 2.96° | 4.22 | 0.890 | 1920 |
+
+Vs earlier triangle_forward (same caveats: n=1, ~0.1 m run-to-run ATE spread):
+noise-free IMU 0.149 / 0.130 / 0.129 m; noisy IMU + pre-refit RIO 0.135 / 0.143 /
+0.178 m. This run is in the same ATE band; cf_1 NEES is consistent (~2.7) where
+the shuttle (stale floors) was 10.6.
+
+**Held-out `--check`** (`--constants out/rio_cov_calibration/collinear_shuttle.json`,
+no retune). RIO used only ~5 s (50/48/51 rows, 5/5/4 windows@1s) — short
+radar-rate log, not a 200-row calibration set. cf_0/cf_1 1 s consistency
+**ratios ≈ 0** and step NEES ≈ 0 (floors much larger than the observed increment
+error on those two). cf_2 @ 1 s, **constants** debiased ratio x/y/z/psi =
+**0.04 / 0.17 / 0.50 / 5.76**, NEES h2/v1/psi = 4.32 / 0.41 / 2.43 (heading
+still tight vs the 0.195°/√s floor). Same numbers as `[as_flown]` because this
+flight already advertised the new floors.
+
+**Nits.** `swarm_loc_scenarios.py --write-config` has written derived YAML in the
+Windows codepage when invoked from a Windows Python; this launch used WSL
+`python3` (UTF-8). `out/radar_maps/` is gitignored (generated). Leave
+`mlflow.db-journal` untracked.
+
+**Still open (research, not this pipeline):** spawn inside the tunnel + UWB
+`los_model: mesh`; whether to flip `imu_use_residual_as_noise` so
+`imu_measurement_noise_std: 0.4877` is live; a noise-mismatch / 2× noise arm;
+repeated seeded runs and ablations (RIO-only, no entrance, minus mutual yaw,
+centralized reference); mutual yaw has never fired live; IMU-calibration
+provenance; radar Pd/SNR and the plugin ±20° elevation.

@@ -1,0 +1,76 @@
+# Gazebo IMU noise model — Phase 2 sensor fidelity (simulator-side corruption of
+# the gz IMU readings; Tier B: research/calibration-derived white noise + bias
+# instability, NOT a full error model — see "not modeled" below).
+#
+# Sim mechanism: per-axis sdformat <imu><angular_velocity|linear_acceleration>
+# <x|y|z><noise type="gaussian"> injected into the generated SDF's
+# <sensor type="imu"> by eval_scripts/apply_imu_noise.py, called from
+# phase0_gate.sh after apply_tof_sensor.py (flags --no-imu-noise,
+# --imu-noise-config PATH). The firmware_mods/CrazySim submodule is never touched.
+#
+# Provenance: the numbers come from configs/sensors/imu_calib_results.yaml, an
+# Allan-variance analysis committed by a teammate (commit bc00044). The script
+# that produced it is not in the repo, and the SOURCE IMU of the calibration log
+# is not documented in the repo either. This file only holds the injection
+# choices, so the calibration file can be regenerated without losing them.
+#
+# Caveats (read before trusting the bias terms):
+#   - The log is 18.3 s long at 100 Hz. Trustworthy bias instability normally
+#     needs >= 300 s; the Allan minima here sit at tau = 0.3-4.6 s with very few
+#     clusters, so the bias-instability / correlation-time numbers are rough.
+#   - Orientation stays ground-truth-perfect: gz-sensors8 can only noise angular
+#     velocity and linear acceleration, not orientation. RIO.py consumes the
+#     orientation, so RIO attitude is still noise-free.
+#   - Gyro noise does NOT reach RIO (perception/radar_processing/RIO.py reads only
+#     orientation and linear_acceleration). It reaches the Crazyflie firmware via
+#     the CrazySim bridge (crazysim_plugin.cpp ImuCallback), as does accel noise.
+#   - The IMU rate used for the conversion is the SDF's own <update_rate> (1000 Hz),
+#     not the calibration's 100 Hz. gz only steps the sensor on physics steps, so
+#     worlds with max_step_size > 1 ms cap the real rate below that (the default
+#     phase0_tunnel_gate / phase1_pid_tune worlds use 1 ms).
+
+calib_results_path: configs/sensors/imu_calib_results.yaml
+
+# ── enabled terms ────────────────────────────────────────────────────────────
+terms:
+  # White noise (angle/velocity random walk). random_walk_coeff N is a
+  # continuous density [rad/s/sqrt(Hz) gyro, m/s^2/sqrt(Hz) accel]; gz draws an
+  # independent sample per update, so stddev = N * sqrt(update_rate_hz).
+  # (Using the calibration's 100 Hz instead of 1000 Hz would under-noise by sqrt(10).)
+  white_noise: true
+  # Bias instability -> gz first-order Gauss-Markov <dynamic_bias_stddev> +
+  # <dynamic_bias_correlation_time>:
+  #   GM with steady-state stddev q, corr. time T has its Allan-deviation peak at
+  #   tau = 1.8926*T with value 0.61736*q (ratios fitted numerically;
+  #   apply_imu_noise.py --selftest reproduces them). So
+  #     q = ADEV_min / 0.61736,   T = bias_instability_tau_s / 1.8926
+  #   gz's dynamic_bias_stddev is the DRIVING density (steady-state stddev is
+  #   dynamic_bias_stddev*sqrt(T/2), per gz-sensors8 GaussianNoiseModel.cc), so
+  #     dynamic_bias_stddev = q * sqrt(2/T)
+  dynamic_bias: true
+
+# ── bias-instability convention ──────────────────────────────────────────────
+# What the calibration file's `bias_instability` means:
+#   allan_minimum : it is the raw minimum of the Allan-deviation curve.
+#   ieee_952_B    : it is the IEEE Std 952 flicker coefficient B, i.e. the
+#                   minimum divided by sqrt(2 ln2 / pi) = 0.6643.
+# Default allan_minimum because the file's own numbers only make sense that way:
+# an Allan-deviation minimum can never be below the white-noise contribution
+# N/sqrt(tau) at the same tau. Under ieee_952_B the implied minimum
+# (0.664 * bias_instability) falls below that floor on all three gyro axes
+# (e.g. gyro.x 4.98e-5 < 5.86e-5 rad/s); under allan_minimum it is above it on
+# all three. Also `bias_instability_avg_scaled` is exactly the rad/s average
+# converted to deg/hr with no 0.664 factor. apply_imu_noise.py prints a
+# WARNING for any axis where the chosen convention violates the floor. (Several
+# accel axes violate it under either convention — another sign the 18 s log is
+# too short for trustworthy accel bias numbers.)
+bias_instability_convention: allan_minimum
+
+# ── not modeled ──────────────────────────────────────────────────────────────
+# Rate random walk (rate_random_walk_coeff): skipped. gz-sensors8 has no
+#   unbounded random-walk bias term and it is not approximated silently. (Gyro
+#   RRW is NaN in the calibration anyway; accel RRW is finite but unused.)
+# Turn-on bias (bias_mean / bias_stddev): written as 0. Allan analysis cannot
+#   estimate an absolute bias and the calibration file contains none.
+# Quantization (precision): omitted; no source for a value.
+# Orientation noise: impossible in gz-sensors8 (enable_orientation is untouched).

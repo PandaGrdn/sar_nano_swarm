@@ -71,6 +71,23 @@ rio:
   dropout_rate: 0.02
   dropout_duration_s: 0.5
   dropout_q_scale: 25.0
+  ros_params:
+    imu_process_noise_std: 0.0012964481834306532
+    imu_residual_noise_floor: 0.0404
+    imu_measurement_noise_std: 0.4877
+    imu_use_residual_as_noise: true
+  attitude:
+    source: estimated
+    algorithm: madgwick_imu
+    madgwick_beta: 0.003935
+    init_window_s: 2.0
+    init_min_samples: 50
+    init_max_gyro_norm_rad_s: 0.05
+    init_max_accel_dev_mps2: 0.5
+    max_dt_gap_s: 0.1
+    gravity_mps2: 9.81
+    orientation_cov_rad2: 0.0003
+    log_throttle_s: 5.0
 ablation:
   disable_uwb: false
   disable_bearing: false

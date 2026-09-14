@@ -280,6 +280,7 @@ class SwarmLocNode:
                 delta.roll,
                 delta.pitch,
                 delta.valid,
+                cov=delta.cov,
             )
         self._drain()
 

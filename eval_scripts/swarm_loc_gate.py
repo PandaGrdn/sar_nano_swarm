@@ -1067,10 +1067,25 @@ def run_flight(args, scfs: list, recorder=None) -> bool:
 
 
 def _rate_ok(stamps: List[float], target_hz: float, window_s: float) -> Tuple[bool, float]:
+    """Estimate publish rate. `stamps` and `window_s` must be the SAME clock.
+
+    Prefer SIM-time stamps (estimator header / est_meta raw stamp). A wall-clock
+    window under load made cf_2 fail at 39.75 Hz vs a 40 Hz bar while sim-Hz
+    was still healthy (collinear_shuttle 2026-09-14).
+    """
     if len(stamps) < 2 or window_s <= 0:
         return False, 0.0
     hz = (len(stamps) - 1) / window_s
     return hz >= RATE_FRAC_MIN * target_hz, hz
+
+
+def _sim_rate_ok(sim_stamps: List[float], target_hz: float) -> Tuple[bool, float]:
+    """Rate from advancing SIM stamps. Zero/frozen stamps do not count."""
+    real = [float(s) for s in sim_stamps if float(s) > 1e-3]
+    if len(real) < 2:
+        return False, 0.0
+    span = max(real) - min(real)
+    return _rate_ok(real, target_hz, span)
 
 
 def run_selftest() -> int:
@@ -1274,6 +1289,21 @@ def run_selftest() -> int:
     n_slow = int(round(2.0 * sim_span)) + 1
     r_ok, r_det = rio_alive_check(list(np.linspace(0.0, sim_span, n_slow)), [1] * n_slow, ref)
     check("9o rio_alive fails: 2 sim-Hz under rate floor", not r_ok, r_det)
+
+    # Estimate publish rate in SIM time (collinear_shuttle 2026-09-14: cf_2
+    # was 39.75 wall-Hz vs a 40 Hz bar while sim-Hz was still ~50).
+    n_est = 5274
+    wall_span = (n_est - 1) / 39.75
+    wall_ok, wall_hz = _rate_ok(list(range(n_est)), 50.0, wall_span)
+    check("9p wall-clock 39.75 Hz fails 0.8×50 bar (the bug)", (not wall_ok) and abs(wall_hz - 39.75) < 0.05, f"hz={wall_hz:.2f}")
+    sim_stamps = list(np.linspace(10.0, 10.0 + 100.0, n_est))  # 100 s sim → ~52.7 Hz
+    s_ok, s_hz = _sim_rate_ok(sim_stamps, 50.0)
+    check("9q same n over 100 s sim passes (~52.7 sim-Hz)", s_ok and s_hz > 50.0, f"hz={s_hz:.2f}")
+    slow = list(np.linspace(0.0, 200.0, n_est))  # ~26 sim-Hz
+    slow_ok, slow_hz = _sim_rate_ok(slow, 50.0)
+    check("9r genuinely slow 26 sim-Hz still fails", not slow_ok, f"hz={slow_hz:.2f}")
+    z_ok, z_hz = _sim_rate_ok([0.0] * n_est, 50.0)
+    check("9s frozen/zero stamps fail sim-rate", not z_ok, f"hz={z_hz:.2f}")
 
     # ------------------------------------------------------------------
     # BUG B (2026-09-11): the liveness reference must be the FLIGHT window,
@@ -1783,10 +1813,8 @@ def main():
     diverged = False
     for i in range(n):
         rec = recorder.rows[i]
-        stamps = [t for t, _ in rec]
-        t0 = stamps[0] if stamps else 0.0
-        t1 = stamps[-1] if stamps else 0.0
-        ok_r, hz = _rate_ok(stamps, target_hz, t1 - t0)
+        sim_stamps = [s for _, s, _ in recorder.est_meta[i]]
+        ok_r, hz = _sim_rate_ok(sim_stamps, target_hz)
         rates[i] = hz
         checks[f"rate_hz_cf_{i}"] = ok_r
         for _, row in rec:
@@ -1942,7 +1970,7 @@ def main():
 
     print("\n[swarm_loc_gate] results:")
     for i in range(n):
-        print(f"  cf_{i} estimate_hz={rates.get(i, 0):.2f}  n={len(recorder.rows[i])}")
+        print(f"  cf_{i} estimate_hz={rates.get(i, 0):.2f} sim-Hz  n={len(recorder.rows[i])}")
         print(f"  cf_{i} n_subs={len(all_subs.get(i, []))} truth_subs={truth_hits.get(i, [])}")
     for k, v in checks.items():
         line = f"  {'PASS' if v else 'FAIL'} {k}"

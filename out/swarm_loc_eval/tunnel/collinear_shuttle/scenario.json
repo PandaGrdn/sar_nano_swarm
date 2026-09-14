@@ -1,0 +1,13 @@
+{
+  "env": "tunnel",
+  "situation": "collinear_shuttle",
+  "world": "phase0_tunnel_gate",
+  "num_drones": 3,
+  "spacing": 1.5,
+  "layout": "line_x",
+  "motion": "repeated_shuttle",
+  "leg_m": 0.5,
+  "duration": 90.0,
+  "why": "Same line, keep moving so ATE/RPE are not a 5 min hover blob.",
+  "key": "tunnel/collinear_shuttle"
+}

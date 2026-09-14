@@ -1,0 +1,143 @@
+# FMCW radar detection-cloud noise layer — Phase 2 (RIO front-end realism).
+# Target sensor: TI IWR6843AOP (60-64 GHz, antenna-on-package, 3 TX / 4 RX).
+#
+# Sim mechanism: perception/radarays_gz2 publishes an IDEAL ray-cast cloud on
+# /cf_<i>/radar/points_ideal (720 rays, perfect range, ideal static-world
+# Doppler, synthetic intensity = 1/r). perception/radar_sim/radar_noise_node.py
+# (math in radar_noise_model.py) turns it into a realistic detection cloud on
+# /cf_<i>/radar/points, which is what RIO / rio_bridge consume. Launched by
+# eval_scripts/phase0_gate.sh (disable with --no-radar-noise).
+#
+# ⚠ AGENTS.md §1 Tier A — SIM ORACLE WALL: this file drives the SIMULATOR. The
+# estimator (RIO.py, rio_bridge.py, swarm_loc) must NEVER read it. In
+# particular the Doppler residual / outlier numbers below must not be copied
+# into estimator tuning as "known truth".
+#
+# FIDELITY (AGENTS.md §5): Tier B. FOV and resolutions are from TI and from a
+# published IWR6843AOP dataset configuration; the bearing model is a published,
+# dataset-tuned estimator model (see bearing section); the Doppler residual and
+# outlier rate are measured on real ColoRadar scans (different radar — a TI
+# cascade, see caveats). Radar frame convention (verified in rmagine
+# SphericalModel::getDirection = [cos(phi)cos(theta), cos(phi)sin(theta),
+# sin(phi)], theta = 0 along +x): radar_link, boresight +x, azimuth =
+# atan2(y, x), elevation = atan2(z, hypot(x, y)).
+#
+# UNMODELLED: detection probability / SNR / RCS (p_d = 1 inside FOV and range);
+# range noise beyond quantization; multipath ghost POSITIONS (outliers only
+# corrupt Doppler); inter-radar chirp interference (Phase 7); angular
+# resolution merging of nearby points (29 deg AOP resolution); the sensor's
+# real per-frame point cap.
+
+seed: 20260914                  # per-drone model seed = seed + drone id (as UwbModel)
+
+# ── effect switches (all true = full model) ──────────────────────────────────
+enable:
+  gating: true
+  bearing_noise: true
+  range_quantization: true
+  doppler_quantization: true
+  doppler_residual: true
+  outliers: true
+  wrap: true
+
+# ── FOV and range gating (detection limits) ─────────────────────────────────
+# Decided on the IDEAL point (the real FOV is physical).
+fov_azimuth_half_deg: 60.0      # TI SWRA758 table, IWR6843AOP/ODS layout: FoV az +/-60 deg
+                                # (angular resolution 29 deg az/el, 4x4 virtual array);
+                                # TI IWR6843AOPEVM product page: "120 deg azimuth FoV"
+fov_elevation_half_deg: 60.0    # TI SWRA758 (el +/-60); TI IWR6843AOPEVM page: "120 deg elevation FoV"
+                                # LIMITATION: radarays_gz2 only casts +/-20 deg of elevation
+                                # (8 rows) and 4 deg azimuth steps, so the sim's effective
+                                # elevation coverage is narrower than the real sensor's.
+                                # The plugin is intentionally not changed.
+range_min_m: 0.25               # github.com/christopherdoer/reve cfg `min_dist: 0.25`
+range_max_m: 20.0               # Doer ICINS 2021 IWR6843AOP dataset config `d_max_final: 20.00 m`
+                                # (christopherdoer.github.io/datasets/icins_2021_radar_inertial_odometry)
+
+# ── bearing noise (reve / EKF-RIO model, Doer & Trommer) ────────────────────
+# u = p/|p|; for each component k:
+#   sigma_k = deg2rad(offset) + deg2rad(scale) * (1 - |u_k|);  u_k += N(0, sigma_k^2); renormalize.
+# Formula: github.com/christopherdoer/reve radar_ego_velocity_estimator.cpp,
+#   sigma_x(k,j) = offset + scale * (1 - fabs(H(k,j))).
+# Values: github.com/christopherdoer/rio ekf_rio/config/ekf_rio_default.yaml.
+# Paper: Doer & Trommer, "An EKF Based Approach to Radar Inertial Odometry",
+#   IEEE MFI 2020, pp. 152-159, doi:10.1109/MFI49285.2020.9235254.
+# HONESTY NOTE: this is a published, dataset-tuned bearing-UNCERTAINTY model
+# for this chip, estimator-side in its origin — NOT a direct sensor
+# measurement. Angle is the least certain parameter in this file.
+# At boresight the lateral components get ~12 deg, the boresight component 2 deg.
+model_noise_offset_deg: 2.0     # ekf_rio_default.yaml model_noise_offset_deg
+model_noise_scale_deg: 10.0     # ekf_rio_default.yaml model_noise_scale_deg
+
+# ── range quantization ──────────────────────────────────────────────────────
+# r_meas = d_res * round(r / d_res), guarded r_meas >= d_res; point = r_meas * u_noisy.
+range_resolution_m: 0.07        # Doer ICINS 2021 IWR6843AOP dataset config `d_res_final: 0.07 m`;
+                                # TI out-of-box detections report range-bin index x resolution.
+
+# ── Doppler quantization + residual ─────────────────────────────────────────
+# v_meas = v_res * round(v / v_res) + N(0, sigma_residual^2),
+# sigma_residual = sqrt(doppler_total_std^2 - v_res^2/12) computed IN CODE
+# (= 0.01385 m/s with these values); the model raises if total^2 < v_res^2/12.
+velocity_resolution_mps: 0.13   # Doer ICINS 2021 IWR6843AOP dataset config `v_res_final: 0.13 m/s`
+doppler_total_std_mps: 0.040    # configs/sensors/radar_calib_results.yaml
+                                # scan_analysis.residual_rms.median = 0.0404 (1639 real ColoRadar
+                                # scans, Doppler LS-fit residual). 0.040 ~= quantization std
+                                # 0.13/sqrt(12) = 0.0375, i.e. Doppler error is quantization-dominated.
+                                # CAVEAT: the device/config behind that residual is undocumented
+                                # (commit bc00044).
+                                # NOT injected: reve `sigma_v_d: 0.125` — that is the estimator's
+                                # tuned value (~one Doppler bin), not a sensor measurement.
+
+# ── Doppler outliers (multipath / moving clutter) ───────────────────────────
+# Each surviving point independently, with p_outlier, gets Doppler replaced by
+# Uniform(-v_max, v_max) (quantized the same way). Position is KEPT for
+# outliers (simplification: a real multipath ghost also has a wrong position).
+p_outlier: 0.24                 # 1 - radar_calib_results.yaml scan_analysis.inlier_fraction_mean (0.761);
+                                # consistent with EKF-RIO ekf_rio_default.yaml `allowed_outlier_percentage: 0.25`
+velocity_max_mps: 4.0           # Doer ICINS 2021 IWR6843AOP dataset config `v_max_final: 4.00 m/s`
+
+# ── Doppler ambiguity ───────────────────────────────────────────────────────
+# Every measured Doppler is wrapped into [-v_max, v_max) (enable.wrap).
+
+# ── detection probability (NOT modeled) ─────────────────────────────────────
+# p_d = 1 inside FOV/range. The sim has no SNR (intensity is synthetic 1/r),
+# and the only real-data detection / clutter statistics we have (rejected
+# source below, items c) are top-K threshold artifacts, not radar physics.
+
+# ── intensity ───────────────────────────────────────────────────────────────
+# Passed through unchanged (synthetic 1/r from the plugin). RIO's
+# doppler_intensity_weighting therefore weights by 1/r, not by SNR.
+
+# ── REJECTED SOURCE (recorded, not used) ────────────────────────────────────
+# `radar/radar_noise_calibration.json` on the `landmarking` git branch
+# (ColoRadar cascade radar, 117 frames, calibrateRadarNoise.m) is real-data
+# derived but NOT used: its values measure the lidar-association and
+# thresholding procedure rather than the radar.
+#  (a) range noise std 0.15-0.21 m at all ranges — pinned at the 0.5 m lidar
+#      nearest-neighbour match gate (uniform scatter in a 0.5 m ball gives
+#      per-axis std 0.5/sqrt(5) = 0.224 m), versus the radar's range
+#      quantization std 0.0593/sqrt(12) = 0.017 m.
+#  (b) azimuth std tracks 0.224/r (0.27 rad at 1 m vs predicted 0.22; 0.084 at
+#      3 m vs 0.075; 0.054 at 5 m vs 0.045; 0.029 at 7 m vs 0.032) — same gate
+#      artifact.
+#  (c) ~93% of the top-K (9000) points per frame counted as clutter (~8,400
+#      unmatched vs ~620 matched) and detection probability collapsing to ~0.03
+#      beyond 4 m — a top-K threshold artifact.
+#  (d) Doppler std 0.3-0.9 m/s — ~10x the in-scan least-squares residual
+#      measured on ColoRadar (0.040 m/s).
+rejected_source:
+  path: "landmarking branch: radar/radar_noise_calibration.json"
+  reason: "measures lidar-association gate / top-K thresholding, not the radar"
+  range_std_m: [0.15, 0.21]
+  gate_uniform_ball_axis_std_m: 0.224
+  radar_range_quantization_std_m: 0.017
+  azimuth_std_rad_at_1_3_5_7m: [0.27, 0.084, 0.054, 0.029]
+  gate_predicted_azimuth_std_rad_at_1_3_5_7m: [0.22, 0.075, 0.045, 0.032]
+  clutter_fraction: 0.93
+  p_detect_beyond_4m: 0.03
+  doppler_std_mps: [0.3, 0.9]
+
+# ── node ────────────────────────────────────────────────────────────────────
+input_topic_fmt: "/cf_{i}/radar/points_ideal"
+output_topic_fmt: "/cf_{i}/radar/points"
+diag_period_s: 10.0

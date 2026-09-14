@@ -102,7 +102,13 @@ def motion_repeated_shuttle(mcs, t_end: float, spec: dict) -> None:
 
 
 def motion_formation_forward(mcs, t_end: float, spec: dict) -> None:
-    """Several simultaneous forward legs, then hover leftover time."""
+    """Several simultaneous forward legs, then hover leftover time.
+
+    ``hover_end_s`` is a *minimum* hover after the last leg, not a cap.
+    The 2026-09-14 triangle_forward gate returned after ~4 legs + 5 s and
+    the sim-time flight window was 4.3 s (under the 5 s liveness floor).
+    Always consume remaining wall time until ``t_end`` (the scenario duration).
+    """
     n_legs = int(spec.get("n_legs", 4))
     leg = float(spec.get("leg_m", 0.5))
     pause = float(spec.get("pause_s", 2.0))
@@ -114,10 +120,9 @@ def motion_formation_forward(mcs, t_end: float, spec: dict) -> None:
     hover_end = spec.get("hover_end_s")
     if hover_end is not None:
         _sleep_until(t_end, float(hover_end))
-    else:
-        remain = t_end - time.time()
-        if remain > 0:
-            time.sleep(remain)
+    remain = t_end - time.time()
+    if remain > 0:
+        time.sleep(remain)
 
 
 def motion_staggered_advance(mcs, t_end: float, spec: dict) -> None:
@@ -375,6 +380,42 @@ def run_selftest() -> int:
     check("derived tri z = hover", all(abs(p[2] - 0.5) < 1e-12 for p in pos))
     check("derived keeps base keys", tri["launch"]["init_yaw_deg"] == 0.0 and "seed" in tri)
     check("derived does not mutate base", "positions_xyz_m" not in base["launch"])
+
+    # formation_forward must consume t_end, not return after hover_end_s.
+    slept: list = []
+    real_sleep = time.sleep
+    real_time = time.time
+    t0 = {"now": 1000.0}
+
+    def fake_time():
+        return t0["now"]
+
+    def fake_sleep(s):
+        slept.append(float(s))
+        t0["now"] += float(s)
+
+    class _Mc:
+        def start_forward(self, _v):
+            return None
+        def start_back(self, _v):
+            return None
+        def stop(self):
+            return None
+
+    time.time = fake_time  # type: ignore[assignment]
+    time.sleep = fake_sleep  # type: ignore[assignment]
+    try:
+        motion_formation_forward(
+            [_Mc(), _Mc(), _Mc()],
+            t0["now"] + 45.0,
+            {"n_legs": 4, "leg_m": 0.5, "pause_s": 2.0, "hover_end_s": 5.0},
+        )
+    finally:
+        time.time = real_time
+        time.sleep = real_sleep
+    # 4*(0.5/0.2 travel + 2s pause) + 5s hover_end + remainder → 45 s total
+    check("formation_forward consumes duration",
+          abs(sum(slept) - 45.0) < 1e-9, f"slept={sum(slept):.3f} {slept}")
     line = derived_estimator_config(get_scenario("tunnel/collinear_hover"), base, 0.5)
     check(
         "derived line matches x0+i*spacing",

@@ -11,9 +11,14 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Union
+
+# Final log names only. `cf_1.tmp.npz` (atomic-save sibling) must not match.
+_DRONE_NPZ_NAME = re.compile(r"^cf_\d+\.npz$")
 
 import numpy as np
 
@@ -96,9 +101,58 @@ RIO_DTYPE = np.dtype(
         ("dpsi", "<f4"),
         ("roll", "<f4"),
         ("pitch", "<f4"),
+        # Advertised 5x5 covariance of [dp_body(3), dpsi, scale] as received on
+        # /cf_<i>/rio/delta: upper triangle, row-major, same order as the wire
+        # RIO_DTYPE in swarm_msgs.py. NaN when the writer had no covariance and
+        # for logs written before these fields existed (see load_drone_log).
+        *[(f"cov_{k}", "<f4") for k in range(15)],
         ("valid", "<u4"),
     ]
 )
+RIO_COV_FIELDS = tuple(f"cov_{k}" for k in range(15))
+RIO_COV_N = 5
+# (i, j) of each cov_k — identical to swarm_msgs.triu_n(5).
+RIO_COV_TRIU = tuple((i, j) for i in range(RIO_COV_N) for j in range(i, RIO_COV_N))
+
+
+def rio_cov_triu(cov) -> np.ndarray:
+    """15 upper-triangle entries from a 5x5 matrix or a 15-vector; None -> NaN."""
+    if cov is None:
+        return np.full(15, np.nan, dtype=np.float64)
+    c = np.asarray(cov, dtype=np.float64)
+    if c.shape == (RIO_COV_N, RIO_COV_N):
+        return np.array([c[i, j] for i, j in RIO_COV_TRIU], dtype=np.float64)
+    c = c.reshape(-1)
+    if c.size != 15:
+        raise ValueError(f"rio cov must be 5x5 or 15 entries, got shape {np.shape(cov)}")
+    return c
+
+
+def rio_cov_matrix(row) -> np.ndarray:
+    """5x5 covariance from one logged rio row (NaN matrix for old logs)."""
+    M = np.zeros((RIO_COV_N, RIO_COV_N), dtype=np.float64)
+    for k, (i, j) in enumerate(RIO_COV_TRIU):
+        M[i, j] = M[j, i] = float(row[f"cov_{k}"])
+    return M
+
+
+def cast_struct_by_name(arr: np.ndarray, dtype: np.dtype, fill: float = float("nan")) -> np.ndarray:
+    """Copy a structured array into `dtype` field BY NAME.
+
+    Fields missing from `arr` are filled with `fill` (floats) or 0 (ints).
+    Needed because numpy casts structured arrays by field POSITION, so casting
+    an old 9-field rio log into the 24-field dtype would misplace `valid`.
+    """
+    arr = np.asarray(arr)
+    out = np.zeros(arr.shape, dtype=dtype)
+    src = set(arr.dtype.names or ())
+    for name in dtype.names:
+        if name in src:
+            out[name] = arr[name]
+        elif out.dtype.fields[name][0].kind == "f":
+            out[name] = fill
+    return out
+
 
 EST_DTYPE = np.dtype(
     [
@@ -148,7 +202,8 @@ class MeasurementLogger:
         self.nis: List[np.void] = []
         self.stats: dict = {}
 
-    def add_rio(self, stamp, dt, dp, dpsi, roll, pitch, valid) -> None:
+    def add_rio(self, stamp, dt, dp, dpsi, roll, pitch, valid, cov=None) -> None:
+        """`cov`: advertised 5x5 (or 15 upper-triangle entries); None -> NaN."""
         row = np.zeros(1, dtype=RIO_DTYPE)[0]
         row["stamp"] = float(stamp)
         row["dt"] = float(dt)
@@ -156,6 +211,8 @@ class MeasurementLogger:
         row["dpsi"] = float(dpsi)
         row["roll"] = float(roll)
         row["pitch"] = float(pitch)
+        for k, v in enumerate(rio_cov_triu(cov)):
+            row[f"cov_{k}"] = float(v)
         row["valid"] = 1 if valid else 0
         self.rio.append(row)
 
@@ -240,7 +297,20 @@ class MeasurementLogger:
         }
         for k, v in self.stats.items():
             payload[f"stat_{k}"] = np.float64(v)
-        np.savez(out, **payload)
+        # Write to a hidden sibling then os.replace so a concurrent reader
+        # (swarm_loc_gate logs_intact) never opens a half-written zip.
+        # Name must NOT match cf_<id>.npz — glob("cf_*.npz") would otherwise
+        # pick up the in-flight temp (cf_1.tmp.npz raced the 2026-09-14 gate).
+        tmp = out.with_name("." + out.stem + ".partial.npz")
+        try:
+            np.savez(tmp, **payload)
+            os.replace(tmp, out)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
         return out
 
 
@@ -250,7 +320,9 @@ def load_drone_log(path: Union[str, Path]) -> dict:
     nis = np.array(z["nis"], dtype=NIS_DTYPE) if "nis" in z.files else np.zeros(0, dtype=NIS_DTYPE)
     return {
         "drone_id": int(z["drone_id"]),
-        "rio": np.array(z["rio"], dtype=RIO_DTYPE),
+        # By-name cast: old logs (no cov_* fields) load with NaN covariance.
+        "rio": cast_struct_by_name(z["rio"], RIO_DTYPE),
+        "rio_has_cov": bool(set(RIO_COV_FIELDS) <= set(z["rio"].dtype.names or ())),
         "uwb": np.array(z["uwb"], dtype=UWB_DTYPE),
         "estimate": np.array(z["estimate"], dtype=EST_DTYPE),
         "nis": nis,
@@ -259,14 +331,23 @@ def load_drone_log(path: Union[str, Path]) -> dict:
     }
 
 
+def drone_npz_files(directory: Union[str, Path]) -> List[Path]:
+    """``cf_<id>.npz`` only — ignores ``cf_1.tmp.npz`` / hidden partials."""
+    d = Path(directory)
+    return sorted(p for p in d.glob("cf_*.npz") if _DRONE_NPZ_NAME.match(p.name))
+
+
 def load_run(path: Union[str, Path]) -> Dict[int, dict]:
-    """Load one npz or a directory of cf_*.npz / *.npz."""
+    """Load one npz or a directory of cf_<id>.npz / *.npz."""
     p = Path(path)
     files: List[Path]
     if p.is_dir():
-        files = sorted(p.glob("cf_*.npz"))
+        files = drone_npz_files(p)
         if not files:
-            files = sorted(p.glob("*.npz"))
+            files = sorted(
+                q for q in p.glob("*.npz")
+                if q.name != "truth.npz" and not q.name.startswith(".")
+            )
     else:
         files = [p]
     out: Dict[int, dict] = {}
@@ -318,6 +399,113 @@ def run_selftest() -> int:
         check("3e load by file", 1 in one and one[1]["uwb"].shape[0] == 1)
         check("3f stats roundtrip", abs(run[1]["stats"].get("n_nis_reject", 0) - 3) < 1e-9)
         check("3g nis rows", run[1]["nis"].shape[0] == 1)
+        check("3h rio cov NaN when not given",
+              bool(np.all(np.isnan(rio_cov_matrix(run[1]["rio"][0])))) and run[1]["rio_has_cov"])
+
+    # 4 — advertised covariance round trip (5x5 in, same upper triangle out)
+    C = np.array(
+        [[4e-4, 1e-5, 0.0, 0.0, 0.0],
+         [1e-5, 5e-4, 0.0, 0.0, 0.0],
+         [0.0, 0.0, 9e-4, 0.0, 0.0],
+         [0.0, 0.0, 0.0, 2e-6, 0.0],
+         [0.0, 0.0, 0.0, 0.0, 1e-8]]
+    )
+    log4 = MeasurementLogger(2)
+    log4.add_rio(2.0, 0.05, [0.02, -0.01, 0.003], 0.002, 0.01, -0.02, True, cov=C)
+    log4.add_rio(2.05, 0.05, [0.02, -0.01, 0.003], 0.002, 0.01, -0.02, False, cov=rio_cov_triu(2.0 * C))
+    with tempfile.TemporaryDirectory() as td:
+        log4.save(Path(td) / "cf_2.npz")
+        r4 = load_run(td)[2]
+        rio4 = r4["rio"]
+        check("4 cov 5x5 roundtrip", np.allclose(rio_cov_matrix(rio4[0]), C, rtol=1e-6, atol=1e-12),
+              str(rio_cov_matrix(rio4[0])))
+        check("4b cov 15-vector roundtrip", np.allclose(rio_cov_matrix(rio4[1]), 2.0 * C, rtol=1e-6, atol=1e-12))
+        check("4c triu order matches wire (cov_1 is [0,1], cov_5 is [1,1])",
+              abs(float(rio4[0]["cov_1"]) - 1e-5) < 1e-10 and abs(float(rio4[0]["cov_5"]) - 5e-4) < 1e-9)
+        check("4d existing fields unchanged",
+              abs(float(rio4[0]["stamp"]) - 2.0) < 1e-12
+              and abs(float(rio4[0]["dt"]) - 0.05) < 1e-7
+              and abs(float(rio4[0]["dp_x"]) - 0.02) < 1e-7
+              and abs(float(rio4[0]["dp_y"]) + 0.01) < 1e-7
+              and abs(float(rio4[0]["dp_z"]) - 0.003) < 1e-7
+              and abs(float(rio4[0]["dpsi"]) - 0.002) < 1e-7
+              and abs(float(rio4[0]["roll"]) - 0.01) < 1e-7
+              and abs(float(rio4[0]["pitch"]) + 0.02) < 1e-7
+              and int(rio4[0]["valid"]) == 1 and int(rio4[1]["valid"]) == 0)
+        check("4e has_cov flag", r4["rio_has_cov"] is True)
+        try:
+            rio_cov_triu(np.zeros(7))
+            bad_raised = False
+        except ValueError:
+            bad_raised = True
+        check("4f malformed cov rejected", bad_raised)
+
+    # 5 — an OLD-format log (rio without cov_*) still loads, cov = NaN
+    OLD_RIO = np.dtype([("stamp", "<f8"), ("dt", "<f4"), ("dp_x", "<f4"), ("dp_y", "<f4"),
+                        ("dp_z", "<f4"), ("dpsi", "<f4"), ("roll", "<f4"), ("pitch", "<f4"),
+                        ("valid", "<u4")])
+    old = np.zeros(3, dtype=OLD_RIO)
+    old["stamp"] = [1.0, 1.02, 1.04]
+    old["dt"] = 0.02
+    old["dp_x"] = [0.1, 0.2, 0.3]
+    old["dpsi"] = 0.004
+    old["pitch"] = 0.05
+    old["valid"] = [1, 0, 1]
+    with tempfile.TemporaryDirectory() as td:
+        np.savez(Path(td) / "cf_4.npz", drone_id=np.int32(4), rio=old,
+                 uwb=np.zeros(0, dtype=UWB_DTYPE), estimate=np.zeros(0, dtype=EST_DTYPE))
+        r5 = load_run(td)[4]
+        rio5 = r5["rio"]
+        check("5 old log loads into new dtype", rio5.dtype == RIO_DTYPE and rio5.shape[0] == 3)
+        check("5b old log cov all NaN", all(bool(np.all(np.isnan(rio5[f]))) for f in RIO_COV_FIELDS))
+        check("5c old log fields by name (valid not misplaced)",
+              list(rio5["valid"]) == [1, 0, 1]
+              and np.allclose(rio5["dp_x"], [0.1, 0.2, 0.3])
+              and np.allclose(rio5["pitch"], 0.05)
+              and np.allclose(rio5["stamp"], [1.0, 1.02, 1.04]))
+        check("5d old log has_cov False, nis empty", r5["rio_has_cov"] is False and r5["nis"].shape[0] == 0)
+
+    # 6 — atomic replace: a failed np.savez must leave the previous file loadable
+    log6 = MeasurementLogger(0)
+    log6.add_est(1.0, [0.0, 0.0, 0.5], [0.0, 0.0, 0.0], 0.0, 0)
+    with tempfile.TemporaryDirectory() as td:
+        dest = Path(td) / "cf_0.npz"
+        log6.save(dest)
+        load_drone_log(dest)
+        real_savez = np.savez
+
+        def boom(path, **kwargs):
+            Path(path).write_bytes(b"not a zip file")
+            raise RuntimeError("simulated crash mid-write")
+
+        np.savez = boom
+        try:
+            try:
+                log6.save(dest)
+                check("6 save raised", False)
+            except RuntimeError:
+                check("6 save raised", True)
+        finally:
+            np.savez = real_savez
+        try:
+            load_drone_log(dest)
+            check("6b dest still a valid zip after failed save", True)
+        except Exception as exc:
+            check("6b dest still a valid zip after failed save", False, repr(exc))
+        leftovers = list(Path(td).glob(".*.partial.npz")) + list(Path(td).glob("*.tmp.npz"))
+        check("6c no tmp leftover after failed save", leftovers == [], str(leftovers))
+        log6.save(dest)
+        leftovers = list(Path(td).glob(".*.partial.npz")) + list(Path(td).glob("*.tmp.npz"))
+        check("6d tmp gone after successful replace", leftovers == [], str(leftovers))
+
+        # 6e — a stale cf_1.tmp.npz (old temp name) must not be opened by load_run
+        decoy = Path(td) / "cf_1.tmp.npz"
+        decoy.write_bytes(b"not a zip file")
+        run6 = load_run(td)
+        check("6e load_run ignores cf_*.tmp.npz",
+              list(run6) == [0] and decoy.is_file())
+        check("6e2 drone_npz_files skips tmp",
+              [p.name for p in drone_npz_files(td)] == ["cf_0.npz"])
 
     print(f"[selftest] {n_pass} passed, {n_fail} failed")
     print("[selftest] " + ("ALL PASS" if ok else "FAILED"))

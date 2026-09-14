@@ -6,6 +6,10 @@ __pycache__/
 .vscode/
 mlruns/
 mlflow.db
+mlflow.db-journal
+
+# Generated radarays maps (eval_scripts/build_radar_map.py from the world SDF)
+out/radar_maps/
 
 # UTIL CSVs / 7z (GitHub repo is parsers only; data from the UTIL site)
 perception/uwb_sim/uwb_noise_model/dataset/util-uwb-dataset/

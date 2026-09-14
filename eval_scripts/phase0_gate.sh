@@ -25,12 +25,19 @@
 #                        Defaults are auto-detected for built-in worlds; for custom
 #                        worlds you must provide this or pass --no-radar.
 #       --no-radar       Skip radar plugin injection entirely.
+#       --no-radar-noise Publish the ideal radarays cloud directly on
+#                        /cf_<i>/radar/points (skip perception/radar_sim/radar_noise_node.py).
+#       --radar-noise-config PATH
+#                         Path to radar_noise.yaml [default: configs/sensors/radar_noise.yaml]
 #       --no-payload      Skip mass/inertia payload rewrite (apply_payload.py).
 #       --payload-config PATH
 #                         Path to payload.yaml [default: configs/airframe/payload.yaml]
 #       --no-tof         Skip IR ToF rangefinder sensor injection (apply_tof_sensor.py).
 #       --tof-config PATH
 #                         Path to tof.yaml [default: configs/sensors/tof.yaml]
+#       --no-imu-noise   Skip Gazebo IMU noise-model injection (apply_imu_noise.py).
+#       --imu-noise-config PATH
+#                         Path to imu_noise.yaml [default: configs/sensors/imu_noise.yaml]
 #       --no-flow        Skip PMW3901 optical-flow node (perception/flow_sim/flow_node.py).
 #       --flow-config PATH
 #                         Path to optical_flow.yaml [default: configs/sensors/optical_flow.yaml]
@@ -79,10 +86,14 @@ Usage: ./eval_scripts/phase0_gate.sh [OPTIONS]
       --spacing M      Spawn spacing on X axis (m)  [default: 1.5]
       --mesh PATH      Mesh for radar raycasting (rel to SAR_NANO_SWARM_ROOT)
       --no-radar       Skip radar plugin
+      --no-radar-noise Skip radar noise layer (ideal cloud on /cf_<i>/radar/points)
+      --radar-noise-config PATH  radar_noise.yaml [default: configs/sensors/radar_noise.yaml]
       --no-payload     Skip mass/inertia payload rewrite
       --payload-config PATH  payload.yaml to use [default: configs/airframe/payload.yaml]
       --no-tof         Skip IR ToF rangefinder sensor injection
       --tof-config PATH  tof.yaml to use [default: configs/sensors/tof.yaml]
+      --no-imu-noise   Skip Gazebo IMU noise-model injection
+      --imu-noise-config PATH  imu_noise.yaml [default: configs/sensors/imu_noise.yaml]
       --no-flow        Skip PMW3901 optical-flow node
       --flow-config PATH  optical_flow.yaml [default: configs/sensors/optical_flow.yaml]
       --no-uwb         Skip UWB PDoA node
@@ -106,10 +117,14 @@ NUM_DRONES=1
 SPACING=1.5
 MESH_ARG=""
 USE_RADAR=true
+USE_RADAR_NOISE=true
+RADAR_NOISE_CONFIG=""
 USE_PAYLOAD=true
 PAYLOAD_CONFIG=""
 USE_TOF=true
 TOF_CONFIG=""
+USE_IMU_NOISE=true
+IMU_NOISE_CONFIG=""
 USE_FLOW=true
 FLOW_CONFIG=""
 USE_UWB=true
@@ -131,10 +146,14 @@ while [[ $# -gt 0 ]]; do
     --spacing)    SPACING="$2";    shift 2 ;;
     --mesh)       MESH_ARG="$2";    shift 2 ;;
     --no-radar)   USE_RADAR=false;  shift   ;;
+    --no-radar-noise) USE_RADAR_NOISE=false; shift ;;
+    --radar-noise-config) RADAR_NOISE_CONFIG="$2"; shift 2 ;;
     --no-payload) USE_PAYLOAD=false; shift  ;;
     --payload-config) PAYLOAD_CONFIG="$2"; shift 2 ;;
     --no-tof)     USE_TOF=false;   shift   ;;
     --tof-config) TOF_CONFIG="$2"; shift 2 ;;
+    --no-imu-noise) USE_IMU_NOISE=false; shift ;;
+    --imu-noise-config) IMU_NOISE_CONFIG="$2"; shift 2 ;;
     --no-flow)    USE_FLOW=false;  shift   ;;
     --flow-config) FLOW_CONFIG="$2"; shift 2 ;;
     --no-uwb)     USE_UWB=false;   shift   ;;
@@ -228,21 +247,66 @@ PYEOF
 info "World name: $WORLD_NAME"
 
 # ── resolve radar mesh ────────────────────────────────────────────────────────
-# Default meshes keyed by world name (relative to SAR_NANO_SWARM_ROOT).
-declare -A _DEFAULT_MESHES=(
-  ["phase0_tunnel_gate"]="sim_worlds/darpa_subt_worlds/worlds/models/cave_world/meshes/cave_world.obj"
-  ["phase1_pid_tune"]=""    # flat/open world, no geometry to raycast against — use --no-radar
-  ["crazysim_default"]=""
-)
+# radarays_gz2 imports <mesh_path> at IDENTITY and raycasts in WORLD frame, and
+# never reads the world SDF. So the map must be the launched world's COLLISION
+# geometry (ground <plane> included) already transformed into world
+# coordinates. eval_scripts/build_radar_map.py builds exactly that from
+# $WORLD_SDF, cropped to the flight region + radar range, cached in
+# out/radar_maps/<world>_<hash>.obj (a relaunch reuses it without re-parsing
+# meshes). No per-world mesh table: every world with physical geometry gets
+# radar (phase1_pid_tune / crazysim_default via their ground planes).
+#
+# --mesh PATH stays an explicit override (used verbatim, as before).
+# If the builder fails (or the cropped map is empty) radar is DISABLED with a
+# loud warning — never a silent fallback to a mesh that does not match the world.
+#
+# Flight region: spawn line x in [SPAWN_X, SPAWN_X+(N-1)*SPACING], y = SPAWN_Y,
+# z in [0, RADAR_FLIGHT_ZMAX_M], widened by RADAR_FLIGHT_MARGIN_M on each
+# horizontal side. 5 m covers everything the launcher's users do today:
+# eval_scripts/swarm_loc_scenarios.py motions translate at most ~2-3 m total
+# (0.4-0.5 m legs, a few of them) and the gate reset_poses drones into
+# line/triangle layouts within a few metres of the spawn line. The builder adds
+# the radar range (+2 m margin) on top of this on every axis.
+RADAR_FLIGHT_MARGIN_M=5.0
+RADAR_FLIGHT_ZMAX_M=3.0
+# With --no-radar-noise the ideal plugin cloud is not gated to radar_noise.yaml
+# range_max_m; the plugin itself casts to radarModel_.range.max = 30 m
+# (perception/radarays_gz2/src/RadarSensorSystem.cpp), so crop to that instead.
+RADAR_PLUGIN_RANGE_MAX_M=30.0
 
 if [[ "$USE_RADAR" == true ]]; then
-  MESH_PATH="${MESH_ARG:-${_DEFAULT_MESHES[$WORLD_NAME]:-}}"
+  MESH_PATH="$MESH_ARG"
 
   if [[ -z "$MESH_PATH" ]]; then
-    warn "No mesh path for world '$WORLD_NAME'. Disabling radar."
-    warn "Pass --mesh <path> to enable it, or --no-radar to suppress this warning."
-    USE_RADAR=false
-  else
+    _map_region=$(python3 -c "
+x0 = float('${SPAWN_X}'); x1 = x0 + (int('${NUM_DRONES}') - 1) * float('${SPACING}')
+y = float('${SPAWN_Y}'); m = float('${RADAR_FLIGHT_MARGIN_M}')
+print(min(x0, x1) - m, max(x0, x1) + m, y - m, y + m, 0.0, float('${RADAR_FLIGHT_ZMAX_M}'))")
+    _map_args=("$WORLD_SDF" --region $_map_region
+               --cache-dir "$SAR_NANO_SWARM_ROOT/out/radar_maps")
+    if [[ "$USE_RADAR_NOISE" != true ]]; then
+      _map_args+=(--range-m "$RADAR_PLUGIN_RANGE_MAX_M")
+    elif [[ -n "$RADAR_NOISE_CONFIG" ]]; then
+      _rn_cfg="$RADAR_NOISE_CONFIG"
+      [[ "$_rn_cfg" != /* ]] && _rn_cfg="$SAR_NANO_SWARM_ROOT/$_rn_cfg"
+      _map_args+=(--radar-config "$_rn_cfg")
+    fi
+    info "Building radar map from world collision geometry (region: $_map_region) …"
+    if _map_out=$(python3 "$SAR_NANO_SWARM_ROOT/eval_scripts/build_radar_map.py" "${_map_args[@]}"); then
+      echo "$_map_out" | sed '$d' | sed 's/^/    /'
+      MESH_PATH="$(echo "$_map_out" | tail -n 1)"
+    else
+      warn "════════════════════════════════════════════════════════════════════"
+      warn "build_radar_map.py FAILED for $WORLD_SDF — RADAR DISABLED."
+      warn "The radar map must match the world; not falling back to another mesh."
+      warn "Fix the error above, pass --mesh <path>, or --no-radar."
+      warn "════════════════════════════════════════════════════════════════════"
+      USE_RADAR=false
+      MESH_PATH=""
+    fi
+  fi
+
+  if [[ "$USE_RADAR" == true ]]; then
     # Verify the mesh file is reachable
     _resolved_mesh="$MESH_PATH"
     [[ "$MESH_PATH" != /* ]] && _resolved_mesh="$SAR_NANO_SWARM_ROOT/$MESH_PATH"
@@ -254,6 +318,28 @@ if [[ "$USE_RADAR" == true ]]; then
       info "Radar mesh: $MESH_PATH"
     fi
   fi
+fi
+
+# ── radar noise layer (sim-side) — resolve BEFORE injection ──────────────────
+# Enabled: plugin publishes the ideal cloud on /cf_<i>/radar/points_ideal and
+# perception/radar_sim/radar_noise_node.py republishes /cf_<i>/radar/points.
+# If the node cannot start, fall back to the plugin publishing /radar/points
+# directly so RIO is never left without a cloud.
+RADAR_TOPIC_SUFFIX="radar/points"
+if [[ "$USE_RADAR" == true && "$USE_RADAR_NOISE" == true ]]; then
+  _radar_noise_cfg="${RADAR_NOISE_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/sensors/radar_noise.yaml}"
+  [[ "$_radar_noise_cfg" != /* ]] && _radar_noise_cfg="$SAR_NANO_SWARM_ROOT/$_radar_noise_cfg"
+  if [[ ! -f "$_radar_noise_cfg" ]]; then
+    warn "Radar noise config not found: $_radar_noise_cfg — radar cloud will be IDEAL."
+    USE_RADAR_NOISE=false
+  elif ! command -v ros2 &>/dev/null; then
+    warn "ros2 not on PATH — skipping radar noise node; radar cloud will be IDEAL."
+    USE_RADAR_NOISE=false
+  else
+    RADAR_TOPIC_SUFFIX="radar/points_ideal"
+  fi
+else
+  USE_RADAR_NOISE=false
 fi
 
 # Real RIO needs radarays Doppler clouds. Stub is the only no-radar odom path.
@@ -285,6 +371,7 @@ info "Stopping any running cf2 / UWB / swarm-loc nodes …"
 pkill -x cf2 2>/dev/null || true
 pkill -f "uwb_node.py" 2>/dev/null || true
 pkill -f "uwb_sim" 2>/dev/null || true
+pkill -f "radar_noise_node.py" 2>/dev/null || true
 pkill -f "swarm_loc_node.py" 2>/dev/null || true
 pkill -f "rio_stub.py" 2>/dev/null || true
 pkill -f "rio_bridge.py" 2>/dev/null || true
@@ -330,8 +417,8 @@ for CF_ID in $(seq 0 $((NUM_DRONES - 1))); do
     --output-file     "$SDF_TMP"
 
   if [[ "$USE_RADAR" == true ]]; then
-    info "Injecting radarays_gz2 plugin on drone ${CF_ID} (mesh: $MESH_PATH, topic: /cf_${CF_ID}/radar/points) …"
-    python3 - "$SDF_TMP" "$MESH_PATH" "$CF_ID" <<'PYEOF'
+    info "Injecting radarays_gz2 plugin on drone ${CF_ID} (mesh: $MESH_PATH, topic: /cf_${CF_ID}/${RADAR_TOPIC_SUFFIX}) …"
+    python3 - "$SDF_TMP" "$MESH_PATH" "$CF_ID" "/cf_${CF_ID}/${RADAR_TOPIC_SUFFIX}" <<'PYEOF'
 import sys, xml.etree.ElementTree as ET
 
 ET.register_namespace('', 'http://sdformat.org/schemas/root.xsd')
@@ -348,8 +435,9 @@ plugin.set('name', 'radarays_gz2::RadarSensorSystem')
 mesh_elem = ET.SubElement(plugin, 'mesh_path')
 mesh_elem.text = sys.argv[2]
 # Per-drone radar topic so rio_bridge <i> sees only its own Doppler cloud.
+# /cf_<i>/radar/points_ideal when the radar noise node is enabled, else /cf_<i>/radar/points.
 topic_elem = ET.SubElement(plugin, 'topic')
-topic_elem.text = f"/cf_{sys.argv[3]}/radar/points"
+topic_elem.text = sys.argv[4]
 
 tree.write(sys.argv[1], encoding='unicode')
 print(f"[radar-inject] Plugin injected into {sys.argv[1]}")
@@ -383,6 +471,18 @@ PYEOF
       info "Injecting IR ToF sensor(s) on drone ${CF_ID} ($_tof_cfg) …"
       python3 "$SAR_NANO_SWARM_ROOT/eval_scripts/apply_tof_sensor.py" "$SDF_TMP" \
         --config "$_tof_cfg" --cf-id "$CF_ID"
+    fi
+  fi
+
+  if [[ "$USE_IMU_NOISE" == true ]]; then
+    _imu_cfg="${IMU_NOISE_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/sensors/imu_noise.yaml}"
+    [[ "$_imu_cfg" != /* ]] && _imu_cfg="$SAR_NANO_SWARM_ROOT/$_imu_cfg"
+    if [[ ! -f "$_imu_cfg" ]]; then
+      warn "IMU noise config not found: $_imu_cfg — skipping IMU noise injection."
+    else
+      info "Injecting IMU noise model on drone ${CF_ID} ($_imu_cfg) …"
+      python3 "$SAR_NANO_SWARM_ROOT/eval_scripts/apply_imu_noise.py" "$SDF_TMP" \
+        --config "$_imu_cfg" --cf-id "$CF_ID"
     fi
   fi
 
@@ -509,6 +609,15 @@ if [[ "$USE_UWB" == true ]]; then
   fi
 fi
 
+# ── launch radar noise node — one node for the whole swarm, before RIO ───────
+# (config / ros2 availability already resolved before plugin injection)
+if [[ "$USE_RADAR" == true && "$USE_RADAR_NOISE" == true ]]; then
+  info "Starting radar noise node ($_radar_noise_cfg, ${NUM_DRONES} drones: /cf_<i>/radar/points_ideal → /cf_<i>/radar/points) …"
+  python3 -u "$SAR_NANO_SWARM_ROOT/perception/radar_sim/radar_noise_node.py" \
+    --config "$_radar_noise_cfg" --num-drones "$NUM_DRONES" &
+  _PIDS+=($!)
+fi
+
 # ── launch RIO stub + swarm-loc estimator (Phase 2 P2-5) — one pair per drone ─
 if [[ "$USE_SWARM_LOC" == true ]]; then
   _cfg="${SWARM_LOC_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/estimation/swarm_loc.yaml}"
@@ -601,8 +710,10 @@ done
 echo "  ║  World        : ${WORLD_NAME}"
 echo "  ║  Model        : ${MODEL}_0..$((NUM_DRONES - 1))"
 echo "  ║  Radar        : ${USE_RADAR}"
+echo "  ║  Radar noise  : ${USE_RADAR_NOISE}"
 echo "  ║  Payload model: ${USE_PAYLOAD}"
 echo "  ║  ToF sensor   : ${USE_TOF}"
+echo "  ║  IMU noise    : ${USE_IMU_NOISE}"
 echo "  ║  Optical flow : ${USE_FLOW}"
 echo "  ║  UWB          : ${USE_UWB}"
 echo "  ║  Swarm-loc    : ${USE_SWARM_LOC}"
