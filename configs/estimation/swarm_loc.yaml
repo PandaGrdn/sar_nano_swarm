@@ -172,6 +172,7 @@ rio:
     init_min_samples: 50
     init_max_gyro_norm_rad_s: 0.05
     init_max_accel_dev_mps2: 0.5     # | |a| - gravity_mps2 |
+    init_max_tilt_deg: 30.0          # reject init if tilted > 30 deg or upside down; a launch pad rest is within a few degrees of level
     # Sim-time gap larger than this is NOT integrated across (rotation during
     # the gap is lost, counted); also treats a backward jump as a time reset.
     max_dt_gap_s: 0.1

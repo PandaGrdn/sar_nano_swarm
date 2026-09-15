@@ -1,6 +1,5 @@
 <?xml version="1.0" ?>
-<!-- Phase 0 exit gate world: SubT-style tunnel geometry + CrazySim-compatible systems.
-     Spawn the Crazyflie (with radar plugin) via eval_scripts/phase0_gate.sh. -->
+<!-- Phase 0 tunnel world. Site file: configs/sim/tunnel_site.yaml -->
 <sdf version="1.9">
   <world name="phase0_tunnel_gate">
     <physics type="ode">
@@ -36,36 +35,12 @@
       <direction>-0.5 0.1 -0.9</direction>
     </light>
 
-    <model name="ground_plane">
-      <static>true</static>
-      <link name="link">
-        <collision name="collision">
-          <geometry>
-            <plane>
-              <normal>0 0 1</normal>
-              <size>200 200</size>
-            </plane>
-          </geometry>
-        </collision>
-        <visual name="visual">
-          <geometry>
-            <plane>
-              <normal>0 0 1</normal>
-              <size>200 200</size>
-            </plane>
-          </geometry>
-          <material>
-            <ambient>0.2 0.2 0.2 1</ambient>
-            <diffuse>0.3 0.3 0.3 1</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
+    <!-- ground_plane removed (tunnel_site.ground_plane=false); the tube floor is the floor. -->
 
     <!-- SubT tunnel segment (local mesh; no Fuel dependency) -->
     <model name="tunnel_segment">
       <static>true</static>
-      <pose>0 0 0 1.570796 0 0</pose>
+      <pose>28.000000 -64.662384 -143.817011 1.570796 0.000000 -3.141593</pose>
       <link name="link">
         <collision name="collision">
           <geometry>
@@ -80,6 +55,27 @@
               <uri>model://cave_world/meshes/lava_tube.obj</uri>
             </mesh>
           </geometry>
+        </visual>
+      </link>
+    </model>
+  
+    <model name="launch_pad">
+      <static>true</static>
+      <pose>1.500000 0.000000 -0.020000 0 0 0.000000</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>4.000000 1.900000 0.060001</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>4.000000 1.900000 0.060001</size></box>
+          </geometry>
+          <material>
+            <ambient>0.5 0.5 0.55 1</ambient>
+            <diffuse>0.6 0.6 0.65 1</diffuse>
+          </material>
         </visual>
       </link>
     </model>

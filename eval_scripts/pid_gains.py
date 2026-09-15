@@ -12,7 +12,9 @@ If you bump the pinned CrazySim/crazyflie-firmware submodule commit, re-grep
 those files before trusting this list (AGENTS.md §6.4: never fabricate
 firmware API details).
 """
+import math
 import subprocess
+import sys
 
 import yaml
 
@@ -81,7 +83,26 @@ def reset_estimator(cf, estimator_group="kalman"):
     cf.param.set_value(f"{estimator_group}.resetEstimation", "1")
 
 
-def reset_pose(world_name, model_name, xyz=(0.0, 0.0, 0.5), gz_bin="gz", timeout_ms=2000):
+def pose_request(model_name, xyz=(0.0, 0.0, 0.5), yaw_rad=0.0) -> str:
+    """gz.msgs.Pose protobuf text for UserCommands set_pose.
+
+    Always includes an identity-tilt quaternion (yaw only). Omitting
+    orientation leaves whatever tumble the model already has — on lava_tube
+    that flipped cf_0 (roll ≈ −177°) so it never took off.
+    """
+    x, y, z = (float(v) for v in xyz)
+    yaw = float(yaw_rad)
+    qz = math.sin(yaw / 2.0)
+    qw = math.cos(yaw / 2.0)
+    return (
+        f'name: "{model_name}", '
+        f"position: {{x: {x}, y: {y}, z: {z}}}, "
+        f"orientation: {{x: 0, y: 0, z: {qz}, w: {qw}}}"
+    )
+
+
+def reset_pose(world_name, model_name, xyz=(0.0, 0.0, 0.5), yaw_rad=0.0,
+               gz_bin="gz", timeout_ms=2000):
     """Teleport the gz-sim model entity back to a spawn pose between tuning
     trials, via the UserCommands 'set_pose' service.
 
@@ -93,8 +114,7 @@ def reset_pose(world_name, model_name, xyz=(0.0, 0.0, 0.5), gz_bin="gz", timeout
     on your installed gz-sim Harmonic version, paste `gz service -i -s
     /world/<world>/set_pose` output and this will get corrected.
     """
-    x, y, z = xyz
-    req = f"name: \"{model_name}\", position: {{x: {x}, y: {y}, z: {z}}}"
+    req = pose_request(model_name, xyz, yaw_rad)
     cmd = [
         gz_bin, "service",
         "-s", f"/world/{world_name}/set_pose",
@@ -104,3 +124,36 @@ def reset_pose(world_name, model_name, xyz=(0.0, 0.0, 0.5), gz_bin="gz", timeout
         "--req", req,
     ]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+
+def run_selftest() -> int:
+    ok = True
+    n_pass = n_fail = 0
+
+    def check(name, cond, detail=""):
+        nonlocal ok, n_pass, n_fail
+        if cond:
+            n_pass += 1
+            print(f"[selftest] PASS {name}")
+        else:
+            ok = False
+            n_fail += 1
+            print(f"[selftest] FAIL {name}" + (f": {detail}" if detail else ""))
+
+    r = pose_request("crazyflie_0", (0.0, 0.45, 0.5), 0.0)
+    check("1 identity tilt at yaw 0", "orientation: {x: 0, y: 0, z: 0.0, w: 1.0}" in r, r)
+    check("1b position", "position: {x: 0.0, y: 0.45, z: 0.5}" in r, r)
+    check("1c name", 'name: "crazyflie_0"' in r, r)
+    r90 = pose_request("crazyflie_1", (1.0, 0.0, 0.5), math.pi / 2)
+    qz, qw = math.sin(math.pi / 4), math.cos(math.pi / 4)
+    check("2 yaw 90 deg is z-w equal",
+          f"z: {qz}" in r90 and f"w: {qw}" in r90 and "x: 0, y: 0" in r90, r90)
+    print(f"[selftest] {n_pass} passed, {n_fail} failed")
+    print("[selftest] " + ("ALL PASS" if ok else "FAILED"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        raise SystemExit(run_selftest())
+    raise SystemExit("pid_gains.py is a library; use --selftest")

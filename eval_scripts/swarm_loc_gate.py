@@ -43,6 +43,7 @@ from swarm_loc_scenarios import (  # noqa: E402
     eval_dir_for,
     get_scenario,
     log_dir_for,
+    sim_sleep,
     spawn_xy,
 )
 
@@ -55,6 +56,33 @@ _RESTART_MSG = (
 )
 
 RATE_FRAC_MIN = 0.80
+
+# Madgwick init needs init_window_s of SIM-time stillness AFTER takeoff.
+# The old 4 s WALL settle was ~1.2 s sim at RTF ≈ 0.3 — shorter than the 2 s
+# window — so cf_0 never finished gyro-bias calib and published no /rio/delta.
+RIO_READY_TIMEOUT_S = 90.0
+
+# PAD runs (spawned_at_layout) settle after takeoff instead of a powered
+# reset_pose re-teleport (there's nothing to re-teleport past — they rest on
+# a flat pad already). --hover-settle-sim-s controls the SIM-time settle
+# window; HOVER_SETTLE_WALL_TIMEOUT_S is the wall-clock guard against that
+# sim time never arriving (RTF ~0 / stalled sim), generous down to RTF~0.05
+# for the default 3 s settle.
+HOVER_SETTLE_SIM_S_DEFAULT = 3.0
+HOVER_SETTLE_WALL_TIMEOUT_S = 60.0
+
+# ---------------------------------------------------------------------------
+# Airborne tripwire (blocking, per drone). The 2026-09-14 hollow PASS on
+# tunnel/triangle_forward: cf_0 sat at z = 0.015 m for the ENTIRE scored
+# window (its RIO had initialized while inverted, bouncing on bumpy lava
+# rock) and the gate PASSED anyway — nothing checked that the drone ever
+# left the ground; metrics_6_1.json for that run is not a real result.
+# AIRBORNE_MARGIN_M / AIRBORNE_FRAC_MIN back the `airborne_cf_<i>` check:
+# truth z must be within MARGIN of the commanded world hover height for
+# >= FRAC_MIN of the truth samples inside the scored flight window.
+# ---------------------------------------------------------------------------
+AIRBORNE_MARGIN_M = 0.25
+AIRBORNE_FRAC_MIN = 0.8
 
 # ---------------------------------------------------------------------------
 # Hollow-run tripwires (blocking). The 2026-09-11 triangle_forward run PASSED
@@ -754,6 +782,79 @@ class EstimateRecorder:
         )
         return False
 
+    def rio_valid_counts(self) -> Dict[int, int]:
+        """Valid /cf_i/rio/delta rows per drone (attitude has initialized)."""
+        return {
+            i: sum(1 for _w, _s, v in rows if int(v))
+            for i, rows in self.rio_meta.items()
+        }
+
+    def last_xyz(self) -> Dict[int, Tuple[float, float, float]]:
+        out: Dict[int, Tuple[float, float, float]] = {}
+        for i, rec in self.truth.items():
+            if rec:
+                _t, x, y, z, _yaw = rec[-1]
+                out[i] = (float(x), float(y), float(z))
+        return out
+
+    def wait_rio_ready(
+        self,
+        timeout_s: float = RIO_READY_TIMEOUT_S,
+        min_sim_s: float = 2.0,
+        min_valid: int = 1,
+    ) -> bool:
+        """Hover-wait until every drone has published valid RIO.
+
+        Madgwick only becomes ready after init_window_s of *sim* stillness.
+        Wall sleeps under-count when RTF < 1. Also require min_sim_s of sim
+        time to elapse after the wait starts so takeoff transients die before
+        the scripted path.
+        """
+        t_wall0 = time.time()
+        t_sim0 = self.sim_now()
+        last_print = 0.0
+        while True:
+            counts = self.rio_valid_counts()
+            t_sim = self.sim_now()
+            sim_held = (
+                math.isfinite(t_sim)
+                and math.isfinite(t_sim0)
+                and (t_sim - t_sim0) >= float(min_sim_s)
+            )
+            all_rio = bool(counts) and all(c >= int(min_valid) for c in counts.values())
+            if sim_held and all_rio:
+                print(
+                    f"[swarm_loc_gate] RIO ready on all drones "
+                    f"(rio_valid={counts}, sim_held={t_sim - t_sim0:.1f}s)",
+                    flush=True,
+                )
+                return True
+            elapsed = time.time() - t_wall0
+            sim_dt = (
+                t_sim - t_sim0
+                if math.isfinite(t_sim) and math.isfinite(t_sim0)
+                else float("nan")
+            )
+            if elapsed >= float(timeout_s):
+                missing = [i for i, c in counts.items() if c < int(min_valid)]
+                zs = {i: round(xyz[2], 3) for i, xyz in self.last_xyz().items()}
+                print(
+                    f"[swarm_loc_gate] RIO not ready after {timeout_s:.0f}s wall "
+                    f"(missing cf_{missing} rio_valid={counts} "
+                    f"sim_held={sim_dt:.1f}s z={zs})",
+                    flush=True,
+                )
+                return False
+            if elapsed - last_print >= 5.0:
+                zs = {i: round(xyz[2], 3) for i, xyz in self.last_xyz().items()}
+                print(
+                    f"[swarm_loc_gate] hovering for Madgwick init … "
+                    f"rio_valid={counts} sim_held={sim_dt:.1f}/{min_sim_s:.1f}s z={zs}",
+                    flush=True,
+                )
+                last_print = elapsed
+            time.sleep(0.2)
+
     def sim_now(self) -> float:
         """Sim-clock high-water mark from /cf_*/odom headers, or NaN if unset.
 
@@ -988,7 +1089,165 @@ def _as_cf(obj):
     raise TypeError(f"cannot unwrap Crazyflie from {type(obj)}")
 
 
+def resolve_launch(cfg: dict, cli_hover_height: float) -> dict:
+    """Pure: derive spawn/hover parameters from the config's `launch:` block.
+
+    SHARED INTERFACE with the pad-spawn work: a pad-run derived config's
+    `launch:` carries `spawned_at_layout: true`, `pad_top_z_m`,
+    `hover_above_pad_m`, and `positions_xyz_m` per drone as
+    `[x, y, pad_top_z_m + hover_above_pad_m]` (world). Non-pad configs carry
+    none of the three new keys and keep the old positions-only behavior.
+
+    Returns a dict:
+      spawn_xy           list[(x, y)] or None (unset -> caller keeps its own)
+      spawned_at_layout   bool
+      pad_top_z           float or None (world z of the pad top)
+      hover_above_pad     float or None (commanded hover height above the pad)
+      mc_default_height   MotionCommander `default_height` — relative to
+                           wherever the drone rests (pad top for pad runs,
+                           the world floor at z=0 otherwise)
+      world_hover_z        world-frame z at hover, used by the airborne check
+    """
+    launch_cfg = cfg.get("launch") or {}
+    pos = launch_cfg.get("positions_xyz_m")
+    spawned_at_layout = bool(launch_cfg.get("spawned_at_layout", False))
+    out = {
+        "spawn_xy": None,
+        "spawned_at_layout": spawned_at_layout,
+        "pad_top_z": None,
+        "hover_above_pad": None,
+        "mc_default_height": float(cli_hover_height),
+        "world_hover_z": float(cli_hover_height),
+    }
+    if not pos:
+        return out
+    out["spawn_xy"] = [(float(p[0]), float(p[1])) for p in pos]
+    if spawned_at_layout:
+        pad_top_z = float(launch_cfg["pad_top_z_m"])
+        hover_above_pad = float(launch_cfg["hover_above_pad_m"])
+        out["pad_top_z"] = pad_top_z
+        out["hover_above_pad"] = hover_above_pad
+        out["mc_default_height"] = hover_above_pad
+        out["world_hover_z"] = pad_top_z + hover_above_pad
+    else:
+        world_hover_z = float(pos[0][2])
+        out["mc_default_height"] = world_hover_z
+        out["world_hover_z"] = world_hover_z
+    return out
+
+
+def flight_steps(spawned_at_layout: bool, recorder_present: bool) -> List[str]:
+    """Pure planner: the ordered flight sequence `run_flight` follows.
+
+    PAD runs (spawned_at_layout) rest the drones on a flat pad at their
+    layout position already — there is nothing to reset_pose past, and an
+    unpowered/powered reset_pose there only fights the pad contact (AGENTS.md:
+    unpowered reset_pose loses the fight with gravity). So: reset the
+    estimator, wait for RIO to come up BEFORE arming (while still on the
+    pad), then arm/takeoff/settle/fly. Without a recorder there is no way to
+    confirm RIO readiness, so the plan fails closed rather than arming blind.
+
+    Non-pad runs keep the original sequence (unpowered reset_pose to the
+    possibly-bumpy layout, arm, takeoff, powered reset_pose to a clean level
+    hover) but the post-takeoff RIO wait now fails the flight explicitly
+    instead of "starting the path anyway" (2026-09-14 hollow pass) when a
+    recorder is present to check it; with no recorder there is nothing to
+    wait on, so the plan proceeds straight to the scripted path (matching
+    today's recorder-less behavior).
+    """
+    if spawned_at_layout:
+        if not recorder_present:
+            # No way to confirm RIO readiness before arming -> fail closed
+            # right there. The plan stops: arm/takeoff/fly never happen.
+            return ["reset_estimator_all", "rio_ready_prearm_unavailable_fail"]
+        return [
+            "reset_estimator_all",
+            "rio_ready_prearm_wait",
+            "arm",
+            "takeoff",
+            "hover_settle",
+            "mark_flight_start",
+            "scripted_path",
+            "mark_flight_end",
+        ]
+    steps = [
+        "reset_pose_unpowered_all",
+        "reset_estimator_all",
+        "arm",
+        "takeoff",
+        "reset_pose_powered_all",
+        "reset_estimator_all_post_takeoff",
+    ]
+    if recorder_present:
+        steps.append("rio_ready_postarm_wait")
+    steps += ["mark_flight_start", "scripted_path", "mark_flight_end"]
+    return steps
+
+
+def airborne_check(
+    truth_stamps: List[float],
+    truth_z: List[float],
+    flight_t0: Optional[float],
+    flight_t1: Optional[float],
+    world_hover_z: float,
+) -> Tuple[bool, str]:
+    """Per-drone: was it actually airborne during the scored flight window?
+
+    2026-09-14 hollow pass: cf_0 sat at z = 0.015 m for the WHOLE scored
+    window (its RIO had initialized while inverted on bumpy lava rock) and
+    the gate PASSED — nothing checked altitude. This compares truth z (SIM
+    time, same clock as flight_sim_t0/t1) against the flight window: the
+    fraction of truth samples inside the window with
+    z >= world_hover_z - AIRBORNE_MARGIN_M must be >= AIRBORNE_FRAC_MIN.
+    A missing/non-finite/empty window, or zero samples inside it, FAILS
+    explicitly — never a vacuous pass.
+    """
+    a = float(flight_t0) if flight_t0 is not None else float("nan")
+    b = float(flight_t1) if flight_t1 is not None else float("nan")
+    if not (math.isfinite(a) and math.isfinite(b)) or b <= a:
+        return False, (
+            f"no valid scored flight window (t0={flight_t0} t1={flight_t1}) — "
+            "airborne fraction is unverifiable; FAIL rather than pass vacuously"
+        )
+    if not math.isfinite(world_hover_z):
+        return False, f"world_hover_z is not finite ({world_hover_z}) — cannot check altitude"
+    pairs = [
+        (float(t), float(z))
+        for t, z in zip(truth_stamps or [], truth_z or [])
+        if math.isfinite(t) and math.isfinite(z) and a <= t <= b
+    ]
+    if not pairs:
+        return False, (
+            f"no truth samples inside flight window [{a:.1f}, {b:.1f}]s — "
+            "airborne fraction is unverifiable; FAIL rather than pass vacuously"
+        )
+    floor = world_hover_z - AIRBORNE_MARGIN_M
+    hits = sum(1 for _, z in pairs if z >= floor)
+    frac = hits / len(pairs)
+    ok = frac >= AIRBORNE_FRAC_MIN
+    return ok, (
+        f"airborne_frac={frac:.2f} (need>={AIRBORNE_FRAC_MIN:g}) "
+        f"z>={floor:.3f}m (world_hover_z={world_hover_z:.3f}m - "
+        f"margin={AIRBORNE_MARGIN_M:g}m) over {len(pairs)} truth samples "
+        f"in [{a:.1f},{b:.1f}]s"
+    )
+
+
+def apply_rio_ready_prearm_check(checks: Dict[str, bool], rio_ready_prearm: Optional[bool]) -> None:
+    """Wire the pad-only `rio_ready_prearm` check into `checks` (pure, mutates in place).
+
+    `rio_ready_prearm` is None for non-pad runs (run_flight never sets
+    args._rio_ready_prearm on that path) — the check is then OMITTED
+    entirely, matching the SHARED INTERFACE. Pad runs set True/False and the
+    check is wired accordingly.
+    """
+    if rio_ready_prearm is not None:
+        checks["rio_ready_prearm"] = bool(rio_ready_prearm)
+
+
 def run_flight(args, scfs: list, recorder=None) -> bool:
+    from contextlib import ExitStack
+
     from pid_gains import apply_gains, load_gains, reset_estimator, reset_pose
     from cflib.positioning.motion_commander import MotionCommander
 
@@ -996,53 +1255,216 @@ def run_flight(args, scfs: list, recorder=None) -> bool:
     gains = load_gains(args.gains)
     signal.signal(signal.SIGALRM, _alarm)
     diverged = False
+    spawned_at_layout = bool(getattr(args, "spawned_at_layout", False))
+    ready_timeout = float(getattr(args, "rio_ready_timeout", RIO_READY_TIMEOUT_S))
+    init_window_s = float(getattr(args, "rio_init_window_s", 2.0))
+    plan = flight_steps(spawned_at_layout, recorder is not None)
+    print(
+        f"[swarm_loc_gate] flight plan ({'pad' if spawned_at_layout else 'non-pad'}): "
+        f"{plan}",
+        flush=True,
+    )
+
+    def _spawn_xy(i):
+        return args._spawn_xy[i] if getattr(args, "_spawn_xy", None) else (
+            float(i * args.spacing),
+            0.0,
+        )
+
     try:
+        # Wall guard must outlast sim-time flight at RTF < 1 (lockstep does
+        # not make Gazebo real-time; 45 s sim at RTF 0.3 is ~150 s wall).
+        signal.setitimer(
+            signal.ITIMER_REAL,
+            max(
+                float(args.duration) * 20.0,
+                float(args.duration) + ready_timeout + HOVER_SETTLE_WALL_TIMEOUT_S + 60.0,
+            ),
+        )
         for i, scf in enumerate(scfs):
             cf = _as_cf(scf)
             apply_gains(cf, gains)
-            try:
-                xy = args._spawn_xy[i] if getattr(args, "_spawn_xy", None) else (
-                    float(i * args.spacing),
-                    0.0,
+            if not spawned_at_layout:
+                # step: reset_pose_unpowered_all — layout may be bumpy rock;
+                # PAD runs skip this (they already rest on the flat pad).
+                try:
+                    xy = _spawn_xy(i)
+                    reset_pose(
+                        args.world,
+                        f"{args.model_prefix}_{i}",
+                        xyz=(float(xy[0]), float(xy[1]), args.hover_height),
+                        yaw_rad=float(getattr(args, "spawn_yaw_rad", 0.0)),
+                    )
+                except Exception as e:
+                    print(f"[swarm_loc_gate] reset_pose {i} skipped: {e}", file=sys.stderr)
+            reset_estimator(cf, "kalman")  # step: reset_estimator_all
+
+        if spawned_at_layout:
+            # step: rio_ready_prearm_wait — while still resting on the pad,
+            # BEFORE arming. A pad run with no recorder cannot verify this
+            # and must fail closed rather than arm blind.
+            if recorder is None:
+                print(
+                    "[swarm_loc_gate] FAIL: pad run with no recorder — cannot verify "
+                    "RIO readiness before arming; refusing to arm blind",
+                    file=sys.stderr,
+                    flush=True,
                 )
-                reset_pose(
-                    args.world,
-                    f"{args.model_prefix}_{i}",
-                    xyz=(float(xy[0]), float(xy[1]), args.hover_height),
+                args._rio_ready_prearm = False
+                return True
+            print(
+                "[swarm_loc_gate] pad run: waiting for /rio/delta on all drones BEFORE "
+                f"arming (Madgwick init_window_s={init_window_s:.1f} sim, wall timeout "
+                f"{ready_timeout:.0f} s) …",
+                flush=True,
+            )
+            if not recorder.wait_rio_ready(timeout_s=ready_timeout, min_sim_s=init_window_s):
+                zs = {i: round(xyz[2], 3) for i, xyz in recorder.last_xyz().items()}
+                missing = [i for i, c in recorder.rio_valid_counts().items() if c < 1]
+                print(
+                    f"[swarm_loc_gate] FAIL: RIO attitude not ready pre-arm on drones "
+                    f"{missing} (truth z={zs}) — refusing to arm/fly. A pad run must "
+                    "never score with a dead RIO.",
+                    file=sys.stderr,
+                    flush=True,
                 )
-            except Exception as e:
-                print(f"[swarm_loc_gate] reset_pose {i} skipped: {e}", file=sys.stderr)
-            reset_estimator(cf, "kalman")
-        time.sleep(2.0)
+                args._rio_ready_prearm = False
+                return True
+            args._rio_ready_prearm = True
+
+        # step: arm
         for scf in scfs:
             try:
                 _as_cf(scf).platform.send_arming_request(True)
             except Exception:
                 pass
-        time.sleep(0.5)
-        signal.setitimer(signal.ITIMER_REAL, float(args.duration) + 60.0)
-        mcs = [MotionCommander(_as_cf(s), default_height=args.hover_height) for s in scfs]
-        # MotionCommander is a context manager; nest via ExitStack
-        from contextlib import ExitStack
+        time.sleep(0.1)
 
+        # step: takeoff
+        mcs = [MotionCommander(_as_cf(s), default_height=args.hover_height) for s in scfs]
         with ExitStack() as stack:
             for mc in mcs:
                 stack.enter_context(mc)
-            print("[swarm_loc_gate] takeoff/settle 4 s …")
-            time.sleep(4.0)
-            t_end = time.time() + float(args.duration)
+
+            if spawned_at_layout:
+                # step: hover_settle — sim-time settle in place of the powered
+                # re-teleport (nothing to re-teleport past on a flat pad),
+                # wall-guarded against sim time never advancing.
+                settle_s = float(getattr(args, "hover_settle_sim_s", HOVER_SETTLE_SIM_S_DEFAULT))
+                print(
+                    f"[swarm_loc_gate] pad run: settling {settle_s:.1f}s sim before the "
+                    "scripted path …",
+                    flush=True,
+                )
+                t_sim0 = recorder.sim_now()
+                t_wall0 = time.time()
+                settled = False
+                while True:
+                    t_sim = recorder.sim_now()
+                    if (
+                        math.isfinite(t_sim)
+                        and math.isfinite(t_sim0)
+                        and (t_sim - t_sim0) >= settle_s
+                    ):
+                        settled = True
+                        break
+                    if time.time() - t_wall0 >= HOVER_SETTLE_WALL_TIMEOUT_S:
+                        break
+                    time.sleep(0.1)
+                if not settled:
+                    print(
+                        f"[swarm_loc_gate] FAIL: sim time did not advance {settle_s:.1f}s "
+                        f"within {HOVER_SETTLE_WALL_TIMEOUT_S:.0f}s wall after takeoff — "
+                        "refusing to fly on an unverifiable hover-settle",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    diverged = True
+                    for mc in mcs:
+                        try:
+                            mc.stop()
+                        except Exception:
+                            pass
+                    return diverged
+            else:
+                # step: reset_pose_powered_all — motors are on. Snap every
+                # model to hover, level: an unpowered set_pose before takeoff
+                # loses the fight with gravity (AGENTS.md) and they sit on
+                # lava_tube rock (z≈0.015, bouncing) so Madgwick never gets
+                # 2 s still. PID can hold once they are in free air.
+                print("[swarm_loc_gate] powered teleport to hover (level) …", flush=True)
+                for i, _scf in enumerate(scfs):
+                    try:
+                        xy = _spawn_xy(i)
+                        reset_pose(
+                            args.world,
+                            f"{args.model_prefix}_{i}",
+                            xyz=(float(xy[0]), float(xy[1]), args.hover_height),
+                            yaw_rad=float(getattr(args, "spawn_yaw_rad", 0.0)),
+                        )
+                    except Exception as e:
+                        print(f"[swarm_loc_gate] powered reset_pose {i} skipped: {e}",
+                              file=sys.stderr)
+                    reset_estimator(_as_cf(_scf), "kalman")  # step: reset_estimator_all_post_takeoff
+                # step: rio_ready_postarm_wait — a run where RIO never came up
+                # must never score (2026-09-14 hollow pass: cf_0 stayed at
+                # z=0.015m for the whole scored window and the old code just
+                # printed a WARNING and started the path anyway).
+                if recorder is not None:
+                    print(
+                        "[swarm_loc_gate] hover until /rio/delta on all drones "
+                        f"(Madgwick init_window_s={init_window_s:.1f} sim, "
+                        f"wall timeout {ready_timeout:.0f} s) …",
+                        flush=True,
+                    )
+                    if not recorder.wait_rio_ready(
+                        timeout_s=ready_timeout, min_sim_s=init_window_s
+                    ):
+                        zs = {i: round(xyz[2], 3) for i, xyz in recorder.last_xyz().items()}
+                        missing = [i for i, c in recorder.rio_valid_counts().items() if c < 1]
+                        print(
+                            f"[swarm_loc_gate] FAIL: RIO attitude not ready on drones "
+                            f"{missing} (truth z={zs}) after takeoff — refusing to fly "
+                            "the scripted path. A run where RIO never came up must never "
+                            "score.",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        diverged = True
+                        for mc in mcs:
+                            try:
+                                mc.stop()
+                            except Exception:
+                                pass
+                        return diverged
+                else:
+                    print("[swarm_loc_gate] takeoff/settle 4 s …", flush=True)
+                    time.sleep(4.0)
+
+            # step: mark_flight_start / scripted_path / mark_flight_end
             spec = getattr(args, "_scenario", None)
             label = spec["key"] if spec else "tunnel/collinear_hover (default motion)"
-            print(f"[swarm_loc_gate] scripted path {label} for {args.duration:.0f} s …")
+            duration_s = float(args.duration)
+            print(f"[swarm_loc_gate] scripted path {label} for {duration_s:.0f} s sim …")
+            # When recorder available, t_end is sim-time; without, it's wall-clock.
             # BUG B: the liveness reference is the FLIGHT window, not the whole
             # recorder life. Mark it around the scripted path only.
             if recorder is not None:
+                t_end_sim = recorder.sim_now() + duration_s
                 recorder.mark_flight_start()
+            else:
+                t_end = time.time() + duration_s
             try:
                 if spec is not None:
-                    apply_motion(mcs, t_end, spec)
+                    if recorder is not None:
+                        apply_motion(mcs, t_end_sim, spec, recorder)
+                    else:
+                        apply_motion(mcs, t_end, spec)
                 else:
-                    apply_motion(mcs, t_end, get_scenario("tunnel/collinear_hover"))
+                    if recorder is not None:
+                        apply_motion(mcs, t_end_sim, get_scenario("tunnel/collinear_hover"), recorder)
+                    else:
+                        apply_motion(mcs, t_end, get_scenario("tunnel/collinear_hover"))
             except Exception as e:
                 print(f"[swarm_loc_gate] motion warning: {e}", file=sys.stderr)
             finally:
@@ -1661,6 +2083,245 @@ def run_selftest() -> int:
         t0, _, _ = load_score_window(Path(td))
         check("13e unset marker persists no start, never a 0.0 window", t0 is None, f"t0={t0}")
 
+    # Hover-wait for Madgwick /rio/delta (replaces the 4 s wall settle).
+    rec = _fresh_recorder(3)
+    check("14 wait_rio_ready False when no deltas (timeout 0)",
+          not rec.wait_rio_ready(timeout_s=0.0, min_sim_s=0.0))
+    rec.rio_meta[0].append((0.0, 10.0, 1))
+    rec.rio_meta[1].append((0.0, 10.0, 1))
+    check("14a still False if any drone has no valid RIO",
+          not rec.wait_rio_ready(timeout_s=0.0, min_sim_s=0.0))
+    rec.rio_meta[2].append((0.0, 10.0, 0))  # invalid row does not count
+    check("14b invalid-only rows do not count as ready",
+          not rec.wait_rio_ready(timeout_s=0.0, min_sim_s=0.0))
+    rec.rio_meta[2].append((0.0, 10.1, 1))
+    rec._last_odom_sim = 12.0
+    check("14c True when every drone has a valid row and min_sim_s=0",
+          rec.wait_rio_ready(timeout_s=0.0, min_sim_s=0.0))
+    rec2 = _fresh_recorder(3)
+    for i in range(3):
+        rec2.rio_meta[i].append((0.0, 10.0, 1))
+    rec2._last_odom_sim = float("nan")
+    check("14d False while sim clock is unset even if RIO rows exist",
+          not rec2.wait_rio_ready(timeout_s=0.0, min_sim_s=2.0))
+    rec2._last_odom_sim = 5.0
+    check("14e False until min_sim_s of sim time has elapsed",
+          not rec2.wait_rio_ready(timeout_s=0.0, min_sim_s=2.0))
+    rec4 = _fresh_recorder(3)
+    for i in range(3):
+        rec4.rio_meta[i].append((0.0, 8.0, 1))
+    rec4._last_odom_sim = 10.0
+    calls = {"n": 0}
+
+    def _sim_flip():
+        calls["n"] += 1
+        return 10.0 if calls["n"] <= 1 else 12.5
+
+    rec4.sim_now = _sim_flip  # type: ignore[method-assign]
+    check("14f True once sim advances min_sim_s after wait starts",
+          rec4.wait_rio_ready(timeout_s=0.0, min_sim_s=2.0))
+    check("14g rio_valid_counts ignores valid==0",
+          rec.rio_valid_counts() == {0: 1, 1: 1, 2: 1}, str(rec.rio_valid_counts()))
+
+    # ------------------------------------------------------------------
+    # PAD-spawn interface (2026-09-14). Another agent adds a flat launch pad
+    # and spawns each drone directly at its layout position resting on it;
+    # derived configs then carry launch.spawned_at_layout/pad_top_z_m/
+    # hover_above_pad_m alongside positions_xyz_m = [x, y, pad_top_z+hover].
+    # ------------------------------------------------------------------
+    plan_pad = flight_steps(True, True)
+    check("15 pad plan: no reset_pose anywhere",
+          not any("reset_pose" in s for s in plan_pad), str(plan_pad))
+    check("15a pad plan: rio-ready wait happens BEFORE arm",
+          plan_pad.index("rio_ready_prearm_wait") < plan_pad.index("arm"), str(plan_pad))
+    check("15b pad plan: hover_settle happens AFTER takeoff, before the path",
+          plan_pad.index("takeoff") < plan_pad.index("hover_settle") < plan_pad.index("scripted_path"),
+          str(plan_pad))
+    check("15c pad plan: reset_estimator happens once, before arm",
+          plan_pad.count("reset_estimator_all") == 1
+          and plan_pad.index("reset_estimator_all") < plan_pad.index("arm"),
+          str(plan_pad))
+
+    plan_pad_norec = flight_steps(True, False)
+    check("15d pad plan with no recorder: fails closed instead of waiting",
+          "rio_ready_prearm_unavailable_fail" in plan_pad_norec
+          and "rio_ready_prearm_wait" not in plan_pad_norec,
+          str(plan_pad_norec))
+    check("15e pad plan with no recorder never arms",
+          "arm" not in plan_pad_norec, str(plan_pad_norec))
+
+    plan_nonpad = flight_steps(False, True)
+    check("15f non-pad plan: reset_pose (unpowered, then powered) still present",
+          plan_nonpad.count("reset_pose_unpowered_all") == 1
+          and plan_nonpad.count("reset_pose_powered_all") == 1, str(plan_nonpad))
+    check("15g non-pad plan: rio-ready wait happens AFTER takeoff (post-arm)",
+          plan_nonpad.index("takeoff") < plan_nonpad.index("rio_ready_postarm_wait")
+          < plan_nonpad.index("scripted_path"),
+          str(plan_nonpad))
+    check("15h non-pad plan: arm before takeoff before the powered re-teleport",
+          plan_nonpad.index("arm") < plan_nonpad.index("takeoff")
+          < plan_nonpad.index("reset_pose_powered_all"),
+          str(plan_nonpad))
+
+    plan_nonpad_norec = flight_steps(False, False)
+    check("15i non-pad plan with no recorder: no rio-ready wait step at all "
+          "(matches today's recorder-less behavior — nothing to check)",
+          "rio_ready_postarm_wait" not in plan_nonpad_norec, str(plan_nonpad_norec))
+    check("15j plans that reach the path all end mark_flight_start, "
+          "scripted_path, mark_flight_end",
+          all(p[-3:] == ["mark_flight_start", "scripted_path", "mark_flight_end"]
+              for p in (plan_pad, plan_nonpad, plan_nonpad_norec)))
+    check("15k pad plan with no recorder stops at the failed pre-arm check "
+          "(never reaches the path)",
+          plan_pad_norec[-1] == "rio_ready_prearm_unavailable_fail", str(plan_pad_norec))
+
+    # ---- airborne_cf_<i>: the 2026-09-14 hollow-pass tripwire ----
+    hover_z = 1.5
+    # Healthy hover: truth sits at hover_z the whole flight window.
+    t_air = list(np.linspace(10.0, 40.0, 300))
+    z_air = [hover_z] * len(t_air)
+    ok_c, det = airborne_check(t_air, z_air, 10.0, 40.0, hover_z)
+    check("16 airborne passes: truth at hover z for the whole window", ok_c, det)
+
+    # The actual 2026-09-11/09-14 symptom: cf_0 on the floor for the whole
+    # window (z=0.015 m) must FAIL, never pass because *something* published.
+    z_floor = [0.015] * len(t_air)
+    ok_c, det = airborne_check(t_air, z_floor, 10.0, 40.0, hover_z)
+    check("16a airborne FAILS: floor for the whole window (the hollow-pass symptom)",
+          not ok_c, det)
+
+    # No flight window marked at all (None/None) -> FAIL, not vacuous.
+    ok_c, det = airborne_check(t_air, z_air, None, None, hover_z)
+    check("16b airborne FAILS: no flight window marked", not ok_c, det)
+    ok_c, det = airborne_check(t_air, z_air, float("nan"), 40.0, hover_z)
+    check("16b2 airborne FAILS: non-finite window start", not ok_c, det)
+    ok_c, det = airborne_check(t_air, z_air, 40.0, 10.0, hover_z)
+    check("16b3 airborne FAILS: window end before start", not ok_c, det)
+
+    # No truth samples at all -> FAIL, not vacuous.
+    ok_c, det = airborne_check([], [], 10.0, 40.0, hover_z)
+    check("16c airborne FAILS: zero truth samples", not ok_c, det)
+
+    # Truth samples exist but none fall inside the marked window -> FAIL.
+    ok_c, det = airborne_check(t_air, z_air, 100.0, 130.0, hover_z)
+    check("16d airborne FAILS: no truth samples inside the flight window", not ok_c, det)
+
+    # Threshold boundary: exactly AIRBORNE_FRAC_MIN of samples airborne passes;
+    # just under it fails. 300 samples -> 240 = 0.80 exactly.
+    n_air = len(t_air)
+    n_up = int(round(AIRBORNE_FRAC_MIN * n_air))
+    z_boundary = [hover_z] * n_up + [0.0] * (n_air - n_up)
+    ok_c, det = airborne_check(t_air, z_boundary, 10.0, 40.0, hover_z)
+    check(f"16e airborne PASSES at exactly the {AIRBORNE_FRAC_MIN:g} boundary", ok_c, det)
+    z_below = [hover_z] * (n_up - 1) + [0.0] * (n_air - n_up + 1)
+    ok_c, det = airborne_check(t_air, z_below, 10.0, 40.0, hover_z)
+    check(f"16f airborne FAILS just under the {AIRBORNE_FRAC_MIN:g} boundary", not ok_c, det)
+
+    # Non-finite world_hover_z FAILS explicitly rather than crashing/misreading.
+    ok_c, det = airborne_check(t_air, z_air, 10.0, 40.0, float("nan"))
+    check("16g airborne FAILS: world_hover_z not finite", not ok_c, det)
+
+    # ---- interface parsing: resolve_launch (pure, no cflib/args needed) ----
+    ok_launch = resolve_launch({}, 0.5)
+    check("17 resolve_launch: no launch block -> unchanged CLI hover height",
+          ok_launch["spawn_xy"] is None and not ok_launch["spawned_at_layout"]
+          and ok_launch["mc_default_height"] == 0.5 and ok_launch["world_hover_z"] == 0.5,
+          str(ok_launch))
+
+    cfg_nonpad = {"launch": {"positions_xyz_m": [[0.0, 0.0, 0.8], [1.5, 0.0, 0.8]]}}
+    r_nonpad = resolve_launch(cfg_nonpad, 0.5)
+    check("17a resolve_launch: non-pad positions -> hover from positions[0][2], no pad keys",
+          not r_nonpad["spawned_at_layout"] and r_nonpad["pad_top_z"] is None
+          and r_nonpad["hover_above_pad"] is None
+          and r_nonpad["mc_default_height"] == 0.8 and r_nonpad["world_hover_z"] == 0.8
+          and r_nonpad["spawn_xy"] == [(0.0, 0.0), (1.5, 0.0)],
+          str(r_nonpad))
+
+    cfg_pad = {
+        "launch": {
+            "spawned_at_layout": True,
+            "pad_top_z_m": 0.05,
+            "hover_above_pad_m": 0.45,
+            "positions_xyz_m": [[0.0, 0.0, 0.5], [1.5, 0.0, 0.5]],
+        }
+    }
+    r_pad = resolve_launch(cfg_pad, 0.5)
+    check("17b resolve_launch: pad keys -> MotionCommander height = hover_above_pad",
+          r_pad["spawned_at_layout"] and r_pad["mc_default_height"] == 0.45, str(r_pad))
+    check("17c resolve_launch: pad keys -> world_hover_z = pad_top_z + hover_above_pad",
+          abs(r_pad["world_hover_z"] - 0.5) < 1e-12, str(r_pad))
+    check("17d resolve_launch: pad keys -> pad_top_z/hover_above_pad surfaced",
+          r_pad["pad_top_z"] == 0.05 and r_pad["hover_above_pad"] == 0.45, str(r_pad))
+    check("17e resolve_launch: pad spawn_xy still parsed from positions_xyz_m",
+          r_pad["spawn_xy"] == [(0.0, 0.0), (1.5, 0.0)], str(r_pad))
+
+    # ------------------------------------------------------------------
+    # sim_sleep helper for SIM-time waits with wall-clock guards (2026-09-14).
+    # When recorder is None, should use wall-clock sleep. When recorder has
+    # sim_now(), should poll and wait for sim time to advance.
+    # ------------------------------------------------------------------
+    class _FakeRecorder:
+        """Minimal recorder mock for sim_sleep testing."""
+        def __init__(self):
+            self.t = 0.0
+        def sim_now(self) -> float:
+            return self.t
+
+    # No recorder: sim_sleep falls back to wall-clock and returns True
+    check("19 sim_sleep with None recorder uses wall-clock sleep",
+          sim_sleep(None, 0.01) is True)
+
+    # Advance-on-demand recorder: sim_sleep polls and waits for sim advance
+    rec_adv = _FakeRecorder()
+    rec_adv.t = 10.0
+    def _advance_after_n_polls():
+        calls = [0]
+        orig_sim_now = rec_adv.sim_now
+        def patched():
+            calls[0] += 1
+            # Advance sim time after 3 polls
+            if calls[0] >= 3:
+                return 10.0 + 2.5  # 2.5 s sim advanced
+            return 10.0
+        return patched
+    rec_adv.sim_now = _advance_after_n_polls()
+    check("19a sim_sleep polls and returns True when sim advances",
+          sim_sleep(rec_adv, 2.0, wall_timeout_s=5.0) is True)
+
+    # Frozen clock: sim_sleep hits wall timeout and returns False
+    rec_frozen = _FakeRecorder()
+    rec_frozen.t = 10.0
+    rec_frozen.sim_now = lambda: 10.0  # Always returns same value
+    check("19b sim_sleep returns False on frozen sim (wall timeout)",
+          sim_sleep(rec_frozen, 2.0, wall_timeout_s=0.1) is False)
+
+    # Generous wall timeout: at least 60s or 20×duration
+    rec_gen = _FakeRecorder()
+    rec_gen.t = 0.0
+    calls = [0]
+    def patched_gen():
+        calls[0] += 1
+        if calls[0] > 150:  # ~3 seconds at 50 Hz, requires long wall timeout
+            return 15.0  # Advance after many polls
+        return 0.0
+    rec_gen.sim_now = patched_gen
+    check("19c sim_sleep uses generous wall timeout for short durations",
+          sim_sleep(rec_gen, 0.1, wall_timeout_s=1.0) is True)
+
+    # ---- rio_ready_prearm check wiring (pad-only; pure) ----
+    checks_a: Dict[str, bool] = {}
+    apply_rio_ready_prearm_check(checks_a, None)
+    check("20 rio_ready_prearm omitted entirely on non-pad runs (None)",
+          "rio_ready_prearm" not in checks_a, str(checks_a))
+    checks_b: Dict[str, bool] = {}
+    apply_rio_ready_prearm_check(checks_b, True)
+    check("20a rio_ready_prearm wired True on pad success",
+          checks_b.get("rio_ready_prearm") is True, str(checks_b))
+    checks_c: Dict[str, bool] = {}
+    apply_rio_ready_prearm_check(checks_c, False)
+    check("20b rio_ready_prearm wired False on pad failure (blocks the gate)",
+          checks_c.get("rio_ready_prearm") is False, str(checks_c))
+
     print(f"[selftest] {n_pass} passed, {n_fail} failed")
     print("[selftest] " + ("ALL PASS" if ok else "FAILED"))
     return 0 if ok else 1
@@ -1691,10 +2352,26 @@ def main():
         "--duration",
         type=float,
         default=None,
-        help="Flight/record seconds. Default 300, or the scenario's duration if --scenario is set.",
+        help="Flight duration in SIM seconds when Gazebo is running (lockstepped to RTF). "
+             "Default 300, or the scenario's duration if --scenario is set.",
     )
     parser.add_argument("--connect-wait", type=float, default=90.0)
     parser.add_argument("--connect-timeout", type=float, default=90.0)
+    parser.add_argument(
+        "--rio-ready-timeout",
+        type=float,
+        default=RIO_READY_TIMEOUT_S,
+        help="Wall seconds to hover after takeoff until every drone publishes "
+        "/rio/delta (Madgwick init is sim-time; 4 s wall was too short at RTF<1).",
+    )
+    parser.add_argument(
+        "--hover-settle-sim-s",
+        type=float,
+        default=HOVER_SETTLE_SIM_S_DEFAULT,
+        help="PAD runs only (launch.spawned_at_layout): SIM seconds to hover-settle "
+        "after takeoff, before the scripted path, in place of the powered "
+        "reset_pose re-teleport non-pad runs use.",
+    )
     parser.add_argument(
         "--no-fly",
         action="store_true",
@@ -1761,6 +2438,29 @@ def main():
     if not os.path.isabs(cfg_path):
         cfg_path = os.path.join(_REPO_ROOT, cfg_path)
     cfg = load_config(cfg_path)
+    att = (cfg.get("rio") or {}).get("attitude") or {}
+    args.rio_init_window_s = float(att.get("init_window_s", 2.0))
+    launch_info = resolve_launch(cfg, args.hover_height)
+    args.spawned_at_layout = launch_info["spawned_at_layout"]
+    args.pad_top_z = launch_info["pad_top_z"]
+    args.hover_above_pad = launch_info["hover_above_pad"]
+    args.hover_height = launch_info["mc_default_height"]
+    args.world_hover_z = launch_info["world_hover_z"]
+    if launch_info["spawn_xy"]:
+        args._spawn_xy = launch_info["spawn_xy"]
+        if args.spawned_at_layout:
+            print(
+                "[swarm_loc_gate] pad launch: spawned_at_layout=True "
+                f"pad_top_z={args.pad_top_z:.2f}m hover_above_pad={args.hover_above_pad:.2f}m "
+                f"world_hover_z={args.world_hover_z:.2f}m (n={len(launch_info['spawn_xy'])})",
+                flush=True,
+            )
+        else:
+            print(
+                f"[swarm_loc_gate] reset_pose from launch.positions_xyz_m "
+                f"(n={len(launch_info['spawn_xy'])} hover={args.hover_height:.2f} m)",
+                flush=True,
+            )
     target_hz = float(cfg["estimator"]["rate_hz"])
     n = int(args.num_drones)
 
@@ -1831,6 +2531,9 @@ def main():
         checks["flight"] = True
     else:
         checks["flight"] = (not flight_fail) and (not fly_fallback)
+    # PAD runs verify RIO readiness BEFORE arming (run_flight sets this
+    # attribute only on the pad path); non-pad runs omit the check entirely.
+    apply_rio_ready_prearm_check(checks, getattr(args, "_rio_ready_prearm", None))
 
     # ---- hollow-run tripwires: RIO / EKF liveness from the recorder ----
     duration_s = float(args.duration)  # WALL seconds — used only by rate/floor
@@ -1877,6 +2580,18 @@ def main():
             )
         checks[f"pairing_clock_cf_{i}"] = ok_c
         details[f"pairing_clock_cf_{i}"] = det
+        # 2026-09-14 hollow pass: cf_0 sat at z=0.015 m for the whole scored
+        # window and nothing checked altitude. Truth z vs the flight window.
+        tr = recorder.truth[i]
+        ok_c, det = airborne_check(
+            [t for t, _, _, _, _ in tr],
+            [z for _, _, _, z, _ in tr],
+            recorder.flight_sim_t0,
+            recorder.flight_sim_t1,
+            float(getattr(args, "world_hover_z", args.hover_height)),
+        )
+        checks[f"airborne_cf_{i}"] = ok_c
+        details[f"airborne_cf_{i}"] = det
 
     eval_dir = args.eval_dir.strip()
     report = None

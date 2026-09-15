@@ -1035,9 +1035,219 @@ Windows codepage when invoked from a Windows Python; this launch used WSL
 `python3` (UTF-8). `out/radar_maps/` is gitignored (generated). Leave
 `mlflow.db-journal` untracked.
 
-**Still open (research, not this pipeline):** spawn inside the tunnel + UWB
-`los_model: mesh`; whether to flip `imu_use_residual_as_noise` so
+**Still open (research, not this pipeline):** whether to flip `imu_use_residual_as_noise` so
 `imu_measurement_noise_std: 0.4877` is live; a noise-mismatch / 2× noise arm;
 repeated seeded runs and ablations (RIO-only, no entrance, minus mutual yaw,
 centralized reference); mutual yaw has never fired live; IMU-calibration
 provenance; radar Pd/SNR and the plugin ±20° elevation.
+
+## 2026-09-14 — Tunnel site: spawn inside lava_tube.obj, entrance moves with it, UWB mesh LOS
+
+The 1.267 / 0.773 / 0.195°/√s RIO floors stay **open-field-only** until
+`collinear_shuttle` is re-flown inside this cell. Do not treat a “swarm beats
+RIO-only” number with those floors as in-tunnel evidence.
+
+**Site.** `eval_scripts/find_tunnel_site.py` (trimesh/embreex) surveyed
+`lava_tube.obj` after the existing +90° roll. Accepted cell (rolled world):
+`(28.0, −64.66, 143.82)` m — inside the previous y ∈ [−164.7, −50.6] AABB,
+not the origin. Floor +0.5 m hover, ceiling 8.7 m, side walls 4.2 / 6.8 m,
+forward walls 16.6 / 24.1 m. Mesh pose in `phase0_tunnel_gate.sdf` is now
+`28.000 −64.662 −143.817  1.571  0  −3.142` (yaw −180° so **+x is down-tunnel**).
+The 200×200 m ground plane is **removed** (it was the only radar return).
+
+`configs/sim/tunnel_site.yaml` is the surveyed source of truth. The estimator
+never reads it (AGENTS.md §1).
+
+**Consumers (must stay in lockstep):**
+
+* `phase0_gate.sh` loads the site for `-x -y -z` unless overridden. Spawn z is
+  no longer hardcoded 0.5.
+* `swarm_loc_scenarios.py --write-config` writes `launch.positions_xyz_m` **and**
+  `entrance.position_xyz_m` / `yaw_deg` from the site.
+* `swarm_loc_gate.py` `reset_pose` uses those derived positions.
+* UWB: if no `--uwb-config`, phase0 writes `out/runtime_uwb.yaml` with the site
+  entrance peer and `los_model: mesh` pointing at the **world-frame** radar map
+  (`build_radar_map.py` output). `uwb_model.MeshLosError` on empty path, missing
+  file, or missing trimesh — no silent always-LOS. `requirements.txt` now lists
+  `trimesh` and `embreex`.
+
+Entrance UWB node (id 1000) stays at **(−2, 0, 0.30) m**, yaw 0, facing +x into
+the tube — 2 m behind the formation in the site frame. The visual
+`tunnel_entrance` portal mesh (15.57 × 3.67 × 6.92 m at scale 0.01) is still
+not in this world; it is optional decoration.
+
+**Not used:** Fuel-only `indian_tunnel`, `niosh_osrf`, `tunnel_simple03`.
+
+**Still to fly:** hover/translate in the cell (wall+floor returns, at least one
+NLOS UWB pair), then recalibrate RIO on in-tunnel `collinear_shuttle` and write
+`out/rio_cov_calibration/triangle_forward_check.json` on the held-out `--check`.
+
+## 2026-09-14 — cf_0 never finished Madgwick init (4 s wall settle < 2 s sim)
+
+**Why.** `run_flight` slept 4 s of wall after MotionCommander takeoff, then
+started the scripted path. Madgwick needs `init_window_s = 2.0` of **sim**
+stillness. At RTF ≈ 0.3 that settle is ~1.2 s sim, so the window never
+completed before translation. Live `tunnel/triangle_forward` in the lava_tube
+cell: cf_1/cf_2 published `/rio/delta` (~9.3 Hz) after a lucky still stretch;
+cf_0 stayed on `attitude initializing` (337 restarts), empty meas log, EKF
+stamps frozen at 0. Gate FAIL `rio_alive_cf_0` / `logs_intact` / `uwb_consumed`.
+
+**What.** After takeoff the gate **hovers until every drone has a valid
+`/rio/delta` row** and at least `init_window_s` of sim time has elapsed
+(`EstimateRecorder.wait_rio_ready`, wall timeout 90 s). The scored flight
+window still starts at the scripted path. Selftests 14–14g.
+
+**Not changed:** Madgwick thresholds. The drones have to actually sit still;
+they just get enough sim time to do it before the path starts.
+
+The first live retry after that wait still left **cf_0 on the floor**
+(`z≈0.016` m for the whole 90 s hover, `/rio/delta` never published). cf_1/cf_2
+initialized (restarts 20 / 17). After landing, cf_0's Madgwick finally
+reported `roll=-176.82 deg` — inverted. `reset_pose` only sent XYZ, so the
+tumble from sitting on lava_tube was preserved through the teleport. Fix:
+`pid_gains.pose_request` always includes a yaw-only quaternion (identity tilt)
+and `run_flight` teleports twice 0.5 s apart so residual twist cannot re-flip
+them before arming.
+
+The 2 s `time.sleep` after that teleport was also wrong: unpowered free-fall
+hits the lava in ~0.3 s (AGENTS.md). Live truth: cf_0 `p_z = 0.015` m for the
+whole scored window. `run_flight` now arms and enters MotionCommander ~0.25 s
+after the second teleport so the PID catches them still in the air.
+
+## 2026-09-14 (later) — Launch pad, airborne tripwire, and every prior live metric was hollow
+
+**Pad.** `configs/sim/tunnel_site.yaml` gains a surveyed `launch_pad` (4.0 × 1.9 m
+static box, top z = 0.010 m, floor flat to ~1e-6). Drones spawn at their
+layout positions resting on it (`--spawn-positions`, z = pad top + 0.020). Truth
+on the pad: z = 0.0250 m, zero jitter / tilt / velocity. Madgwick initializes
+on all three first try (restarts 0, tilt_rejects 0). No teleport at all on a pad
+run. Gate plan: `reset_estimator_all → rio_ready_prearm_wait → arm → takeoff →
+hover_settle (3 s sim) → scripted path`. `attitude_filter.init_max_tilt_deg = 30`
+rejects an init window taken while tumbled.
+
+**Airborne tripwire.** `airborne_cf_i`: ≥ 80 % of truth samples in the flight
+window must be above `world_hover_z − 0.25 m`. Re-scoring the committed runs
+with it: 3643218 airborne 0.06/0.16/0.05; c8567b8 `triangle_forward`
+0.00/0.00/0.08; c8567b8 open-field calibration 0.06/0.28/0.18. **The drones were
+on the ground.** Every committed live metric and the `rio_bridge` covariance
+refit (`SIGMA_VZ_MPS`, `SIGMA_V_XY_FLOOR_MPS`, `SIGMA_DPSI`) came from grounded
+data and must be redone from flights that pass `airborne_cf_i`.
+
+## 2026-09-14 (later) — "cflib parallel open timed out" was a wedged SITL firmware (fixed)
+
+**Symptom.** Intermittent cflib timeouts, including a single sequential link.
+The UDP relay answered the plugin null ping (0xFF) on all ports. Only some
+firmwares answered CRTP link echo (0xF0). Wedged `cf2`: one thread at 100 % CPU,
+~24 context switches/s (healthy: ~5 200/s), empty `out.log`.
+
+**Cause.** `socketlinkTask` did `ASSERT(xQueueSend(crtpPacketDelivery, &p, 0) == pdPASS)`.
+The plugin floods IMU/baro/odom through that socket. Under CPU load the 2000-slot
+queue fills, and SITL `vAssertCalled` does `printf; while(1);`. stdout redirected
+to a file is block-buffered, so the message never appeared.
+
+**Fix.** `socketlink.c`: drop-on-full with a rate-limited counter
+(`rx queue full, dropped N packets total`). `main_sitl.c`: line-buffered stdout,
+unbuffered stderr, `abort()` on assert. `phase0_gate.sh`: per-port CRTP
+link-echo liveness check after SITL settle, which warns `FIRMWARE NOT ANSWERING`.
+Live: all three links answer, the gate connects first try, fw0 logged one
+dropped packet (previously a permanent wedge).
+
+The earlier theory that a pre-gate cflib probe breaks arming (CRTP v7 re-arm
+quirk) was wrong: probe + gate connects and arms.
+
+## 2026-09-14 (later) — OPEN: drones climb away and crash (wall-clock firmware vs RTF ≈ 0.3)
+
+Connection and pre-arm now pass. Flight does not: `airborne_cf_i` 0.15/0.54/0.42.
+Every drone climbs past the 0.5 m target to 2–4 m over ~5 s, then drops or
+tumbles (`SUP: Locked, reboot required` / `Landing timeout, disarming`),
+sometimes twice per run.
+
+CrazySim has **no lockstep**. FreeRTOS POSIX ticks on the wall clock and the
+plugin stamps with `steady_clock`. The firmware runs at 70–92 % of nominal
+(`stabilizer loop rate is off (706–918)`, Kalman 85–90 Hz), but physics RTF during
+flight is ~0.3. Relative to sim time the controller runs ~3× fast, so
+integrators and the estimator see the wrong dt.
+
+A/B results so far (tunnel/collinear_shuttle, 3 drones, headless):
+- `--no-tof --no-flow`: flight RTF median 0.29–0.34. No change.
+- Collision mesh cropped 888 585 → 18 479 triangles, visual/shadows off: RTF
+  median 0.32, airborne 0.54/0.55/0.49. No material change, so the tunnel
+  mesh is not the bottleneck. (A cropped OBJ needs vertex normals; DART's ODE
+  mesh loader segfaults without them.)
+- gz thread snapshot: three threads pinned at ~100 %, one per drone. These are
+  the CrazySim plugin relay threads (`sendCfFirmwareThread` polls
+  `try_dequeue_bulk` with no wait). The sim-loop thread sits at ~40 %.
+
+- Plugin busy-spins removed (`crazysim_plugin.cpp`, nested submodule
+  `crazyflie-firmware/tools/crazyflie-simulation`: sleep 200 µs only when a pass
+  dequeues nothing, 1 ms before the handshake, timed wait on the cflib queue)
+  **plus** the ogre2 Sensors system dropped from the light world: the pinned
+  threads are gone (system 32 % idle, load 18.5 → 12.5), but flight RTF median
+  is still 0.34 and airborne 0.69/0.48/0.52 with the same SUP crashes. The gz
+  sim-loop thread sits at ~53 %: gz is **blocking on something**, not
+  CPU-starved.
+
+- /proc sampling mid-flight (5 s): busiest gz thread 63 % CPU, ~990 voluntary
+  + ~455 involuntary context switches/s at RTF 0.27–0.37 (~300–370 steps/s):
+  it blocks ~3× per step (pacing sleep / worker-thread barriers), not pure
+  compute. Airborne 0.28/0.56/0.58.
+
+- Unpaced world (`real_time_update_rate 0`): RTF median 0.35, airborne
+  0.29/0.34/0.53. **Pacing is not the limiter.** Each step genuinely costs ~3 ms
+  (compute + system-thread handoffs) with 3 drones.
+
+- Single-drone `hover_gate.py` in `phase1_pid_tune` (firmware + physics, IMU
+  noise ON, no radar/UWB/swarm-loc): **RTF median 1.00 (min 0.90), M2 hover
+  PASS** — mean |Zerr| 1.35 cm, horizontal RMS 4.6 cm. Gains, firmware and IMU
+  noise are fine at RTF ≈ 1. The 3-drone swarm stack dropping RTF to ~0.35 is
+  what breaks flight.
+
+- Idle RTF with firmware + physics only (`phase1_pid_tune`, no radar/UWB/swarm-loc):
+  N=1 **1.00**, N=2 **0.81**, N=3 **0.60**, with CPU ~75 % idle each time. The
+  slowdown is per drone and not compute. Suspect: CrazySim plugin gz-transport
+  traffic — `PreUpdate → writeMotors()` publishes an Actuators msg every step
+  (1 kHz/drone, even unchanged) on top of the 1 kHz IMU subscription.
+
+- Motor publish-on-change (+50 ms keepalive) in `crazysim_plugin.cpp`: N=3 idle RTF
+  **0.60**, no change. Expected in hindsight: `power_distribution_sitl.c`
+  sends a motor packet every 1 ms tick regardless of value, so "dirty" is set
+  more often than physics steps. Kept, since it's harmless.
+
+**Conclusion.** Swarm RTF is capped by CrazySim's per-drone gz-side cost, not by
+our stack or CPU. With the firmware on wall-clock time, 3-drone flights are
+invalid as-is. The FreeRTOS tick is set only by `setitimer(portTICK_RATE_MICROSECONDS)`
+in `port.c` (`configTICK_RATE_HZ` must stay 1000), so a fixed time-dilation
+(firmware tick = k ms wall with gz pinned to RTF 1/k) is a small, contained
+option. A true lockstep and fewer drones are the alternatives. Decision pending. If RTF stays well below 1,
+the options are a lockstep bridge, fewer drones per run, or accepting RTF and
+retuning. Until `airborne_cf_i` passes, no live metric is reportable.
+
+## 2026-09-14 (later) — lockstep wired (firmware tick = Gazebo sim time)
+
+The lockstep bridge was already in tree and unused. Plugin
+(`crazysim_plugin.cpp`): `CRAZYSIM_LOCKSTEP=1` sends a little-endian `uint32`
+N = 1 ms sim ticks on UDP `cffirm_port+1000`. Firmware (`port.c`):
+`CF2_LOCKSTEP_PORT` skips `setitimer` and raises `SIGALRM` once per received
+tick. Neither env var was set, so 3-drone runs still ticked on the wall clock.
+
+**Wiring (`phase0_gate.sh`):** default `CRAZYSIM_LOCKSTEP=1` on the `gz sim`
+process; each `cf2` gets `CF2_LOCKSTEP_PORT=$((19950+id+1000))` (20950–20952).
+SITL starts right after spawn so the bind is up before many physics steps
+drop. Hitch catch-up in the plugin is capped (skip the gap, resume 1-for-1)
+so a pause cannot dump hundreds of controller ticks in one physics step.
+`swarm_loc_gate.py` wall `SIGALRM` is `max(20×duration, duration+timeouts)` so
+45 s sim at RTF ~0.3 is not killed at 255 s wall. Override: `CRAZYSIM_LOCKSTEP=0`.
+
+Live `tunnel/triangle_forward` (pad spawn, regenerated derived yaml, lockstep on):
+**`[swarm_loc_gate] PASS`**. Madgwick/RIO ready on the pad first try
+(`rio_valid` 25/27/26 at 2.0 s sim, z≈0.025 m rest). Scripted path 45 s sim,
+flight window 91.4 s. Truth z in the window: median **0.50 m** (p95 0.56–0.59 m,
+max 0.78–1.03 m) — no 2–4 m climb-away. `airborne_cf_0/1/2` PASS,
+`rio_alive_cf_*` 9.4–9.5 sim-Hz valid_frac=1.0. ATE RMSE 0.13 / 0.13 / 0.17 m,
+yaw RMSE 0.7 / 4.1 / 2.8 deg. Firmware `error.log` empty (no `SUP: Locked`).
+A first attempt without regenerating the stale derived yaml had `rio_bridge`
+refuse (`missing init_max_tilt_deg`) so RIO never came up; hover was already
+stable at 0.50 m for 90 s wall, which is how we knew lockstep was doing its
+job before the pad re-fly. `out/_start_phase0.py` now uses `phase0_cmd()`
+(`--spawn-positions` on the pad) and rewrites `swarm_loc_derived.yaml` from
+`configs/estimation/swarm_loc.yaml`.

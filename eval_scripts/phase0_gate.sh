@@ -16,10 +16,20 @@
 #                        absolute path to any .sdf file.
 #                        Built-in: phase0_tunnel_gate (default), crazysim_default
 #   -m, --model  MODEL   crazyflie | crazyflie_thrust_upgrade  (default: crazyflie)
-#   -x X                 Spawn X position in metres (default: 0)
-#   -y Y                 Spawn Y position in metres (default: 0)
+#   -x X                 Spawn X position in metres (default: site or 0)
+#   -y Y                 Spawn Y position in metres (default: site or 0)
+#   -z Z                 Spawn Z position in metres (default: site or 0.5)
 #   -n, --num-drones N    Number of Crazyflie drones to spawn (default: 1)
 #       --spacing M      Metres between drone spawn points on X axis (default: 1.5)
+#       --spawn-positions "x,y,z;x,y,z;..."
+#                        Explicit per-drone spawn poses (one x,y,z entry per
+#                        drone, world frame), used verbatim instead of the
+#                        SPAWN_X + i*SPACING line. Entry count must equal -n.
+#                        Spawned with identity tilt and the tunnel site's yaw
+#                        (configs/sim/tunnel_site.yaml spawn.yaw_deg) when the
+#                        site file is present. Used for tunnel launch-pad rest
+#                        poses (eval_scripts/swarm_loc_scenarios.py) so drones
+#                        sit on the pad instead of dropping onto bumpy rock.
 #       --mesh PATH      Mesh file for radar raycasting.
 #                        Relative paths are resolved against $SAR_NANO_SWARM_ROOT.
 #                        Defaults are auto-detected for built-in worlds; for custom
@@ -61,6 +71,11 @@
 #                      Default: <repo>/firmware_mods/CrazySim/crazyflie-firmware/sitl_make/build/cf2
 #   RADAR_PLUGIN_DIR   Dir containing libradar_sensor_system.so.
 #                      Default: <repo>/install/radarays_gz2/lib
+#   CRAZYSIM_LOCKSTEP  1 (default) = Gazebo drives each cf2 1 kHz tick from
+#                      sim time (plugin UDP port = firmware port + 1000).
+#                      Required when 3-drone physics runs below RTF 1; without
+#                      it the controller ticks on the wall clock and climbs.
+#                      Set 0 to restore wall-clock FreeRTOS ticks.
 #
 # cfclient connection URI printed at startup:
 #   udp://127.0.0.1:19850+N   (drone ID N)
@@ -80,10 +95,13 @@ Usage: ./eval_scripts/phase0_gate.sh [OPTIONS]
   -w, --world  WORLD   World name (no .sdf) or absolute .sdf path
                        [default: phase0_tunnel_gate]
   -m, --model  MODEL   crazyflie | crazyflie_thrust_upgrade  [default: crazyflie]
-  -x X                 Spawn X  [default: 0]
-  -y Y                 Spawn Y  [default: 0]
+  -x X                 Spawn X  [default: tunnel_site or 0]
+  -y Y                 Spawn Y  [default: tunnel_site or 0]
+  -z Z                 Spawn Z  [default: tunnel_site or 0.5]
   -n, --num-drones N    Number of drones  [default: 1]
       --spacing M      Spawn spacing on X axis (m)  [default: 1.5]
+      --spawn-positions "x,y,z;x,y,z;..."  Explicit per-drone spawn poses
+                       (world frame, one entry per drone; count must equal -n)
       --mesh PATH      Mesh for radar raycasting (rel to SAR_NANO_SWARM_ROOT)
       --no-radar       Skip radar plugin
       --no-radar-noise Skip radar noise layer (ideal cloud on /cf_<i>/radar/points)
@@ -113,8 +131,13 @@ WORLD="phase0_tunnel_gate"
 MODEL="crazyflie"
 SPAWN_X=0
 SPAWN_Y=0
+SPAWN_Z=0.5
+SPAWN_X_CLI=0
+SPAWN_Y_CLI=0
+SPAWN_Z_CLI=0
 NUM_DRONES=1
 SPACING=1.5
+SPAWN_POSITIONS=""
 MESH_ARG=""
 USE_RADAR=true
 USE_RADAR_NOISE=true
@@ -140,10 +163,12 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -w|--world)   WORLD="$2";       shift 2 ;;
     -m|--model)   MODEL="$2";       shift 2 ;;
-    -x)           SPAWN_X="$2";     shift 2 ;;
-    -y)           SPAWN_Y="$2";     shift 2 ;;
+    -x)           SPAWN_X="$2"; SPAWN_X_CLI=1; shift 2 ;;
+    -y)           SPAWN_Y="$2"; SPAWN_Y_CLI=1; shift 2 ;;
+    -z)           SPAWN_Z="$2"; SPAWN_Z_CLI=1; shift 2 ;;
     -n|--num-drones) NUM_DRONES="$2"; shift 2 ;;
     --spacing)    SPACING="$2";    shift 2 ;;
+    --spawn-positions) SPAWN_POSITIONS="$2"; shift 2 ;;
     --mesh)       MESH_ARG="$2";    shift 2 ;;
     --no-radar)   USE_RADAR=false;  shift   ;;
     --no-radar-noise) USE_RADAR_NOISE=false; shift ;;
@@ -169,12 +194,65 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# ── validate --spawn-positions ────────────────────────────────────────────────
+SPAWN_POS_ARR=()
+if [[ -n "$SPAWN_POSITIONS" ]]; then
+  IFS=';' read -ra SPAWN_POS_ARR <<< "$SPAWN_POSITIONS"
+  [[ "${#SPAWN_POS_ARR[@]}" -eq "$NUM_DRONES" ]] || die \
+    "--spawn-positions has ${#SPAWN_POS_ARR[@]} entries but -n/--num-drones is $NUM_DRONES"
+fi
+
 # ── locate repo root ──────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Allow override via env (useful when running from a different working dir)
 export SAR_NANO_SWARM_ROOT="${SAR_NANO_SWARM_ROOT:-$REPO_ROOT}"
+
+# Tunnel site: spawn + (later) derived UWB entrance/mesh LOS. CLI -x/-y/-z win.
+_SITE_YAML="$SAR_NANO_SWARM_ROOT/configs/sim/tunnel_site.yaml"
+_SITE_WORLD=""
+if [[ -f "$_SITE_YAML" ]]; then
+  _SITE_WORLD="$(python3 -c "import yaml; print(yaml.safe_load(open('$_SITE_YAML')).get('world',''))" 2>/dev/null || true)"
+fi
+if [[ -f "$_SITE_YAML" && "$WORLD" == "phase0_tunnel_gate" && "$_SITE_WORLD" == "phase0_tunnel_gate" ]]; then
+  _site_xyz="$(python3 -c "
+import sys
+sys.path.insert(0, '$SAR_NANO_SWARM_ROOT/eval_scripts')
+from tunnel_site import load_site, hover_height
+s = load_site('$_SITE_YAML')
+x,y,z = s['spawn']['xyz_m']
+print(float(x), float(y), float(hover_height(s)))
+")"
+  read -r _SX _SY _SZ <<< "$_site_xyz"
+  [[ "$SPAWN_X_CLI" != 1 ]] && SPAWN_X="$_SX"
+  [[ "$SPAWN_Y_CLI" != 1 ]] && SPAWN_Y="$_SY"
+  [[ "$SPAWN_Z_CLI" != 1 ]] && SPAWN_Z="$_SZ"
+  info "tunnel_site spawn (${SPAWN_X}, ${SPAWN_Y}, ${SPAWN_Z}) from $_SITE_YAML"
+fi
+
+# --spawn-positions: identity tilt + the site's yaw (a real Crazyflie
+# calibrates its gyro sitting still and level; the launch pad places drones
+# resting at their scenario layout instead of dropping them from a hover).
+_SITE_YAW_DEG=0
+_SPAWN_ORIENT_REQ=""
+if [[ -n "$SPAWN_POSITIONS" ]]; then
+  if [[ -f "$_SITE_YAML" ]]; then
+    _SITE_YAW_DEG="$(python3 -c "
+import sys
+sys.path.insert(0, '$SAR_NANO_SWARM_ROOT/eval_scripts')
+from tunnel_site import load_site, spawn_yaw_deg
+print(spawn_yaw_deg(load_site('$_SITE_YAML')))
+")"
+  fi
+  read -r _SPAWN_QZ _SPAWN_QW <<< "$(python3 -c "
+import math
+yaw = math.radians(${_SITE_YAW_DEG})
+print(math.sin(yaw / 2.0), math.cos(yaw / 2.0))
+")"
+  _SPAWN_ORIENT_REQ=", orientation: {z: ${_SPAWN_QZ}, w: ${_SPAWN_QW}}"
+  info "spawn-positions: ${#SPAWN_POS_ARR[@]} explicit poses, yaw ${_SITE_YAW_DEG} deg from $_SITE_YAML"
+fi
 
 # ── source environment ────────────────────────────────────────────────────────
 info "Sourcing setup_env.sh …"
@@ -278,10 +356,21 @@ if [[ "$USE_RADAR" == true ]]; then
   MESH_PATH="$MESH_ARG"
 
   if [[ -z "$MESH_PATH" ]]; then
-    _map_region=$(python3 -c "
-x0 = float('${SPAWN_X}'); x1 = x0 + (int('${NUM_DRONES}') - 1) * float('${SPACING}')
-y = float('${SPAWN_Y}'); m = float('${RADAR_FLIGHT_MARGIN_M}')
-print(min(x0, x1) - m, max(x0, x1) + m, y - m, y + m, 0.0, float('${RADAR_FLIGHT_ZMAX_M}'))")
+    _map_region=$(SPAWN_POSITIONS="$SPAWN_POSITIONS" python3 -c "
+import os
+m = float('${RADAR_FLIGHT_MARGIN_M}')
+sp = os.environ.get('SPAWN_POSITIONS', '')
+if sp:
+    xs = []; ys = []
+    for entry in sp.split(';'):
+        x, y, z = [float(v) for v in entry.split(',')]
+        xs.append(x); ys.append(y)
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+else:
+    x0 = float('${SPAWN_X}'); x1 = x0 + (int('${NUM_DRONES}') - 1) * float('${SPACING}')
+    y0 = y1 = float('${SPAWN_Y}')
+print(x0 - m, x1 + m, y0 - m, y1 + m, 0.0, float('${RADAR_FLIGHT_ZMAX_M}'))")
     _map_args=("$WORLD_SDF" --region $_map_region
                --cache-dir "$SAR_NANO_SWARM_ROOT/out/radar_maps")
     if [[ "$USE_RADAR_NOISE" != true ]]; then
@@ -378,7 +467,11 @@ pkill -f "rio_bridge.py" 2>/dev/null || true
 sleep 1
 
 # ── start Gazebo server ───────────────────────────────────────────────────────
-info "Starting Gazebo server (world: $WORLD_NAME) …"
+# Plugin reads CRAZYSIM_LOCKSTEP at Configure; gz must see it. Each cf2 gets
+# CF2_LOCKSTEP_PORT=$((cffirm + 1000)) so ticks follow sim dt, not wall time.
+: "${CRAZYSIM_LOCKSTEP:=1}"
+export CRAZYSIM_LOCKSTEP
+info "Starting Gazebo server (world: $WORLD_NAME, CRAZYSIM_LOCKSTEP=${CRAZYSIM_LOCKSTEP}) …"
 gz sim -s -r "$WORLD_SDF" -v 3 &
 _PIDS+=($!)
 GZ_SERVER_PID=${_PIDS[-1]}
@@ -402,7 +495,13 @@ for CF_ID in $(seq 0 $((NUM_DRONES - 1))); do
   CFFIRM_PORT=$((19950 + CF_ID))
   CFLIB_PORTS+=("$CFLIB_PORT")
   SDF_TMP="/tmp/${MODEL}_${CF_ID}.sdf"
-  SPAWN_XI=$(python3 -c "print(${SPAWN_X} + ${CF_ID} * ${SPACING})")
+  if [[ -n "$SPAWN_POSITIONS" ]]; then
+    IFS=',' read -r SPAWN_XI SPAWN_YI SPAWN_ZI <<< "${SPAWN_POS_ARR[$CF_ID]}"
+  else
+    SPAWN_XI=$(python3 -c "print(${SPAWN_X} + ${CF_ID} * ${SPACING})")
+    SPAWN_YI="$SPAWN_Y"
+    SPAWN_ZI="$SPAWN_Z"
+  fi
 
   rm -f "$SDF_TMP"
   mkdir -p "$BUILD_DIR/$CF_ID"
@@ -486,16 +585,32 @@ PYEOF
     fi
   fi
 
-  info "Spawning ${MODEL}_${CF_ID} at (${SPAWN_XI}, ${SPAWN_Y}) …"
+  info "Spawning ${MODEL}_${CF_ID} at (${SPAWN_XI}, ${SPAWN_YI}, ${SPAWN_ZI}) …"
   gz service \
     -s "/world/${WORLD_NAME}/create" \
     --reqtype  gz.msgs.EntityFactory \
     --reptype  gz.msgs.Boolean \
     --timeout  5000 \
     --req "sdf_filename: \"${SDF_TMP}\",
-           pose: {position: {x: ${SPAWN_XI}, y: ${SPAWN_Y}, z: 0.5}},
+           pose: {position: {x: ${SPAWN_XI}, y: ${SPAWN_YI}, z: ${SPAWN_ZI}}${_SPAWN_ORIENT_REQ}},
            name: \"${MODEL}_${CF_ID}\",
            allow_renaming: 1"
+
+  # Start SITL immediately after spawn so the lockstep UDP bind is up before
+  # many physics steps elapse. Plugin sends to cffirm_port+1000; firmware
+  # binds that port when CF2_LOCKSTEP_PORT is set.
+  export CF2_SIM_MODEL="gz_${MODEL}"
+  pushd "$BUILD_DIR/$CF_ID" > /dev/null
+  if [[ "$CRAZYSIM_LOCKSTEP" == "1" ]]; then
+    _ls_port=$((CFFIRM_PORT + 1000))
+    info "Starting SITL firmware (instance ${CF_ID}, lockstep udp ${_ls_port}) …"
+    env CF2_LOCKSTEP_PORT="${_ls_port}" "$CF2_BIN" "$CFFIRM_PORT" > out.log 2> error.log &
+  else
+    info "Starting SITL firmware (instance ${CF_ID}) …"
+    env -u CF2_LOCKSTEP_PORT "$CF2_BIN" "$CFFIRM_PORT" > out.log 2> error.log &
+  fi
+  _PIDS+=($!)
+  popd > /dev/null
 
   info "Waiting for drone ${CF_ID} sensors (/cf_${CF_ID}/odom) to come online …"
   _drone_ready=false
@@ -510,16 +625,8 @@ PYEOF
     info "Drone ${CF_ID} sensors publishing. Giving them 2s to stabilise …"
     sleep 2
   else
-    warn "Drone ${CF_ID} gz odom not detected after ~20s — firmware starts; ROS wait is later."
+    warn "Drone ${CF_ID} gz odom not detected after ~20s — ROS wait is later."
   fi
-
-  export CF2_SIM_MODEL="gz_${MODEL}"
-
-  info "Starting SITL firmware (instance ${CF_ID}) …"
-  pushd "$BUILD_DIR/$CF_ID" > /dev/null
-  "$CF2_BIN" "$CFFIRM_PORT" > out.log 2> error.log &
-  _PIDS+=($!)
-  popd > /dev/null
 done
 
 # ── wait for cflib UDP ports + firmware settle (uwb_gate / cflib connect) ─────
@@ -537,8 +644,50 @@ for _port in "${CFLIB_PORTS[@]}"; do
 done
 _cf2_n="$(pgrep -x cf2 2>/dev/null | wc -l | tr -d ' ')"
 [[ "${_cf2_n:-0}" -ge "$NUM_DRONES" ]] || warn "Only ${_cf2_n:-0}/${NUM_DRONES} cf2 process(es) — check sitl_make/build/*/error.log"
+if [[ "$CRAZYSIM_LOCKSTEP" == "1" ]]; then
+  for CF_ID in $(seq 0 $((NUM_DRONES - 1))); do
+    if grep -q "LOCKSTEP: firmware ticks" "$BUILD_DIR/$CF_ID/out.log" 2>/dev/null; then
+      info "cf2 ${CF_ID} lockstep bound"
+    else
+      warn "cf2 ${CF_ID} did not log lockstep bind — check $BUILD_DIR/$CF_ID/out.log (wall-clock ticks?)"
+    fi
+  done
+fi
 info "SITL settle (3 s for CfFirm handshake) …"
 sleep 3
+
+# ── firmware liveness check: CRTP link-echo per port ─────────────────────────
+for _port in "${CFLIB_PORTS[@]}"; do
+  if python3 - "$_port" <<'PYEOF'
+import sys, socket
+
+port = int(sys.argv[1])
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(0.5)
+echo_packet = b"\xf0\x01\x02\x03"
+found_reply = False
+
+for attempt in range(20):
+  try:
+    sock.sendto(echo_packet, ('127.0.0.1', port))
+    reply, _ = sock.recvfrom(64)
+    if reply and reply[0] == 0xf0 and reply != b"\xff":
+      found_reply = True
+      break
+  except socket.timeout:
+    pass
+  except Exception:
+    pass
+sock.close()
+sys.exit(0 if found_reply else 1)
+PYEOF
+  then
+    info "Firmware on port ${_port} answers CRTP link echo."
+  else
+    _cf_id=$(((_port - 19850)))
+    warn "FIRMWARE NOT ANSWERING on cflib port ${_port} (wedged or dead cf2) — check $BUILD_DIR/${_cf_id}/out.log; cflib connect will time out."
+  fi
+done
 
 # ── bridge gz topics to ROS 2 ────────────────────────────────────────────────
 if [[ "$USE_TOF" == true || "$USE_FLOW" == true || "$USE_UWB" == true || "$USE_SWARM_LOC" == true ]] && command -v ros2 &>/dev/null && ros2 pkg prefix ros_gz_bridge &>/dev/null; then
@@ -597,6 +746,19 @@ fi
 if [[ "$USE_UWB" == true ]]; then
   _uwb_cfg="${UWB_CONFIG:-$SAR_NANO_SWARM_ROOT/configs/sensors/uwb_pdoa.yaml}"
   [[ "$_uwb_cfg" != /* ]] && _uwb_cfg="$SAR_NANO_SWARM_ROOT/$_uwb_cfg"
+  # Tunnel site: pin the entrance peer and point mesh LOS at the world-frame
+  # radar map. Skip if the caller passed --uwb-config (they own the file).
+  if [[ -z "$UWB_CONFIG" && -f "$_SITE_YAML" && "$WORLD" == "phase0_tunnel_gate" && "$USE_RADAR" == true && -n "${MESH_PATH:-}" ]]; then
+    _uwb_derived="$SAR_NANO_SWARM_ROOT/out/runtime_uwb.yaml"
+    if python3 "$SAR_NANO_SWARM_ROOT/eval_scripts/tunnel_site.py" \
+        --site "$_SITE_YAML" --derive-uwb --base "$_uwb_cfg" \
+        --mesh-path "$MESH_PATH" --out "$_uwb_derived"; then
+      _uwb_cfg="$_uwb_derived"
+      info "derived UWB config (mesh LOS + site entrance) → $_uwb_cfg"
+    else
+      die "failed to derive UWB config with mesh LOS — refusing silent always-LOS"
+    fi
+  fi
   if [[ ! -f "$_uwb_cfg" ]]; then
     warn "UWB config not found: $_uwb_cfg — skipping UWB node."
   elif ! command -v ros2 &>/dev/null; then

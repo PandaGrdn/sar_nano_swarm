@@ -11,6 +11,7 @@ import argparse
 import math
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -135,37 +136,48 @@ def los_check_boxes(p_a: np.ndarray, p_b: np.ndarray, boxes: List[dict]) -> bool
 _mesh_cache: dict = {}
 
 
+class MeshLosError(RuntimeError):
+    """los_model: mesh cannot be honoured. Never fall back to always-LOS."""
+
+
+def prepare_mesh_los(cfg: dict) -> None:
+    """Load and cache the Embree intersector. Raises MeshLosError — no silent LOS."""
+    los_check_mesh(np.zeros(3), np.array([1.0, 0.0, 0.0]), cfg)
+
+
 def los_check_mesh(p_a: np.ndarray, p_b: np.ndarray, cfg: dict, logger=None) -> bool:
     mesh_path = cfg.get("mesh_path", "")
     root = cfg.get("_swarm_root", "")
     if not mesh_path:
-        return True
+        raise MeshLosError("los_model: mesh but mesh_path is empty")
     key = (mesh_path, root)
     if key not in _mesh_cache:
         try:
             import trimesh
             from trimesh.ray.ray_pyembree import RayMeshIntersector
-        except ImportError:
-            if logger:
-                logger("WARNING: trimesh/embreex unavailable — falling back to always_los")
-            _mesh_cache[key] = None
-            return True
+        except ImportError as exc:
+            raise MeshLosError(
+                "los_model: mesh requires trimesh and embreex (pip install trimesh embreex)"
+            ) from exc
         import os
 
         full = mesh_path if os.path.isabs(mesh_path) else os.path.join(root, mesh_path)
+        if not os.path.isfile(full):
+            raise MeshLosError(f"los_model: mesh file not found: {full}")
         try:
             mesh = trimesh.load(full, force="mesh")
             intersector = RayMeshIntersector(mesh)
             _mesh_cache[key] = intersector
+        except MeshLosError:
+            raise
         except Exception as exc:
-            if logger:
-                logger(f"WARNING: mesh load failed ({full}): {exc} — falling back to always_los")
-            _mesh_cache[key] = None
-            return True
+            raise MeshLosError(f"los_model: mesh load failed ({full}): {exc}") from exc
+        if logger:
+            logger(f"mesh LOS ready: {full}")
 
     intersector = _mesh_cache[key]
     if intersector is None:
-        return True
+        raise MeshLosError(f"los_model: mesh intersector missing for {mesh_path}")
     direction = p_b - p_a
     dist = float(np.linalg.norm(direction))
     if dist < EPS:
@@ -268,6 +280,8 @@ class UwbModel:
                 model.antenna_delay_bias[did] = float(rng.normal(0.0, sigma_bias))
             else:
                 model.antenna_delay_bias[did] = 0.0
+        if str(cfg.get("los_model", "boxes")) == "mesh":
+            prepare_mesh_los(cfg)
         return model
 
     def boresight_unit(self) -> np.ndarray:
@@ -743,6 +757,46 @@ def run_selftest() -> int:
     check("8 occluded", not los_check_boxes(np.array([0, 0, 1.0]), np.array([2, 0, 1.0]), [wall]))
     check("8 clear side", los_check_boxes(np.array([0, 0, 1.0]), np.array([0, 2, 1.0]), [wall]))
     check("8 over top", los_check_boxes(np.array([0, 0, 5.0]), np.array([2, 0, 5.0]), [wall]))
+
+    # 8m — mesh LOS refuses to silently become always-LOS
+    _mesh_cache.clear()
+    raised = False
+    try:
+        los_check_mesh(np.zeros(3), np.array([1.0, 0.0, 0.0]), {"los_model": "mesh", "mesh_path": ""})
+    except MeshLosError:
+        raised = True
+    check("8m empty mesh_path raises", raised)
+    raised = False
+    try:
+        los_check_mesh(
+            np.zeros(3), np.array([1.0, 0.0, 0.0]),
+            {"los_model": "mesh", "mesh_path": "/no/such/uwb_mesh.obj"},
+        )
+    except MeshLosError as exc:
+        raised = "not found" in str(exc).lower() or "load failed" in str(exc).lower() or "trimesh" in str(exc)
+    check("8m missing file or missing trimesh raises", raised)
+    try:
+        import trimesh  # noqa: F401
+        from trimesh.ray.ray_pyembree import RayMeshIntersector  # noqa: F401
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            obj = Path(td) / "wall.obj"
+            obj.write_text(
+                "v 1  -2  0\nv 1  2  0\nv 1  2  3\nv 1  -2  3\nf 1 2 3\nf 1 3 4\n",
+                encoding="utf-8",
+            )
+            cfg_m = {"los_model": "mesh", "mesh_path": str(obj)}
+            _mesh_cache.clear()
+            check("8m wall occludes", not los_check_mesh(
+                np.array([0.0, 0.0, 1.0]), np.array([2.0, 0.0, 1.0]), cfg_m))
+            check("8m parallel clear", los_check_mesh(
+                np.array([0.0, 0.0, 1.0]), np.array([0.0, 2.0, 1.0]), cfg_m))
+            _mesh_cache.clear()
+            UwbModel.from_config({**cfg, "los_model": "mesh", "mesh_path": str(obj)}, seed=0)
+            check("8m from_config preloads mesh", True)
+    except ImportError:
+        print("[selftest] SKIP 8m live ray (trimesh/embreex not installed)")
+    _mesh_cache.clear()
 
     # 9 NLOS effects
     cfg9 = dict(cfg)

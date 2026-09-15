@@ -64,7 +64,10 @@ from swarm_msgs import RIO_DTYPE, _to_array, pack_rio, rio_delta_from_row, rio_r
 # is a bridge model constant (the only axis RIO itself has no covariance
 # for), not an estimator tunable.
 #
-# CALIBRATED 2026-09-14. Protocol: eval_scripts/calibrate_rio_covariance.py
+# CALIBRATED 2026-09-14 on OPEN-FIELD collinear_shuttle (drones were ~50 m
+# outside lava_tube.obj). Redo after the tunnel site is flown; these floors
+# make RIO nearly worthless to the EKF and must not back a "swarm vs RIO-only"
+# claim. Protocol: eval_scripts/calibrate_rio_covariance.py
 # --calibrate out/swarm_loc_logs/tunnel/collinear_shuttle
 # --out out/rio_cov_calibration/collinear_shuttle.json --min-valid-rows 150
 # (default 200 refused: 10 Hz RIO × ~18.5 s score window yields 183/188/186
@@ -811,7 +814,7 @@ def _run_node(cf_id: int, cfg_path: str) -> int:
             if fwd is None:
                 self.get_logger().info(
                     f"attitude initializing: hold still for {self._att_cfg.init_window_s} s of sim time "
-                    f"(restarts={self._att.n_init_restarts}, gaps={self._att.n_gaps}) — RIO waits",
+                    f"(restarts={self._att.n_init_restarts}, tilt_rejects={self._att.n_init_tilt_rejects}, gaps={self._att.n_gaps}) — RIO waits",
                     throttle_duration_sec=self._att_cfg.log_throttle_s)
                 return
             if self._att is not None and not self._att_ready_logged:
@@ -821,7 +824,7 @@ def _run_node(cf_id: int, cfg_path: str) -> int:
                 self.get_logger().info(
                     f"attitude initialized: gyro bias={np.round(self._att.gyro_bias, 6).tolist()} rad/s, "
                     f"roll={math.degrees(r):.2f} pitch={math.degrees(p):.2f} yaw={math.degrees(y):.2f} deg, "
-                    f"init restarts={self._att.n_init_restarts}")
+                    f"init restarts={self._att.n_init_restarts}, tilt_rejects={self._att.n_init_tilt_rejects}")
             super()._imu_callback(fwd)
 
         def _publish_twist(self, publisher, vel_xy, stamp):

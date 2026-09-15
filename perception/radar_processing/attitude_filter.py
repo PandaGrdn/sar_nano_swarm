@@ -81,6 +81,7 @@ _REQUIRED_ESTIMATED_KEYS = (
     "init_min_samples",
     "init_max_gyro_norm_rad_s",
     "init_max_accel_dev_mps2",
+    "init_max_tilt_deg",
     "max_dt_gap_s",
     "gravity_mps2",
     "orientation_cov_rad2",
@@ -101,6 +102,7 @@ class AttitudeConfig:
     init_min_samples: int = 0
     init_max_gyro_norm_rad_s: float = float("nan")
     init_max_accel_dev_mps2: float = float("nan")
+    init_max_tilt_deg: float = float("nan")
     max_dt_gap_s: float = float("nan")
     gravity_mps2: float = float("nan")
     orientation_cov_rad2: float = float("nan")
@@ -166,6 +168,7 @@ def parse_attitude_config(cfg: dict) -> AttitudeConfig:
         init_min_samples=int(n_min),
         init_max_gyro_norm_rad_s=num("init_max_gyro_norm_rad_s"),
         init_max_accel_dev_mps2=num("init_max_accel_dev_mps2"),
+        init_max_tilt_deg=num("init_max_tilt_deg", allow_zero=True),
         max_dt_gap_s=num("max_dt_gap_s"),
         gravity_mps2=num("gravity_mps2"),
         orientation_cov_rad2=num("orientation_cov_rad2", allow_zero=True),
@@ -232,6 +235,7 @@ class MadgwickImuFilter:
         self.n_duplicate = 0
         self.n_gaps = 0
         self.n_init_restarts = 0
+        self.n_init_tilt_rejects = 0
         self.n_nonfinite = 0
         self.n_integrated = 0
 
@@ -305,6 +309,11 @@ class MadgwickImuFilter:
             am = self._win_accel / self._win_n
             roll = math.atan2(am[1], am[2])
             pitch = math.atan2(-am[0], math.hypot(am[1], am[2]))
+            # Check if tilted or upside down: reject init and restart window
+            if am[2] <= 0.0 or abs(math.degrees(roll)) > c.init_max_tilt_deg or abs(math.degrees(pitch)) > c.init_max_tilt_deg:
+                self.n_init_tilt_rejects += 1
+                self._restart_window()
+                return False
             self.q = quat_from_rpy(roll, pitch, c.init_yaw_rad)
             self.ready = True
         return True
@@ -354,6 +363,7 @@ def _test_cfg(**over) -> AttitudeConfig:
         "source": "estimated", "algorithm": "madgwick_imu",
         "madgwick_beta": 0.003935, "init_window_s": 2.0, "init_min_samples": 50,
         "init_max_gyro_norm_rad_s": 0.05, "init_max_accel_dev_mps2": 0.5,
+        "init_max_tilt_deg": 30.0,
         "max_dt_gap_s": 0.1, "gravity_mps2": 9.81, "orientation_cov_rad2": 3.0e-4,
         "log_throttle_s": 5.0}}, "launch": {"init_yaw_deg": 0.0}}
     for k, v in over.items():
@@ -473,7 +483,8 @@ def run_selftest() -> int:
         {"rio": {"attitude": {"source": "gazebo_truth"}}}).source == "gazebo_truth")
     good = {"rio": {"attitude": dict(source="estimated", algorithm="madgwick_imu", madgwick_beta=0.004,
                                      init_window_s=2.0, init_min_samples=50, init_max_gyro_norm_rad_s=0.05,
-                                     init_max_accel_dev_mps2=0.5, max_dt_gap_s=0.1, gravity_mps2=9.81,
+                                     init_max_accel_dev_mps2=0.5, init_max_tilt_deg=30.0,
+                                     max_dt_gap_s=0.1, gravity_mps2=9.81,
                                      orientation_cov_rad2=3e-4, log_throttle_s=5.0)},
             "launch": {"init_yaw_deg": 0.0}}
     check("1e complete dict parses", not raises(good))
@@ -540,6 +551,47 @@ def run_selftest() -> int:
     check("3c initial roll/pitch from gravity (<0.3 deg)",
           abs(math.degrees(r0) - 5.0) < 0.3 and abs(math.degrees(p0) + 3.0) < 0.3 and abs(y0) < 1e-3,
           f"roll={math.degrees(r0):.3f} pitch={math.degrees(p0):.3f} yaw={y0}")
+
+    # ---- 3d tilt rejection: upside down ----------------------------------------
+    f3d = MadgwickImuFilter(c)
+    R_upside_down = quat_to_matrix(quat_from_rpy(0.0, 0.0, 0.0))
+    R_upside_down[2, 2] = -1.0  # flip z-axis
+    fb_upside = R_upside_down.T @ np.array([0.0, 0.0, _G])
+    t3d = static_run(f3d, R_upside_down, 2.1, np.zeros(3), noise=False)
+    check("3d upside down never initializes", not f3d.ready and f3d.n_init_tilt_rejects > 0,
+          f"ready={f3d.ready} rejects={f3d.n_init_tilt_rejects}")
+
+    # ---- 3e tilt rejection: roll 45 deg ----------------------------------------
+    f3e = MadgwickImuFilter(c)
+    R_roll45 = quat_to_matrix(quat_from_rpy(math.radians(45.0), 0.0, 0.0))
+    t3e = static_run(f3e, R_roll45, 2.1, np.zeros(3), noise=False)
+    check("3e roll 45 deg never initializes", not f3e.ready and f3e.n_init_tilt_rejects > 0,
+          f"ready={f3e.ready} rejects={f3e.n_init_tilt_rejects}")
+
+    # ---- 3f tilt rejection: pitch 45 deg ---------------------------------------
+    f3f = MadgwickImuFilter(c)
+    R_pitch45 = quat_to_matrix(quat_from_rpy(0.0, math.radians(45.0), 0.0))
+    t3f = static_run(f3f, R_pitch45, 2.1, np.zeros(3), noise=False)
+    check("3f pitch 45 deg never initializes", not f3f.ready and f3f.n_init_tilt_rejects > 0,
+          f"ready={f3f.ready} rejects={f3f.n_init_tilt_rejects}")
+
+    # ---- 3g tilt at threshold: 10 deg roll ------------------------------------
+    f3g = MadgwickImuFilter(c)
+    R_roll10 = quat_to_matrix(quat_from_rpy(math.radians(10.0), 0.0, 0.0))
+    t3g = static_run(f3g, R_roll10, 2.1, np.zeros(3), noise=False)
+    check("3g roll 10 deg initializes", f3g.ready,
+          f"ready={f3g.ready} rejects={f3g.n_init_tilt_rejects}")
+    r3g, p3g, _ = matrix_to_rpy(f3g.rotation_matrix)
+    check("3g roll 10 deg value correct", abs(math.degrees(r3g) - 10.0) < 0.1,
+          f"roll={math.degrees(r3g):.3f}")
+
+    # ---- 3h tilt rejection config: missing key ---------------------------------
+    bad_no_tilt = {"rio": {"attitude": dict(source="estimated", algorithm="madgwick_imu", madgwick_beta=0.004,
+                                           init_window_s=2.0, init_min_samples=50, init_max_gyro_norm_rad_s=0.05,
+                                           init_max_accel_dev_mps2=0.5, max_dt_gap_s=0.1, gravity_mps2=9.81,
+                                           orientation_cov_rad2=3e-4, log_throttle_s=5.0)},
+            "launch": {"init_yaw_deg": 0.0}}
+    check("3h missing init_max_tilt_deg refused", raises(bad_no_tilt))
 
     # ---- 4 static 60 s with injected noise ---------------------------------------
     bias_res = bias - f3.gyro_bias

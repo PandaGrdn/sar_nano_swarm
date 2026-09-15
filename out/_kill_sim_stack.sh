@@ -33,7 +33,11 @@ try:
 except Exception:
     raise SystemExit(0)
 for line in out.splitlines():
-    if any(p in line for p in (":19850", ":19851", ":19852", ":19950", ":19951", ":19952")):
+    if any(p in line for p in (
+        ":19850", ":19851", ":19852",
+        ":19950", ":19951", ":19952",
+        ":20950", ":20951", ":20952",
+    )):
         for pid in re.findall(r"pid=(\d+)", line):
             print("[kill] udp holder", pid, line.strip()[:100])
             try:
@@ -44,5 +48,5 @@ PY
 sleep 2
 echo "[kill] leftover:"
 pgrep -af 'gz sim|cf2|swarm_loc|uwb_node|radar_noise_node|rio_stub|rio_bridge|phase0_gate|flow_node|gz_pose_to_odom|wait_ros_odom' || echo "  (none)"
-ss -ulnp 2>/dev/null | grep -E ':1985|:1995' || echo "[kill] cflib/CfFirm ports free"
+ss -ulnp 2>/dev/null | grep -E ':1985|:1995|:2095' || echo "[kill] cflib/CfFirm/lockstep ports free"
 echo "[kill] done"
