@@ -7,6 +7,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(gz-sim8 REQUIRED)
 find_package(gz-plugin2 REQUIRED COMPONENTS register)
 find_package(gz-common5 REQUIRED)
+find_package(embree 4 CONFIG REQUIRED)
 find_package(rmagine REQUIRED COMPONENTS core embree)
 
 add_library(radar_sensor_system SHARED
