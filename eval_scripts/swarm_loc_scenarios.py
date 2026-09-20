@@ -85,8 +85,14 @@ def _stop_all(mcs) -> None:
             pass
 
 
-def _all_forward(mcs, distance_m: float, velocity: float = 0.2) -> None:
-    """Start every vehicle at once so a formation translates together."""
+def _all_forward(mcs, distance_m: float, velocity: float = 0.2,
+                 recorder: Optional[object] = None) -> None:
+    """Start every vehicle at once so a formation translates together.
+
+    Hold the velocity setpoint for ``distance/velocity`` of *sim* time when a
+    recorder is present. A wall ``time.sleep`` at RTF < 1 only moves a fraction
+    of the commanded leg (triangle_forward blobs of ~0.4 m instead of 2 m).
+    """
     d = abs(float(distance_m))
     v = max(0.05, float(velocity))
     if d < 1e-3:
@@ -96,7 +102,11 @@ def _all_forward(mcs, distance_m: float, velocity: float = 0.2) -> None:
             mc.start_forward(v)
         else:
             mc.start_back(v)
-    time.sleep(d / v)
+    dt = d / v
+    if recorder is not None:
+        sim_sleep(recorder, dt)
+    else:
+        time.sleep(dt)
     _stop_all(mcs)
 
 
@@ -110,12 +120,12 @@ def motion_shuttle_then_hover(mcs, t_end: float, spec: dict,
     import math
     t_sim_start = recorder.sim_now() if recorder else None
 
-    _all_forward(mcs, 0.4)
+    _all_forward(mcs, 0.4, recorder=recorder)
     if recorder is not None:
         sim_sleep(recorder, 3.0)
     else:
         _sleep_until(t_end, 3.0)
-    _all_forward(mcs, -0.4)
+    _all_forward(mcs, -0.4, recorder=recorder)
     if recorder is not None:
         sim_sleep(recorder, 3.0)
     else:
@@ -153,14 +163,14 @@ def motion_repeated_shuttle(mcs, t_end: float, spec: dict,
                 elapsed_sim = t_now_sim - t_sim_start
                 if elapsed_sim + 2.0 >= t_end:
                     break
-            _all_forward(mcs, leg)
+            _all_forward(mcs, leg, recorder=recorder)
             sim_sleep(recorder, 1.5)
             t_now_sim = recorder.sim_now()
             if math.isfinite(t_sim_start) and math.isfinite(t_now_sim):
                 elapsed_sim = t_now_sim - t_sim_start
                 if elapsed_sim + 2.0 >= t_end:
                     break
-            _all_forward(mcs, -leg)
+            _all_forward(mcs, -leg, recorder=recorder)
             sim_sleep(recorder, 1.5)
         # Consume remainder
         t_now_sim = recorder.sim_now()
@@ -208,7 +218,7 @@ def motion_formation_forward(mcs, t_end: float, spec: dict,
         else:
             if time.time() + 1.0 >= t_end:
                 break
-        _all_forward(mcs, leg)
+        _all_forward(mcs, leg, recorder=recorder)
         if recorder is not None:
             sim_sleep(recorder, pause)
         else:
@@ -256,7 +266,7 @@ def motion_staggered_advance(mcs, t_end: float, spec: dict,
         else:
             if time.time() + 1.0 >= t_end:
                 break
-        mc.forward(leg)
+        _all_forward([mc], leg, recorder=recorder)
         if recorder is not None:
             sim_sleep(recorder, pause)
         else:
@@ -581,6 +591,34 @@ def run_selftest() -> int:
     # 4*(0.5/0.2 travel + 2s pause) + 5s hover_end + remainder → 45 s total
     check("formation_forward consumes duration",
           abs(sum(slept) - 45.0) < 1e-9, f"slept={sum(slept):.3f} {slept}")
+
+    # Recorder path: hold start_forward for distance/v of SIM time, not one
+    # wall sleep (RTF 0.3 used to turn a 0.5 m leg into ~15 cm).
+    class _Rec:
+        def __init__(self):
+            self.t = 0.0
+
+        def sim_now(self):
+            return self.t
+
+    rec = _Rec()
+    wall_chunks: list = []
+    real_sleep2 = time.sleep
+
+    def fake_sleep_rtf(s):
+        wall_chunks.append(float(s))
+        rec.t += 0.05
+
+    time.sleep = fake_sleep_rtf  # type: ignore[assignment]
+    try:
+        _all_forward([_Mc()], 0.5, velocity=0.2, recorder=rec)
+    finally:
+        time.sleep = real_sleep2
+    check("_all_forward recorder holds 0.5 m / 0.2 m/s = 2.5 s sim",
+          rec.t + 1e-9 >= 2.5, f"sim={rec.t:.3f}")
+    check("_all_forward recorder does not wall-sleep the whole 2.5 s leg",
+          not any(abs(s - 2.5) < 1e-9 for s in wall_chunks),
+          str(wall_chunks[:8]))
     line = derived_estimator_config(get_scenario("tunnel/collinear_hover"), base, 0.5)
     check(
         "derived line matches x0+i*spacing",
